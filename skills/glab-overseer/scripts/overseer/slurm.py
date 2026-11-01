@@ -33,6 +33,10 @@ TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NOD
 LOG_PATTERNS = (("time_limit", re.compile(r"DUE TO TIME LIMIT", re.I)),
                 ("out_of_memory", re.compile(r"oom[-_ ]?kill|out of memory|OUT_OF_MEMORY", re.I)),
                 ("cancelled", re.compile(r"CANCELLED AT|DUE TO (?:PREEMPTION|NODE FAILURE)", re.I)))
+REJECTION_RE = re.compile("|".join((
+    "invalid partition", "invalid account", "invalid qos", "requested node configuration is not available",
+    "requested time limit", "memory specification", "job violates accounting/qos policy",
+    "access/permission denied", "invalid feature specification", "invalid generic resource")), re.I)
 LOG_FULL_MAX = 256 * 1024 * 1024
 LOG_EDGE = 16 * 1024 * 1024
 
@@ -70,27 +74,16 @@ def choose_backend(root, base=None):
     return "slurm" if not disabled(base) and _survey_slurm(root).get("usable") is True else "local"
 
 
-def _slurm_host(root):
-    """Slurm tools are present here, per the survey; independent of OVERSEER_DISABLE_SLURM."""
-    try:
-        s = store.read_json(os.path.join(paths.state_dir(root), "survey.json"), {})
-    except ValueError:
-        return False
-    tools = s.get("tools") if isinstance(s, dict) else None
-    sbatch = tools.get("sbatch") if isinstance(tools, dict) else None
-    return _survey_slurm(root).get("usable") in (True, "unknown") or (
-        isinstance(sbatch, dict) and sbatch.get("found") is True)
-
-
 def local_agent_problem(root, base=None):
-    """Why an agent may not run locally here (Slurm tools present, no job allocation), else None.
+    """Why an agent may not run locally here, else None.
 
-    The disable flag does not lift this: it only stops the Slurm backend from being chosen.
+    Decided from the current host at launch time: sbatch on the current PATH and no SLURM_JOB_ID.
+    survey.json and the disable flag are ignored.
     """
     base = os.environ if base is None else base
     if base.get("SLURM_JOB_ID"):
         return None
-    if _slurm_host(root):
+    if E.resolve_exe("sbatch", base.get("PATH", "")):
         return ("this is a Slurm host and no job allocation is active: an agent invocation must not run "
                 "on the login node; dispatch it through the slurm backend or run inside an allocation")
     return None
@@ -158,35 +151,40 @@ def resources(plan, unit):
 
 
 def _handshake_evidence(root, rec):
-    """The recorded token's directory lies under this root and holds the nonce and a matching reply."""
+    """Epoch time the batch job wrote in its reply, if the recorded token's directory lies under this
+    root and holds the nonce and a matching reply; else None."""
     tok = rec.get("token")
     if not (isinstance(tok, str) and paths.valid_id(tok)):
-        return False
+        return None
     base = os.path.realpath(os.path.join(paths.state_dir(root), "handshake"))
     d = os.path.realpath(os.path.join(base, tok))
     if os.path.dirname(d) != base:
-        return False
+        return None
     try:
         with open(os.path.join(d, "nonce")) as f:
             nonce = f.read()
     except OSError:
-        return False
+        return None
     reply = X._load(os.path.join(d, "reply.json"))
-    return bool(nonce and isinstance(reply, dict) and reply.get("nonce") == nonce
-                and isinstance(reply.get("host"), str) and reply["host"] and reply["host"] == rec.get("host"))
+    if not (nonce and isinstance(reply, dict) and reply.get("nonce") == nonce
+            and isinstance(reply.get("host"), str) and reply["host"] and reply["host"] == rec.get("host")):
+        return None
+    try:
+        return calendar.timegm(time.strptime(reply.get("time"), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
 
 
 def check_handshake(root, now=None):
+    """Refuse unless a handshake for this root succeeded in the last 7 days.
+
+    The age comes from the UTC time the batch job wrote into its reply, not from the mutable record.
+    Same-user tampering with local state is outside the cooperative boundary (C20).
+    """
     rec = X._load(os.path.join(paths.state_dir(root), "handshake.json"))
-    age = None
-    if isinstance(rec, dict) and isinstance(rec.get("time"), str):
-        try:
-            age = (now or time.time()) - calendar.timegm(time.strptime(rec["time"], "%Y-%m-%dT%H:%M:%SZ"))
-        except ValueError:
-            pass
-    ok = (isinstance(rec, dict) and rec.get("root") == os.path.realpath(root) and age is not None
-          and -300 <= age <= HANDSHAKE_MAX_AGE and _handshake_evidence(root, rec))
-    if not ok:
+    stamp = _handshake_evidence(root, rec) if isinstance(rec, dict) else None
+    age = None if stamp is None else (now or time.time()) - stamp
+    if not (age is not None and rec.get("root") == os.path.realpath(root) and -300 <= age <= HANDSHAKE_MAX_AGE):
         raise SlurmError("no successful Slurm handshake for %s in the last 7 days; run `overseer.py "
                          "slurm-handshake`" % os.path.realpath(root))
 
@@ -280,12 +278,15 @@ def query_sacct(job_id, name):
 
 def _scan_lines(f, limit, found):
     """Scan up to `limit` bytes of f line by line (bounded memory); add matching labels to `found`."""
+    tail = b""  # overlap so a pattern split across two reads is still seen
     while limit > 0:
         line = f.readline(min(1 << 16, limit))
         if not line:
             break
         limit -= len(line)
-        text = line.decode("utf-8", "replace")
+        data = tail + line
+        tail = data[-64:]
+        text = data.decode("utf-8", "replace")
         for label, rx in LOG_PATTERNS:
             if label not in found and rx.search(text):
                 found.add(label)
@@ -509,14 +510,21 @@ def sbatch_argv(name, token, chdir, res, script):
 
 
 def submit(d, env, argv, token, name):
-    """Run sbatch exactly once; returns the job id. `d` receives sbatch.json (argv and raw outcome)."""
+    """Run sbatch exactly once; returns the job id. `d` receives sbatch.json (argv and raw outcome).
+
+    A non-zero exit is a definite rejection only when stderr matches REJECTIONS. Measured on a
+    cluster: sbatch exited 1 with "Batch job submission failed: Socket timed out on send/recv
+    operation" and the job was submitted and ran anyway. Every other failure is ambiguous: squeue
+    is searched for the token, and otherwise the invocation stays UNCERTAIN (later reconciliation
+    uses squeue and the wrapper's own start.json job id).
+    """
     r = E.run_tool(argv, env, SBATCH_TIMEOUT)
     rec = dict(_raw(r), argv=argv, time=store.utc_now())
     out = os.path.join(d, "sbatch.json")
-    if not r["timed_out"] and r["rc"] != 0:
+    if not r["timed_out"] and r["rc"] != 0 and REJECTION_RE.search(r["stderr"]):
         store.write_json_atomic(out, dict(rec, outcome="rejected"))
         raise SbatchRejected("sbatch rejected the job (rc %s): %s" % (r["rc"], r["stderr"].strip()[:500]))
-    m = None if r["timed_out"] else JOBID_RE.match(r["stdout"].strip())
+    m = JOBID_RE.match(r["stdout"].strip()) if r["rc"] == 0 else None
     if m:
         store.write_json_atomic(out, dict(rec, outcome="submitted"))
         return m.group(1)
@@ -527,7 +535,8 @@ def submit(d, env, argv, token, name):
     store.write_json_atomic(out, dict(rec, outcome="ambiguous", squeue=hit[0]))
     raise SbatchAmbiguous("sbatch outcome is ambiguous (%s) and squeue shows no single job with token %s (%s); "
                           "the invocation stays UNCERTAIN and sbatch is not repeated"
-                          % ("timed out" if r["timed_out"] else "unparseable output", token, hit[0]))
+                          % ("timed out" if r["timed_out"] else "exit %s: %s" % (r["rc"], r["stderr"].strip()[:200]),
+                             token, hit[0]))
 
 
 def make_spawn():
@@ -595,9 +604,19 @@ def abort(root, inv, intent, confirm_wait=30.0, sleep=time.sleep):
         store.append_event(root, "cancel_requested", **ref)
     prev = cancel.get("scancel")
     if prev is None or prev.get("retryable") is True:  # a timed-out scancel is ambiguous: never repeated
-        r = _tool(["scancel", launch["job_id"]], QUERY_TIMEOUT)
-        cancel["scancel"] = {"time": store.utc_now(), "rc": r["rc"], "timed_out": r["timed_out"],
-                             "stderr": r["stderr"][:500], "retryable": not r["timed_out"] and r["rc"] != 0}
+        sq = squeue_view(query_squeue(), launch["job_id"], intent["token"])
+        mine = sq["outcome"] == "listed" or query_scontrol(launch["job_id"], intent["token"])["outcome"] == "known"
+        if not mine:  # the recorded id may belong to another job now: never scancel on a bare id
+            reason = "job %s cannot be shown to carry this invocation's token; not cancelled" % launch["job_id"]
+            store.write_json_atomic(cpath, dict(cancel, unidentified=reason))
+            store.append_event(root, "cancel_unidentified", reason=reason, **ref)
+            return "UNIDENTIFIED"
+        if sq["outcome"] == "absent":  # already left the queue: nothing to cancel, only to confirm
+            cancel["scancel"] = {"time": store.utc_now(), "skipped": "job already left squeue", "retryable": False}
+        else:
+            r = _tool(["scancel", launch["job_id"]], QUERY_TIMEOUT)
+            cancel["scancel"] = {"time": store.utc_now(), "rc": r["rc"], "timed_out": r["timed_out"],
+                                 "stderr": r["stderr"][:500], "retryable": not r["timed_out"] and r["rc"] != 0}
         store.write_json_atomic(cpath, cancel)
     end = time.monotonic() + confirm_wait
     while True:
@@ -614,7 +633,7 @@ _JOB = """#!/bin/sh
 D=%s
 n=$(cat "$D/nonce") || exit 3
 h=$(hostname 2>/dev/null || uname -n)
-printf '{"nonce": "%%s", "host": "%%s"}\\n' "$n" "$h" > "$D/reply.tmp" && mv "$D/reply.tmp" "$D/reply.json"
+printf '{"nonce": "%%s", "host": "%%s", "time": "%%s"}\\n' "$n" "$h" "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)" > "$D/reply.tmp" && mv "$D/reply.tmp" "$D/reply.json"
 """
 
 

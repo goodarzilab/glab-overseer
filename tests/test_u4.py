@@ -30,6 +30,8 @@ case $mode in
   reject) echo "sbatch: error: invalid partition specified" >&2; exit 1;;
   hang) sleep 30; exit 0;;
   junk) echo "submitted somewhere"; exit 0;;
+  idfail) echo 4242; echo "sbatch: error: Socket timed out" >&2; exit 1;;
+  socket) echo "sbatch: error: Batch job submission failed: Socket timed out on send/recv operation" >&2; exit 1;;
 esac
 for a; do s=$a; done
 if [ -f "$F/sbatch.run" ]; then
@@ -77,10 +79,12 @@ class SlurmCase(Case):
                 f.write("#!/bin/sh\nF=%s\n%s\n" % (self.F, body))
             os.chmod(p, 0o755)
         sysbin = os.path.join(self.tmp, "sysbin")
-        for t in ("tail", "mv", "uname", "hostname", "sed"):
+        for t in ("tail", "mv", "uname", "hostname", "sed", "date"):
             src = shutil.which(t, path="/usr/bin:/bin:/usr/local/bin")
             if src and not os.path.exists(os.path.join(sysbin, t)):
                 os.symlink(src, os.path.join(sysbin, t))
+        os.environ.pop("SLURM_JOB_ID", None)  # a login node: Case sets it so U3 tests may launch agents
+        self.sysbin = sysbin
         os.environ["PATH"] = os.pathsep.join([fakebin, sysbin])
         for name, val in (("TMP_ROOTS", ()), ("SBATCH_TIMEOUT", 3), ("SACCT_TIMEOUT", 1), ("QUERY_TIMEOUT", 5)):
             p = mock.patch.object(S, name, val)
@@ -98,13 +102,14 @@ class SlurmCase(Case):
     def survey(self, usable):
         store.write_json_atomic(os.path.join(self.root, ".overseer", "survey.json"), {"slurm": {"usable": usable}})
 
-    def handshake_record(self, when=None, root=None, token="a1b2c3", reply=True):
+    def handshake_record(self, when=None, root=None, token="a1b2c3", reply=True, reply_time=None):
         d = os.path.join(self.root, ".overseer", "handshake", "a1b2c3")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "nonce"), "w") as f:
             f.write("nonce-1")
         if reply:
-            store.write_json_atomic(os.path.join(d, "reply.json"), {"nonce": "nonce-1", "host": "node001"})
+            store.write_json_atomic(os.path.join(d, "reply.json"), {
+                "nonce": "nonce-1", "host": "node001", "time": reply_time or when or store.utc_now()})
         store.write_json_atomic(os.path.join(self.root, ".overseer", "handshake.json"), {
             "root": root or self.root, "time": when or store.utc_now(), "token": token, "host": "node001"})
 
@@ -230,6 +235,21 @@ class ChoiceAndRefusals(SlurmCase):
             self.dispatch()
         self.assertEqual(self.calls(), [])
 
+    def test_handshake_age_comes_from_the_reply_not_the_record(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 86400))
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        for reply_time in (old, soon, "garbage", None):
+            self.handshake_record(reply_time=reply_time)  # the record itself says "now"
+            if reply_time is None:
+                S.check_handshake(self.root)
+                continue
+            with self.assertRaisesRegex(S.SlurmError, "handshake", msg=reply_time):
+                S.check_handshake(self.root)
+        d = os.path.join(self.root, ".overseer", "handshake", "a1b2c3")
+        store.write_json_atomic(os.path.join(d, "reply.json"), {"nonce": "nonce-1", "host": "node001"})
+        with self.assertRaisesRegex(S.SlurmError, "handshake"):  # no time in the reply
+            S.check_handshake(self.root)
+
     def test_tmp_root_refused_before_any_submission(self):
         with mock.patch.object(S, "TMP_ROOTS", ("/tmp", "/var/tmp")):
             self.assertIn("private", S.root_problem(os.path.join(self.tmp, "x"), {}))
@@ -241,28 +261,25 @@ class ChoiceAndRefusals(SlurmCase):
         self.assertIsNone(S.root_problem("/data/p", {"TMPDIR": "/scratch/p"}))
         self.assertEqual(self.calls(), [])
 
-    def test_local_agent_refused_on_slurm_host_outside_allocation(self):
+    def test_login_node_guard_uses_the_current_host_only(self):
         argv = [self.script("ag", "true")]
-        with self.assertRaisesRegex(X.ExecutionError, "login node"):
-            self.launch("j1", argv, kind="author", plan="sl")
+        for survey in ("absent", False, True):  # survey.json and the disable flag are irrelevant
+            if survey == "absent":
+                os.unlink(os.path.join(self.root, ".overseer", "survey.json"))
+            else:
+                self.survey(survey)
+            for flag in ("", "1"):
+                with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": flag}):
+                    with self.assertRaisesRegex(X.ExecutionError, "login node"):
+                        self.launch("j1", argv, kind="author", plan="sl")
         inv = os.path.join(self.root, ".overseer", "plans", "sl", "units", "j1", "attempts", "a1", "inv")
         self.assertFalse(os.path.exists(inv))
         self.launch("j1", argv, kind="job", plan="sl")  # a job unit may run locally
-        with mock.patch.dict(os.environ, {"SLURM_JOB_ID": "7"}):
+        with mock.patch.dict(os.environ, {"SLURM_JOB_ID": "7"}):  # inside an allocation
             self.launch("j2", argv, kind="author", plan="sl")
-        self.survey(False)
-        self.launch("j3", argv, kind="fixer", plan="sl")
-
-    def test_login_node_guard_ignores_the_disable_flag(self):
-        store.write_json_atomic(os.path.join(self.root, ".overseer", "survey.json"), {
-            "slurm": {"usable": False, "reason": "disabled"}, "tools": {"sbatch": {"found": True}}})
-        argv = [self.script("ag", "true")]
-        for flag in ("1", "", "0"):
-            with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": flag}):
-                with self.assertRaisesRegex(X.ExecutionError, "login node"):
-                    self.launch("j1", argv, kind="author", plan="sl")
-        with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": "1", "SLURM_JOB_ID": "7"}):
-            self.launch("j1", argv, kind="author", plan="sl")
+        self.survey(True)  # a stale survey from another host does not block a host without sbatch
+        with mock.patch.dict(os.environ, {"PATH": self.sysbin}):
+            self.launch("j3", argv, kind="fixer", plan="sl")
         self.assertEqual(self.calls(), [])
 
 
@@ -342,6 +359,43 @@ class Submission(SlurmCase):
             self.assertEqual(X.abort_invocation(self.root, inv), "UNIDENTIFIED")  # nothing is scancelled
             self.assertEqual(self.calls("scancel"), [])
             self.assertEqual(len(self.calls()), 1)
+
+    def test_nonzero_exit_without_a_rejection_message_is_ambiguous(self):
+        self.fake("sbatch.mode", "socket")  # measured: exit 1, yet the job was submitted and ran
+        self.fake("squeue.state", "RUNNING")
+        rec = self.dispatch("j1")  # squeue lists the token: adopted, not rejected
+        self.assertEqual((rec["launch"]["job_id"], len(self.calls())), ("4242", 1))
+        sb = self.rec(rec["dir"], "sbatch.json")
+        self.assertEqual(sb["outcome"], "recovered_by_squeue")
+        self.assertIn("Socket timed out", sb["stderr"])
+        self.assertEqual(self.status(rec)["state"], "RUNNING")
+        self.unfake("squeue.state")  # nothing listed: UNCERTAIN, slot held, never LAUNCH_FAILED
+        with self.assertRaises(S.SbatchAmbiguous):
+            self.dispatch("j2")
+        inv = next(X.iter_invocations(self.root, "sl", "j2"))["path"]
+        self.assertEqual(self.rec(inv, "sbatch.json")["outcome"], "ambiguous")
+        self.assertIn("Socket timed out", self.rec(inv, "sbatch.json")["stderr"])
+        self.assertFalse(os.path.exists(os.path.join(inv, "launch_error.json")))
+        self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
+        self.assertEqual(X.slots_in_use(self.root), 2)
+        tok = self.rec(inv, "intent.json")["token"]  # the job ran after all: its wrapper wrote start.json
+        store.write_json_atomic(os.path.join(inv, "start.json"), {"token": "other", "pid": 1, "job_id": "999"})
+        self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")  # bound by token only
+        store.write_json_atomic(os.path.join(inv, "start.json"), {"token": tok, "pid": 1, "job_id": "4242"})
+        st = X.invocation_status(inv, True)
+        self.assertEqual(self.rec(inv, "launch.json")["reconciled"], "start.json")
+        self.assertEqual(st["job_id"], "4242")
+        self.exit_rec({"dir": inv, "token": tok, "argv_sha256": self.rec(inv, "intent.json")["argv_sha256"]}, 0)
+        self.assertEqual(self.status({"dir": inv})["state"], "EXITED")  # judged normally from then on
+        self.assertEqual(len(self.calls()), 2)  # one sbatch per intent
+
+    def test_job_id_printed_with_a_failing_exit_is_not_trusted(self):
+        self.fake("sbatch.mode", "idfail")
+        with self.assertRaises(S.SbatchAmbiguous):
+            self.dispatch("j1")
+        inv = next(X.iter_invocations(self.root, "sl", "j1"))["path"]
+        self.assertEqual(self.rec(inv, "sbatch.json")["outcome"], "ambiguous")
+        self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
 
     def test_ambiguous_sbatch_found_in_squeue_records_job_with_one_call(self):
         for mode in ("hang", "junk"):
@@ -436,7 +490,8 @@ class RunSh(SlurmCase):
 
     def test_reserved_and_invalid_extras_are_refused(self):
         n, _ = X.allocate_attempt(self.root, "sl", "j1")
-        for name in ("_OVR_x", "_OVR_PY", X.TOKEN_VAR, "has-dash", "1abc", "a b", "", "A=B"):
+        for name in ("_OVR_x", "_OVR_PY", X.TOKEN_VAR, "has-dash", "1abc", "a b", "", "A=B", "PPID", "UID", "IFS",
+                     "PATH", "RANDOM", "BASH_ENV", "BASHPID", "PS4", "LINENO", "SECONDS"):
             for fn in (lambda e: self.launch("j1", [self.script("p", "true")], kind="job", plan="demo", extras=e),
                        lambda e: S.launch(self.root, "sl", "j1", n, "job", [self.script("p", "true")],
                                           self.root, extras=e)):
@@ -613,6 +668,14 @@ class Evidence(SlurmCase):
         self.assertEqual(S.judge(sq, None, None, ok0, ["oom@x"], True)[0], "FAILED")
         self.assertEqual(S.judge(sq, None, None, ok0, [], False)[0], "COMPLETED")
 
+    def test_pattern_split_across_read_boundaries_is_found(self):
+        adir = os.path.join(self.tmp, "logs2")
+        os.makedirs(adir)
+        for filler in (65532, 65536 - 4 - 1, 3, 65536 * 2 - 6):
+            with open(os.path.join(adir, "slurm-9.out"), "w") as f:
+                f.write("x" * filler + "oom_kill event\n")
+            self.assertEqual(S.scan_logs(adir, "9")[0], ["out_of_memory@slurm-9.out"], filler)
+
     def test_partial_log_scan_is_recorded_and_blocks_wrapper_only_success(self):
         rec = self.dispatch()
         self.exit_rec(rec, 0)
@@ -696,6 +759,20 @@ class Abort(SlurmCase):
             X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None)
         self.assertEqual(len(self.calls("scancel")), 1)
         self.assertTrue(self.rec(rec["dir"], "cancel.json")["scancel"]["timed_out"])
+
+    def test_abort_never_scancels_a_job_that_is_not_ours(self):
+        rec = self.dispatch()
+        for body in ('echo "4242|reused|someone-elses-token|RUNNING|None"', "exit 1", ""):
+            self.shim("squeue", body)  # another job holds the id, squeue fails, or the job is unknown
+            self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "UNIDENTIFIED")
+            self.assertEqual(self.calls("scancel"), [])
+            self.assertIn("not cancelled", self.rec(rec["dir"], "cancel.json")["unidentified"])
+            self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "UNCERTAIN")
+            os.unlink(os.path.join(rec["dir"], "cancel.json"))
+        self.fake("squeue.state", "RUNNING")  # control: our token on the job
+        self.shim("squeue", "F=%s\n%s" % (self.F, SHIMS["squeue"]))
+        X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None)
+        self.assertEqual(self.calls("scancel"), ["4242"])
 
     def test_abort_without_job_id_is_unidentified(self):
         with mock.patch.object(S, "submit", side_effect=Crash):

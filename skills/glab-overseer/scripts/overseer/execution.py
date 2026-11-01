@@ -30,6 +30,8 @@ KINDS = ("author", "fixer", "job")
 ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN", "CANCELLING")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 RESERVED_PREFIX = "_OVR_"
+RESERVED_NAMES = frozenset("PPID UID EUID GROUPS SHELLOPTS BASHOPTS BASHPID FUNCNAME LINENO RANDOM SECONDS PWD OLDPWD "
+                           "IFS PATH HOME SHELL OPTIND OPTARG PS1 PS2 PS4 ENV".split())
 TOKEN_VAR = "OVERSEER_INV_TOKEN"  # exported by run.sh; every payload process inherits it
 BLOCKING_CLASSES = ("QUOTA", "AUTH")
 SIGNALS = ("TERM", "INT", "HUP")
@@ -491,7 +493,7 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
         raise ExecutionError("stdin_text must be a string")
     for k, v in (extras or {}).items():
         if not (isinstance(k, str) and ENV_NAME_RE.match(k) and not k.startswith(RESERVED_PREFIX)
-                and k != TOKEN_VAR and isinstance(v, str) and "\0" not in v):
+                and k != TOKEN_VAR and k not in RESERVED_NAMES and not k.startswith("BASH") and isinstance(v, str) and "\0" not in v):
             raise ExecutionError("invalid environment variable %r: names must be shell identifiers, must not "
                                  "start with %s or equal %s, and values must be strings" % (k, RESERVED_PREFIX, TOKEN_VAR))
     if backend == "local" and kind != "job":

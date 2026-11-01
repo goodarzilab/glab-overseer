@@ -66,7 +66,8 @@ class Case(TmpCase):
                 os.symlink(src, os.path.join(sysbin, t))
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
-        self.penv = {"PATH": os.pathsep.join([self.shims, sysbin]), "HOME": self.tmp, "LC_ALL": "C.UTF-8"}
+        self.penv = {"PATH": os.pathsep.join([self.shims, sysbin]), "HOME": self.tmp, "LC_ALL": "C.UTF-8",
+                     "SLURM_JOB_ID": "1"}  # the sbatch shim makes this look like a Slurm host: be inside an allocation
         patcher = mock.patch.dict(os.environ, self.penv, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
