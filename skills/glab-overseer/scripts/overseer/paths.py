@@ -4,6 +4,7 @@ Every id that becomes a path component goes through `check_id`; every
 repository-relative path goes through `safe_relpath` (or `relpath_problem`
 when no filesystem is involved).
 """
+import fnmatch
 import os
 import re
 import subprocess
@@ -114,3 +115,29 @@ def attempt_dir(root, plan_id, unit_id, n):
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
         raise ValueError("attempt number must be a positive integer")
     return os.path.join(unit_dir(root, plan_id, unit_id), "attempts", "a%d" % n)
+
+
+GLOB_META = "*?["
+
+
+def has_glob_meta(s):
+    return any(c in s for c in GLOB_META)
+
+
+def _seg_match(pats, segs):
+    if not pats:
+        return not segs
+    if pats[0] == "**":
+        return any(_seg_match(pats[1:], segs[i:]) for i in range(len(segs) + 1))
+    if not segs:
+        return False
+    return fnmatch.fnmatchcase(segs[0], pats[0]) and _seg_match(pats[1:], segs[1:])
+
+
+def glob_match(pattern, path):
+    """Segment-aware glob match for real repo-relative paths.
+
+    `*`, `?` and `[...]` never cross `/`. A segment that is exactly `**`
+    matches zero or more whole segments.
+    """
+    return _seg_match(pattern.split("/"), path.split("/"))

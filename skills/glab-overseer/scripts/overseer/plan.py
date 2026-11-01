@@ -3,19 +3,19 @@
 Plans are JSON. State operations (approve, split, unit state) live in
 `approval.py`.
 """
-import fnmatch
 import hashlib
 import json
 import re
 
-from .paths import ID_PATTERN, relpath_problem, valid_id
+from .paths import ID_PATTERN, glob_match, has_glob_meta, relpath_problem, valid_id
 
 CAP_MAX = {"workers": 3, "attempts": 2, "review_rounds": 3}
 KINDS = ("code", "job")
 CODE_REQUIRED = ("title", "prompt", "claims", "test_command", "outputs", "scope")
 JOB_REQUIRED = ("title", "command", "outputs")
-FORBIDDEN_FRAGMENTS = ("model", "provider", "family")
-OUTPUT_KEYS = ("path", "min_bytes", "sha256", "validator")
+FORBIDDEN_KEYS = ("model", "models", "provider", "family", "thinking", "effort")
+FORBIDDEN_SUFFIXES = ("_model", "_provider", "_family")
+OUTPUT_KEYS = ("path", "min_bytes", "sha256", "validate")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 TIME_RE = re.compile(r"^(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?$")
@@ -39,16 +39,25 @@ def load_plan(path):
 
 
 def scope_covers(plan_globs, glob):
-    """True when `glob` is covered by the plan scope. Deliberately simple and conservative.
+    """True when `glob` is covered by the plan scope. Segment-aware and conservative.
 
-    Covered when `glob` fnmatch-matches one plan glob, equals one literally, or
-    a plan glob ending in `/**` is a prefix of it (`src/**` covers `src/a/*.py`).
+    Covered only when: `glob` equals a plan glob; or `glob` has no glob
+    metacharacters and `paths.glob_match(plan_glob, glob)` holds; or a plan
+    glob is `**` or ends in `/**` and `glob` lies under that prefix, compared
+    segment by segment (`src/**` covers `src/a/*.py`, not `srcx/a.py`).
+    Narrower patterns such as `src/a[bc].py` under `src/a?.py` are not covered
+    (false negatives are accepted; list literal paths or widen to `dir/**`).
     """
+    gsegs = glob.split("/")
     for p in plan_globs:
-        if glob == p or fnmatch.fnmatchcase(glob, p):
+        if glob == p:
             return True
-        if p.endswith("/**") and glob.startswith(p[:-2]):
+        if not has_glob_meta(glob) and glob_match(p, glob):
             return True
+        if p == "**" or p.endswith("/**"):
+            prefix = [] if p == "**" else p[:-3].split("/")
+            if len(gsegs) > len(prefix) and gsegs[:len(prefix)] == prefix:
+                return True
     return False
 
 
@@ -118,6 +127,8 @@ def _check_globs(label, what, globs, errors):
 
 def _check_outputs(label, outs, errors):
     if not isinstance(outs, list):
+        if outs is not None:
+            errors.append("%s: outputs must be a list, got %s" % (label, type(outs).__name__))
         return
     for o in outs:
         if isinstance(o, dict):
@@ -125,12 +136,18 @@ def _check_outputs(label, outs, errors):
             if extra:
                 errors.append("%s: output %r has unknown keys %s" % (label, o.get("path"), extra))
             p = o.get("path")
+            if not isinstance(p, str):
+                errors.append("%s: output object needs a string 'path'" % label)
+                continue
             mb = o.get("min_bytes")
             if mb is not None and (isinstance(mb, bool) or not isinstance(mb, int) or mb < 0):
                 errors.append("%s: output %r min_bytes must be a non-negative integer" % (label, p))
             sh = o.get("sha256")
             if sh is not None and not (isinstance(sh, str) and SHA_RE.match(sh)):
                 errors.append("%s: output %r sha256 must be 64 lowercase hex digits" % (label, p))
+            v = o.get("validate")
+            if v is not None and not isinstance(v, str):
+                errors.append("%s: output %r validate must be a string" % (label, p))
         elif isinstance(o, str):
             p = o
         else:
@@ -218,7 +235,6 @@ def validate_plan(plan):
             continue
         needs = u.get("needs", [])
         if not isinstance(needs, list) or not all(isinstance(n, str) for n in needs):
-            errors.append("unit %s: needs must be a list of unit ids" % u["id"])
             needs = []
         for n in needs:
             if n not in known:
@@ -233,9 +249,14 @@ def validate_plan(plan):
     return errors, warnings
 
 
+def _forbidden_key(k):
+    k = str(k).lower()
+    return k in FORBIDDEN_KEYS or k.endswith(FORBIDDEN_SUFFIXES)
+
+
 def _validate_unit(u, label, plan_scope, plan_slurm, errors):
     for k in sorted(u):
-        if any(f in str(k).lower() for f in FORBIDDEN_FRAGMENTS):
+        if _forbidden_key(k):
             errors.append("%s: field %r names a model, provider or family; "
                           "model roles are fixed by the host, not by the plan" % (label, k))
     kind = u.get("kind")
@@ -245,6 +266,12 @@ def _validate_unit(u, label, plan_scope, plan_slurm, errors):
     for f in (CODE_REQUIRED if kind == "code" else JOB_REQUIRED):
         if not _present(u.get(f)):
             errors.append("%s: missing or empty field '%s'" % (label, f))
+    for f in ("title", "prompt", "test_command", "command"):
+        if f in u and u[f] is not None and not isinstance(u[f], str):
+            errors.append("%s: field '%s' must be a string" % (label, f))
+    needs = u.get("needs", [])
+    if not isinstance(needs, list) or not all(isinstance(n, str) for n in needs):
+        errors.append("%s: needs must be a list of unit ids" % label)
     if kind == "code":
         claims = u.get("claims")
         if _present(claims) and not (isinstance(claims, list) and all(isinstance(c, str) and c.strip() for c in claims)):
@@ -253,21 +280,21 @@ def _validate_unit(u, label, plan_scope, plan_slurm, errors):
         if _present(scope) and _check_globs(label, "scope glob", scope, errors):
             for g in scope:
                 if plan_scope and not scope_covers(plan_scope, g):
-                    errors.append("%s: scope glob %r is not covered by the plan scope" % (label, g))
+                    errors.append("%s: scope glob %r is not covered by the plan scope; list the literal "
+                                  "paths, or widen the plan scope to a dir/** glob" % (label, g))
     _check_outputs(label, u.get("outputs"), errors)
     block = u.get("slurm")
     if block is not None and not isinstance(block, dict):
         errors.append("%s: slurm must be an object" % label)
         block = None
-    if kind == "job":
-        if block is not None:
-            _slurm_errors(label, block, errors)
-        if block is not None or plan_slurm is not None:
-            merged = merge_slurm(plan_slurm, block)
-            if "mem" not in merged and "mem_per_cpu" not in merged:
-                errors.append("%s: slurm block needs one of mem or mem_per_cpu" % label)
-            if parse_walltime(merged.get("time")) is None:
-                errors.append("%s: slurm block needs a finite time (got %r)" % (label, merged.get("time")))
+    if block is not None:
+        _slurm_errors(label, block, errors)
+    if block is not None or plan_slurm is not None:
+        merged = merge_slurm(plan_slurm, block)
+        if "mem" not in merged and "mem_per_cpu" not in merged:
+            errors.append("%s: slurm block needs one of mem or mem_per_cpu" % label)
+        if parse_walltime(merged.get("time")) is None:
+            errors.append("%s: slurm block needs a finite time (got %r)" % (label, merged.get("time")))
 
 
 def _cycle_members(graph):

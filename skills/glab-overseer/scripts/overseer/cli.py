@@ -104,6 +104,8 @@ _PLAN_ACTIONS = {"validate": _validate, "approve": _approve, "show": _show, "spl
 def _configure_unlock(p):
     p.add_argument("--force", action="store_true", help="required; removes the lock")
     p.add_argument("--reason", default="", help="why the lock is being removed")
+    p.add_argument("--even-if-alive", action="store_true",
+                   help="remove the lock even if its holder is alive on this host")
 
 
 def _run_unlock(args):
@@ -113,7 +115,7 @@ def _run_unlock(args):
     if not args.reason.strip():
         _err("error: unlock requires --reason TEXT")
         return 1
-    holder = store.force_unlock(_root(args), args.reason)
+    holder = store.force_unlock(_root(args), args.reason, args.even_if_alive)
     if holder is None:
         print("no lock present")
     else:
@@ -179,7 +181,7 @@ def main(argv=None):
         ap.error("unrecognized arguments: %s" % " ".join(extra))
     try:
         return cmd["run"](args)
-    except store.LockHeld as e:
+    except (store.LockHeld, store.LockAlive) as e:
         _err("error: %s" % e)
     except (approval.ApprovalError, approval.PlanStateError, P.PlanError,
             paths.InvalidId, paths.UnsafePath, ValueError, OSError) as e:

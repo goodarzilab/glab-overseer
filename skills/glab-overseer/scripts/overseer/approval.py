@@ -12,6 +12,7 @@ Files under `.overseer/plans/<plan_id>/`:
 Functions that write state expect the caller to hold `store.ProjectLock`.
 """
 import copy
+import hashlib
 import json
 import os
 
@@ -113,17 +114,14 @@ def approve_plan(root, plan, approver):
 
     paths.ensure_state_dir(root)
     filed = {}
+    old_revs = []
     if prev and prev.get("digest") != digest:
         result["status"] = "updated"
+        old_revs = store.read_json(_p(root, pid, "revisions.json"), [])
         hist = store.read_json(_p(root, pid, "approval_history.json"), [])
         hist.append({"approval": prev, "superseded_at": store.utc_now(), "superseded_by": digest,
-                     "filed": (old_issues or {}).get("filed", {}),
-                     "revisions": store.read_json(_p(root, pid, "revisions.json"), [])})
+                     "filed": (old_issues or {}).get("filed", {}), "revisions": old_revs})
         store.write_json_atomic(_p(root, pid, "approval_history.json"), hist)
-        try:
-            os.unlink(_p(root, pid, "revisions.json"))
-        except FileNotFoundError:
-            pass
         ids = set(u["id"] for u in norm["units"])
         filed = dict((k, v) for k, v in (old_issues or {}).get("filed", {}).items() if k in ids)
     elif old_issues:
@@ -131,6 +129,12 @@ def approve_plan(root, plan, approver):
 
     store.write_json_atomic(_p(root, pid, "plan.json"), norm)
     store.write_json_atomic(_p(root, pid, "issues.json"), {"drafts": drafts, "filed": filed})
+    if result["status"] == "updated":
+        _reset_after_reapproval(root, pid, set(u["id"] for u in norm["units"]), old_revs)
+        try:
+            os.unlink(_p(root, pid, "revisions.json"))
+        except FileNotFoundError:
+            pass
     for u in norm["units"]:
         st = load_unit_state(root, pid, u["id"])
         st["authorization"] = {"state": "approved", "plan_digest": digest}
@@ -141,6 +145,29 @@ def approve_plan(root, plan, approver):
     store.append_event(root, "plan_approved", plan_id=pid, approver=approver,
                        digest=digest, status=result["status"])
     return result
+
+
+def _reset_after_reapproval(root, plan_id, new_ids, old_revs):
+    """Undo split closures for units that reappear; archive state of units that are gone."""
+    for rev in old_revs:
+        if rev["parent"] in new_ids:
+            st = load_unit_state(root, plan_id, rev["parent"])
+            if st["closure"].get("state") == "split":
+                st["closure"] = rev.get("pre_split_closure") or {"state": "open"}
+                save_unit_state(root, plan_id, rev["parent"], st)
+    udir = os.path.join(paths.plan_dir(root, plan_id), "units")
+    gone = [n for n in (sorted(os.listdir(udir)) if os.path.isdir(udir) else []) if n not in new_ids]
+    if not gone:
+        return
+    stamp = store.utc_now().replace(":", "").replace("-", "")
+    dest = os.path.join(paths.plan_dir(root, plan_id), "archive", stamp)
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(paths.plan_dir(root, plan_id), "archive", "%s-%d" % (stamp, n))
+    os.makedirs(dest)
+    for name in gone:
+        os.rename(os.path.join(udir, name), os.path.join(dest, name))
 
 
 def require_approval(root, plan_id):
@@ -155,6 +182,7 @@ def require_approval(root, plan_id):
     if P.approval_digest(plan, issues.get("drafts")) != approval.get("digest"):
         raise ApprovalError("stored plan or issue drafts for %s no longer match the approval digest; "
                             "re-run 'plan approve'" % plan_id)
+    _verified_plan(root, plan_id, plan, approval)
     return approval
 
 
@@ -162,6 +190,11 @@ def require_approval(root, plan_id):
 
 def load_revisions(root, plan_id):
     return store.read_json(_p(root, plan_id, "revisions.json"), [])
+
+
+def revision_digest(approval_digest, rev):
+    body = dict((k, v) for k, v in rev.items() if k != "revision_digest")
+    return hashlib.sha256((approval_digest + P.canonical_json(body)).encode("utf-8")).hexdigest()
 
 
 def apply_revision(plan, rev):
@@ -180,12 +213,34 @@ def apply_revision(plan, rev):
     return out
 
 
-def effective_plan(root, plan_id):
-    """The approved plan with all recorded splits applied."""
-    plan = store.read_json(_p(root, plan_id, "plan.json"))
+def _verified_plan(root, plan_id, plan, approval):
+    """Apply every revision after recomputing its digest and re-running the split checks."""
     for rev in load_revisions(root, plan_id):
+        if rev.get("revision_digest") != revision_digest(approval["digest"], rev):
+            raise ApprovalError("revision %s of plan %s does not match its digest" % (rev.get("seq"), plan_id))
+        parent = next((u for u in plan["units"] if u["id"] == rev.get("parent")), None)
+        if parent is None:
+            raise ApprovalError("revision %s of plan %s splits unknown unit %r"
+                                % (rev.get("seq"), plan_id, rev.get("parent")))
+        try:
+            check_split(parent, rev["children"])
+        except OwnerStop as e:
+            raise ApprovalError("revision %s of plan %s fails its split checks: %s" % (rev.get("seq"), plan_id, e))
         plan = apply_revision(plan, rev)
+        errors, _ = P.validate_plan(plan)
+        if errors:
+            raise ApprovalError("revision %s of plan %s yields an invalid plan: %s"
+                                % (rev.get("seq"), plan_id, errors[0]))
     return plan
+
+
+def effective_plan(root, plan_id):
+    """The approved plan with all recorded splits applied (verified; see `_verified_plan`)."""
+    plan = store.read_json(_p(root, plan_id, "plan.json"))
+    approval = store.read_json(_p(root, plan_id, "approval.json"), None)
+    if approval is None:
+        raise ApprovalError("plan %s has no approval" % plan_id)
+    return _verified_plan(root, plan_id, plan, approval)
 
 
 def find_plan_for_unit(root, unit_id):
@@ -215,9 +270,9 @@ def _build_children(parent, spec):
         if not paths.valid_id(cid):
             raise PlanStateError("child unit id %r does not match %s" % (cid, paths.ID_PATTERN))
         if item.get("kind", parent["kind"]) != parent["kind"]:
-            raise PlanStateError("child %s changes the unit kind" % cid)
-        if not P._present(item.get("outputs")):
-            raise PlanStateError("child %s must declare outputs" % cid)
+            raise OwnerStop("child %s changes the unit kind of %s" % (cid, parent["id"]))
+        if not (isinstance(item.get("outputs"), list) and item["outputs"]):
+            raise PlanStateError("child %s must declare outputs as a non-empty list" % cid)
         ppred = dict((o["path"], o) for o in parent["outputs"])
         raw = dict((k, copy.deepcopy(parent[k])) for k in _INHERIT if k in parent)
         raw.update(copy.deepcopy(item))
@@ -228,30 +283,47 @@ def _build_children(parent, spec):
             outs.append(dict(ppred[p]) if isinstance(o, str) and p in ppred else o)
         raw["outputs"] = outs
         errors = []
-        P._check_outputs("child %s" % cid, outs, errors)
+        P._validate_unit(dict(raw, slurm=None), "child %s" % cid, [], None, errors)
         if errors:
             raise PlanStateError(errors[0])
         kids.append(P.normalize_unit(raw))
     return kids
 
 
-def _check_no_growth(parent, kids):
+def check_split(parent, kids):
+    """Refuse (OwnerStop) any child set that grows or weakens the parent."""
     pout = dict((o["path"], o) for o in parent["outputs"])
-    covered = set()
+    pclaims = parent.get("claims", [])
+    covered, claims_covered = set(), set()
     for k in kids:
+        kid = k["id"]
+        if k["kind"] != parent["kind"]:
+            raise OwnerStop("child %s changes the unit kind of %s" % (kid, parent["id"]))
+        if k.get("test_command") != parent.get("test_command"):
+            raise OwnerStop("child %s changes test_command of %s" % (kid, parent["id"]))
+        dropped = sorted(set(parent["needs"]) - set(k["needs"]))
+        if dropped:
+            raise OwnerStop("child %s drops need(s) %s of %s" % (kid, ", ".join(dropped), parent["id"]))
+        extra = [c for c in k.get("claims", []) if c not in pclaims]
+        if extra:
+            raise OwnerStop("child %s has claim(s) not in parent %s: %r" % (kid, parent["id"], extra))
+        claims_covered.update(k.get("claims", []))
         for o in k["outputs"]:
             if o["path"] not in pout:
-                raise OwnerStop("child %s adds output %r beyond parent %s" % (k["id"], o["path"], parent["id"]))
+                raise OwnerStop("child %s adds output %r beyond parent %s" % (kid, o["path"], parent["id"]))
             if o != pout[o["path"]]:
                 raise OwnerStop("child %s changes the predicate of output %r (parent %s)"
-                                % (k["id"], o["path"], parent["id"]))
+                                % (kid, o["path"], parent["id"]))
             covered.add(o["path"])
         for g in k.get("scope", []):
             if not P.scope_covers(parent.get("scope", []), g):
-                raise OwnerStop("child %s adds scope %r beyond parent %s" % (k["id"], g, parent["id"]))
-    dropped = sorted(set(pout) - covered)
-    if dropped:
-        raise OwnerStop("split of %s drops parent output(s) %s" % (parent["id"], ", ".join(map(repr, dropped))))
+                raise OwnerStop("child %s adds scope %r beyond parent %s" % (kid, g, parent["id"]))
+    lost = sorted(set(pout) - covered)
+    if lost:
+        raise OwnerStop("split of %s drops parent output(s) %s" % (parent["id"], ", ".join(map(repr, lost))))
+    lost = [c for c in pclaims if c not in claims_covered]
+    if lost:
+        raise OwnerStop("split of %s drops parent claim(s) %r" % (parent["id"], lost))
 
 
 def split_unit(root, plan_id, unit_id, spec, reason):
@@ -276,17 +348,19 @@ def split_unit(root, plan_id, unit_id, spec, reason):
         if k["id"] in ever or k["id"] in seen:
             raise PlanStateError("child unit id %r is already used in plan %s" % (k["id"], plan_id))
         seen.add(k["id"])
-    _check_no_growth(parent, kids)
+    check_split(parent, kids)
 
     now = store.utc_now()
     rev = {"seq": len(load_revisions(root, plan_id)) + 1, "time": now, "parent": unit_id,
            "reason": reason.strip(), "children": kids,
+           "pre_split_closure": pstate["closure"],
            "drafts": dict((k["id"], P.render_draft(plan_id, k)) for k in kids)}
     errors, _ = P.validate_plan(apply_revision(eff, rev))
     if errors:
         raise PlanStateError("split produces an invalid plan: " + "; ".join(errors))
 
     digest = require_approval(root, plan_id)["digest"]
+    rev["revision_digest"] = revision_digest(digest, rev)
     for k in kids:
         st = default_unit_state(plan_id, k["id"], digest)
         st["lineage"] = {"parent": unit_id, "reason": rev["reason"], "time": now}
@@ -316,7 +390,10 @@ def describe_plan(root, plan_id):
     lines = ["plan: %s" % plan_id, "digest: %s" % approval["digest"],
              "approver: %s at %s" % (approval["approver"], approval["approved_at"]),
              "approval: %s" % verdict]
-    units = effective_plan(root, plan_id)["units"]
+    try:
+        units = effective_plan(root, plan_id)["units"]
+    except ApprovalError:
+        units = plan["units"]
     lines.append("units: %d" % len(units))
     for u in units:
         st = load_unit_state(root, plan_id, u["id"])

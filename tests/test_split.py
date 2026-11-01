@@ -134,6 +134,89 @@ class SplitTests(TmpCase):
         with self.assertRaises(A.ApprovalError):
             self.split(self.good_children())
 
+    def test_children_must_keep_needs_claims_test_command_kind(self):
+        beta_kids = lambda **kw: [dict({"id": "beta-a", "outputs": ["src/beta.py"]}, **kw)]
+        for kw, needle in (
+            ({"needs": []}, "drops need(s) alpha"),
+            ({"claims": ["something new"]}, "claim(s) not in parent beta"),
+            ({"claims": ["beta works"]}, "drops parent claim(s)"),
+            ({"test_command": "true"}, "changes test_command"),
+            ({"kind": "job", "command": "x"}, "changes the unit kind"),
+        ):
+            with self.assertRaises(A.OwnerStop, msg=str(kw)) as cm:
+                self.split(beta_kids(**kw), unit="beta")
+            self.assertIn(needle, str(cm.exception))
+        self.assertEqual(A.load_unit_state(self.root, "demo", "beta")["closure"]["state"], "open")
+
+    def test_children_may_add_needs_and_split_claims(self):
+        kids = [{"id": "beta-a", "outputs": ["src/beta.py"], "claims": ["beta works"]},
+                {"id": "beta-b", "outputs": ["src/beta.py"], "claims": ["beta is fast"],
+                 "needs": ["alpha", "beta-a"]}]
+        self.split(kids, unit="beta")
+        ids = [u["id"] for u in A.effective_plan(self.root, "demo")["units"]]
+        self.assertEqual(ids, ["alpha", "beta-a", "beta-b", "crunch"])
+
+    def test_malformed_child_fields_refused(self):
+        for kw in ({"scope": "src/**"}, {"claims": "text"}, {"needs": "alpha"}):
+            kids = self.good_children()
+            kids[0].update(kw)
+            with self.assertRaises(A.PlanStateError, msg=str(kw)):
+                self.split(kids)
+        kids = self.good_children()
+        kids[0]["outputs"] = "src/alpha.py"
+        with self.assertRaises(A.PlanStateError):
+            self.split(kids)
+
+    def test_reapprove_resets_split_closure_and_archives_children(self):
+        st = A.load_unit_state(self.root, "demo", "alpha")
+        st["closure"] = {"state": "blocked", "note": "x"}
+        A.save_unit_state(self.root, "demo", "alpha", st)
+        self.split(self.good_children())
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"]["state"], "split")
+        changed = plan_copy()
+        changed["units"][1]["prompt"] = "different"
+        res = A.approve_plan(self.root, changed, "tester")
+        self.assertEqual(res["status"], "updated")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"],
+                         {"state": "blocked", "note": "x"})
+        units = os.path.join(paths.plan_dir(self.root, "demo"), "units")
+        self.assertEqual(sorted(os.listdir(units)), ["alpha", "beta", "crunch"])
+        arch = os.path.join(paths.plan_dir(self.root, "demo"), "archive")
+        stamps = os.listdir(arch)
+        self.assertEqual(len(stamps), 1)
+        self.assertEqual(sorted(os.listdir(os.path.join(arch, stamps[0]))), ["alpha-a", "alpha-b"])
+        self.assertFalse(os.path.exists(os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")))
+        self.assertEqual([u["id"] for u in A.effective_plan(self.root, "demo")["units"]],
+                         ["alpha", "beta", "crunch"])
+
+    def revisions_path(self):
+        return os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")
+
+    def test_revision_digest_and_tampering(self):
+        self.split(self.good_children())
+        revs = store.read_json(self.revisions_path())
+        self.assertEqual(revs[0]["revision_digest"], A.revision_digest(self.digest, revs[0]))
+        A.effective_plan(self.root, "demo")
+        revs[0]["reason"] = "edited"
+        store.write_json_atomic(self.revisions_path(), revs)
+        with self.assertRaisesRegex(A.ApprovalError, "does not match its digest"):
+            A.effective_plan(self.root, "demo")
+        with self.assertRaisesRegex(A.ApprovalError, "does not match its digest"):
+            A.require_approval(self.root, "demo")
+
+    def test_forged_revision_with_valid_digest_fails_split_checks(self):
+        self.split(self.good_children())
+        revs = store.read_json(self.revisions_path())
+        revs[0]["children"][0]["scope"] = ["src/alpha.py", "docs/*.md"]
+        revs[0]["revision_digest"] = A.revision_digest(self.digest, revs[0])
+        store.write_json_atomic(self.revisions_path(), revs)
+        with self.assertRaisesRegex(A.ApprovalError, "adds scope"):
+            A.effective_plan(self.root, "demo")
+        with self.assertRaises(A.ApprovalError):
+            A.require_approval(self.root, "demo")
+        r = self.cli("plan", "show", "demo")
+        self.assertIn("INVALID", r.stdout)
+
     def test_cli_split_and_show(self):
         spec = os.path.join(self.tmp, "spec.json")
         with open(spec, "w") as f:

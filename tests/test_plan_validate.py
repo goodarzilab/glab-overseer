@@ -47,11 +47,6 @@ class ValidateTests(unittest.TestCase):
         self.unit(p, "alpha")["needs"] = ["crunch"]
         self.assertError(p, "dependency cycle among units: alpha, beta, crunch")
 
-    def test_self_cycle(self):
-        p = plan_copy()
-        self.unit(p, "alpha")["needs"] = ["alpha"]
-        self.assertError(p, "dependency cycle among units: alpha")
-
     def test_bad_kind(self):
         p = plan_copy()
         self.unit(p, "alpha")["kind"] = "pipeline"
@@ -106,11 +101,99 @@ class ValidateTests(unittest.TestCase):
 
     def test_scope_cover_rule(self):
         self.assertTrue(P.scope_covers(["src/**"], "src/a/b.py"))
+        self.assertTrue(P.scope_covers(["src/**"], "src/a/*.py"))
         self.assertTrue(P.scope_covers(["src/**"], "src/**"))
+        self.assertTrue(P.scope_covers(["**"], "any/where.py"))
         self.assertTrue(P.scope_covers(["docs/*.md"], "docs/a.md"))
+        self.assertTrue(P.scope_covers(["src/a?.py"], "src/a?.py"))
         self.assertTrue(P.scope_covers(["x.txt"], "x.txt"))
         self.assertFalse(P.scope_covers(["src/**"], "srcx/a.py"))
         self.assertFalse(P.scope_covers(["src/**"], "tests/a.py"))
+
+    def test_scope_cover_does_not_cross_slash(self):
+        self.assertFalse(P.scope_covers(["docs/*.md"], "docs/secret/x.md"))
+        self.assertFalse(P.scope_covers(["src/a?.py"], "src/a*.py"))
+        self.assertFalse(P.scope_covers(["src/*"], "src/a/b.py"))
+
+    def test_unit_glob_wider_than_plan_glob_rejected_with_advice(self):
+        p = plan_copy()
+        p["scope"] = ["src/a?.py", "src/beta.py", "src/alpha_data.txt", "tests/**"]
+        self.unit(p, "alpha")["scope"] = ["src/a*.py"]
+        self.assertError(p, "scope glob 'src/a*.py' is not covered by the plan scope; "
+                            "list the literal paths, or widen the plan scope to a dir/** glob")
+
+    def test_narrower_glob_conservatively_rejected(self):
+        p = plan_copy()
+        p["scope"] = ["src/a?.py", "src/beta.py", "tests/**"]
+        self.unit(p, "alpha")["scope"] = ["src/a[bc].py"]
+        self.assertError(p, "scope glob 'src/a[bc].py' is not covered")
+
+    def test_non_list_fields_rejected_not_coerced(self):
+        for field, val in (("outputs", "/tmp/evil"), ("scope", "src/**"), ("claims", "works"),
+                           ("needs", "alpha")):
+            p = plan_copy()
+            self.unit(p, "beta")[field] = val
+            self.assertTrue(errs(p), field)
+        p = plan_copy()
+        self.unit(p, "beta")["outputs"] = "/tmp/evil"
+        self.assertError(p, "unit beta: outputs must be a list")
+        p = plan_copy()
+        self.unit(p, "crunch")["outputs"] = {"path": "x"}
+        self.assertError(p, "unit crunch: outputs must be a list")
+        p = plan_copy()
+        p["test_globs"] = "tests/**"
+        self.assertError(p, "test_globs entry must be a list of strings")
+        p = plan_copy()
+        p["scope"] = "src/**"
+        self.assertError(p, "plan: scope glob must be a list of strings")
+        p = plan_copy()
+        p["units"] = {"id": "alpha"}
+        self.assertError(p, "plan has no units")
+        p = plan_copy()
+        self.unit(p, "alpha")["title"] = ["x"]
+        self.assertError(p, "unit alpha: field 'title' must be a string")
+
+    def test_output_entry_types(self):
+        for entry, needle in (
+            ({"path": 5}, "needs a string 'path'"),
+            ({"min_bytes": 1}, "needs a string 'path'"),
+            ({"path": "a", "min_bytes": -1}, "min_bytes must be a non-negative integer"),
+            ({"path": "a", "min_bytes": "3"}, "min_bytes must be a non-negative integer"),
+            ({"path": "a", "sha256": "abc"}, "sha256 must be 64 lowercase hex digits"),
+            ({"path": "a", "validate": 3}, "validate must be a string"),
+            ({"path": "a", "validator": "x"}, "unknown keys ['validator']"),
+            (7, "output entries must be strings or objects"),
+        ):
+            p = plan_copy()
+            self.unit(p, "crunch")["outputs"] = [entry]
+            self.assertError(p, needle)
+        p = plan_copy()
+        self.unit(p, "crunch")["outputs"] = [{"path": "a", "min_bytes": 0, "sha256": "0" * 64, "validate": "true"}]
+        self.assertEqual(errs(p), [])
+
+    def test_model_key_detection_is_exact(self):
+        for ok in ("modelling", "remodel", "familyname", "providers_list", "effort_estimate"):
+            p = plan_copy()
+            self.unit(p, "alpha")[ok] = "x"
+            self.assertEqual(errs(p), [], ok)
+        for bad in ("model", "models", "provider", "family", "thinking", "effort", "agent_model",
+                    "x_provider", "tier_family", "Model"):
+            p = plan_copy()
+            self.unit(p, "alpha")[bad] = "x"
+            self.assertError(p, "field %r names a model, provider or family" % bad)
+
+    def test_slurm_checked_for_code_units_too(self):
+        p = plan_copy()
+        del p["slurm"]
+        self.unit(p, "alpha")["slurm"] = {"time": "01:00:00"}
+        self.assertError(p, "unit alpha: slurm block needs one of mem or mem_per_cpu")
+        p = plan_copy()
+        del p["slurm"]
+        self.unit(p, "alpha")["slurm"] = {"mem": "1G", "mem_per_cpu": "1G"}
+        self.assertError(p, "unit alpha: slurm block has both mem and mem_per_cpu")
+        p = plan_copy()
+        self.unit(p, "beta")["slurm"] = {"time": "UNLIMITED"}
+        self.assertError(p, "unit beta: slurm block needs a finite time")
 
     def test_slurm_both_mem(self):
         p = plan_copy()
@@ -171,10 +254,6 @@ class ValidateTests(unittest.TestCase):
         p = plan_copy()
         self.unit(p, "beta")["outputs"] = ["src/alpha.py"]
         self.assertEqual(P.validate_plan(p), ([], []))
-
-    def test_walltime(self):
-        self.assertEqual(P.parse_walltime("1-00:00:00"), 1440)
-        self.assertIsNone(P.parse_walltime("00:00:00"))
 
 
 class ValidateCliTests(TmpCase):

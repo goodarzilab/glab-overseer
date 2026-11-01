@@ -1,8 +1,15 @@
 """Atomic JSON writes, the append-only event log and the project mutation lock.
 
-The lock is advisory between cooperating supervisor processes and relies on
-`O_EXCL` atomicity on the shared filesystem. There is no stale-lock reaping:
-only `overseer.py unlock --force --reason TEXT` removes a lock.
+The lock is advisory between cooperating supervisor processes. The holder
+record is written to a temporary file in the same directory and published with
+`os.link`, which fails with EEXIST when the lock is held, so a contender never
+sees a lock without its holder record. There is no stale-lock reaping: only
+`overseer.py unlock --force --reason TEXT` removes a lock. `unlock` refuses when
+the holder is a live process on this host unless `--even-if-alive` is given.
+
+Accepted limit: a holder on another host cannot be probed, so a forced unlock
+of a live remote holder, or a forced unlock racing a release, can let two
+supervisors run at once. Operators own that decision.
 """
 import json
 import os
@@ -125,14 +132,17 @@ class ProjectLock(object):
             "command": self.command, "host": socket.gethostname(),
             "pid": os.getpid(), "time": utc_now(), "token": self.token,
         }
-        try:
-            fd = os.open(paths.lock_path(self.root), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            raise LockHeld(read_lock(self.root))
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        tmp = os.path.join(paths.state_dir(self.root), ".lock.%s.tmp" % self.token)
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f)
             f.flush()
             os.fsync(f.fileno())
+        try:
+            os.link(tmp, paths.lock_path(self.root))
+        except FileExistsError:
+            raise LockHeld(read_lock(self.root))
+        finally:
+            os.unlink(tmp)
         self.held = True
         return self
 
@@ -155,16 +165,41 @@ class ProjectLock(object):
         return False
 
 
-def force_unlock(root, reason):
+class LockAlive(RuntimeError):
+    pass
+
+
+def holder_alive(holder):
+    """True when the holder is a live process on this host."""
+    if not holder or holder.get("host") != socket.gethostname():
+        return False
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def force_unlock(root, reason, even_if_alive=False):
     """Remove the lock and record an event. Returns the removed holder or None."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("unlock requires a non-blank --reason")
     holder = read_lock(root)
     if holder is None:
         return None
+    alive = holder_alive(holder)
+    if alive and not even_if_alive:
+        raise LockAlive("lock holder '%s' (pid %s) is alive on this host; "
+                        "pass --even-if-alive to remove it anyway" % (holder.get("command"), holder.get("pid")))
     try:
         os.unlink(paths.lock_path(root))
     except FileNotFoundError:
         return None
-    append_event(root, "unlock", reason=reason.strip(), previous_holder=holder)
+    append_event(root, "unlock", reason=reason.strip(), previous_holder=holder,
+                 holder_alive=alive, even_if_alive=bool(even_if_alive))
     return holder

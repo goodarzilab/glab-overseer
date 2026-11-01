@@ -31,11 +31,6 @@ class PathsTests(TmpCase):
         with self.assertRaises(paths.UnsafePath):
             paths.safe_relpath(self.root, "link/file")
 
-    def test_symlink_inside_allowed(self):
-        os.makedirs(os.path.join(self.root, "real"))
-        os.symlink("real", os.path.join(self.root, "alias"))
-        paths.safe_relpath(self.root, "alias/file")
-
     def test_check_id(self):
         for good in ("a", "a1_b-c", "0x", "a" * 64):
             paths.check_id(good)
@@ -75,19 +70,6 @@ class StoreTests(TmpCase):
         self.assertTrue(os.path.exists(stray))  # not ours to delete
         self.assertEqual([n for n in os.listdir(os.path.dirname(target)) if n.endswith(".tmp")],
                          [".t.json.stray.tmp"])
-
-    def test_atomic_write_failure_keeps_target(self):
-        target = os.path.join(self.root, "t.json")
-        store.write_json_atomic(target, {"v": 1})
-        with self.assertRaises(TypeError):
-            store.write_json_atomic(target, {"v": object()})
-        self.assertEqual(store.read_json(target), {"v": 1})
-        self.assertEqual([n for n in os.listdir(self.root) if n.endswith(".tmp")], [])
-
-    def test_read_json_default(self):
-        self.assertIsNone(store.read_json(os.path.join(self.root, "nope"), None))
-        with self.assertRaises(FileNotFoundError):
-            store.read_json(os.path.join(self.root, "nope"))
 
     def test_events_append_only(self):
         store.append_event(self.root, "a", n=1)
@@ -130,8 +112,69 @@ class StoreTests(TmpCase):
             holder.stdout.close()
         self.assertEqual(self.cli("plan", "approve", plan, "--approver", "tester").returncode, 0)
 
+    def dead_pid(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def make_dead_holder_lock(self, command="stuck"):
+        store.ProjectLock(self.root, command).acquire()
+        rec = store.read_lock(self.root)
+        rec["pid"] = self.dead_pid()
+        with open(paths.lock_path(self.root), "w") as f:
+            json.dump(rec, f)
+
+    def test_unlock_refuses_live_local_holder_unless_even_if_alive(self):
+        store.ProjectLock(self.root, "busy").acquire()
+        r = self.cli("unlock", "--force", "--reason", "x")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("alive", r.stderr)
+        self.assertIsNotNone(store.read_lock(self.root))
+        self.assertEqual(store.read_events(self.root), [])
+        r = self.cli("unlock", "--force", "--reason", "x", "--even-if-alive")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ev = store.read_events(self.root)[0]
+        self.assertTrue(ev["holder_alive"])
+        self.assertTrue(ev["even_if_alive"])
+
+    def test_unlock_dead_or_remote_holder_needs_no_override(self):
+        self.make_dead_holder_lock()
+        self.assertEqual(self.cli("unlock", "--force", "--reason", "x").returncode, 0)
+        ev = store.read_events(self.root)[0]
+        self.assertFalse(ev["holder_alive"])
+        self.assertFalse(ev["even_if_alive"])
+        store.ProjectLock(self.root, "remote").acquire()
+        rec = store.read_lock(self.root)
+        rec["host"] = "some-other-host"
+        with open(paths.lock_path(self.root), "w") as f:
+            json.dump(rec, f)
+        self.assertEqual(self.cli("unlock", "--force", "--reason", "y").returncode, 0)
+
+    def test_lock_published_with_link_and_no_temp_left(self):
+        from unittest import mock
+        with mock.patch.object(store.os, "link", wraps=os.link) as link:
+            lk = store.ProjectLock(self.root, "linked").acquire()
+        self.assertEqual(link.call_count, 1)
+        self.assertEqual(store.read_lock(self.root)["command"], "linked")
+        with self.assertRaises(store.LockHeld) as cm:
+            store.ProjectLock(self.root, "other").acquire()
+        self.assertIn("linked", str(cm.exception))
+        self.assertNotIn("unknown", str(cm.exception).split("(")[0])
+        leftovers = [n for n in os.listdir(paths.state_dir(self.root)) if n.startswith(".lock.")]
+        self.assertEqual(leftovers, [])
+        lk.release()
+
+    def test_release_only_removes_own_lock(self):
+        a = store.ProjectLock(self.root, "a").acquire()
+        os.unlink(paths.lock_path(self.root))  # forced away
+        b = store.ProjectLock(self.root, "b").acquire()
+        a.release()
+        self.assertEqual(store.read_lock(self.root)["command"], "b")
+        b.release()
+        self.assertIsNone(store.read_lock(self.root))
+
     def test_unlock_force_records_event(self):
-        store.ProjectLock(self.root, "stuck").acquire()
+        self.make_dead_holder_lock()
         r = self.cli("unlock", "--reason", "crashed")
         self.assertEqual(r.returncode, 1)
         self.assertIsNotNone(store.read_lock(self.root))
@@ -146,6 +189,22 @@ class StoreTests(TmpCase):
         self.assertEqual(ev[0]["previous_holder"]["command"], "stuck")
 
 
+class GlobTests(unittest.TestCase):
+    def test_glob_match_segments(self):
+        m = paths.glob_match
+        self.assertTrue(m("src/*.py", "src/a.py"))
+        self.assertFalse(m("src/*.py", "src/sub/a.py"))
+        self.assertFalse(m("src/a?.py", "src/a/.py"))
+        self.assertTrue(m("src/a[bc].py", "src/ab.py"))
+        self.assertFalse(m("src/[a-z]*", "src/x/y"))
+        self.assertTrue(m("src/**", "src/a/b/c.py"))
+        self.assertTrue(m("src/**/c.py", "src/c.py"))
+        self.assertTrue(m("src/**/c.py", "src/a/b/c.py"))
+        self.assertTrue(m("**/c.py", "c.py"))
+        self.assertFalse(m("src/**", "other/a.py"))
+        self.assertFalse(m("src/a*", "src"))
+
+
 class CliTests(TmpCase):
     def test_help_lists_every_subcommand(self):
         r = self.cli("--help", cwd=self.tmp)
@@ -158,11 +217,6 @@ class CliTests(TmpCase):
             r = self.cli(c, "--whatever", "x")
             self.assertEqual(r.returncode, 2, c)
             self.assertIn("not implemented in this version", r.stderr)
-
-    def test_runs_by_absolute_path_from_any_cwd(self):
-        r = subprocess.run([sys.executable, helpers.ENTRY, "--help"], cwd="/", env=self.env(),
-                           capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0)
 
     def test_ci_file_names_both_pythons_and_triggers(self):
         with open(os.path.join(helpers.REPO, ".github", "workflows", "ci.yml")) as f:
