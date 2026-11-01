@@ -1,0 +1,31 @@
+JobId=3507140 JobName=overseer-fx-a1-abcd1234
+   UserId=user1(10006) GroupId=lab-group(10002) MCS_label=N/A
+   Priority=136 Nice=0 Account=lab-account QOS=normal
+   JobState=RUNNING Reason=None Dependency=(null)
+   Requeue=1 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+   RunTime=00:00:06 TimeLimit=00:05:00 TimeMin=N/A
+   SubmitTime=2026-11-01T12:01:37 EligibleTime=2026-11-01T12:01:37
+   AccrueTime=2026-11-01T12:01:37
+   StartTime=2026-11-01T12:01:38 EndTime=2026-11-01T12:06:38 Deadline=N/A
+   PreemptEligibleTime=2026-11-01T12:01:38 PreemptTime=None
+   SuspendTime=None SecsPreSuspend=0 LastSchedEval=2026-11-01T12:01:38 Scheduler=Main
+   Partition=batch-cpu AllocNode:Sid=node001:2386399
+   ReqNodeList=(null) ExcNodeList=(null)
+   NodeList=node001
+   BatchHost=node001
+   NumNodes=1 NumCPUs=2 NumTasks=1 CPUs/Task=1 ReqB:S:C:T=0:0:*:*
+   ReqTRES=cpu=1,mem=1G,node=1,billing=1
+   AllocTRES=cpu=2,mem=1G,node=1,billing=2
+   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+   MinCPUsNode=1 MinMemoryNode=1G MinTmpDiskNode=0
+   Features=(null) DelayBoot=00:00:00
+   OverSubscribe=OK Contiguous=0 Licenses=(null) LicensesAlloc=(null) Network=(null)
+   Command=/work/project/job.sh
+   SubmitLine=sbatch --parsable --job-name overseer-fx-a1-abcd1234 --comment tok-abcd1234 --chdir /work/project --output /work/project/slurm-%j.out --error /work/project/slurm-%j.err --partition batch-cpu --time 00:05:00 --mem 1G --cpus-per-task 1 /work/project/job.sh
+   WorkDir=/work/project
+   Comment=tok-abcd1234
+   StdErr=/work/project/slurm-3507140.err
+   StdIn=/dev/null
+   StdOut=/work/project/slurm-3507140.out
+   TresPerTask=cpu=1
+
