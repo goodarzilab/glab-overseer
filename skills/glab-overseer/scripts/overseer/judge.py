@@ -43,8 +43,8 @@ def _invocations(root, plan_id, unit, n):
 def execution_evidence(invs):
     """(class, evidence) from the attempt's invocations: class is success, failure or uncertain.
 
-    A queued or running invocation refuses; the latest invocation decides success or failure,
-    but any UNCERTAIN or CANCELLING one makes the attempt uncertain.
+    A queued or running invocation refuses. Definite failure in any invocation wins; otherwise
+    any UNCERTAIN or CANCELLING one makes the attempt uncertain; otherwise the latest decides.
     """
     if not invs or invs[-1]["status"]["state"] == "NOT_LAUNCHED":
         raise JudgeError("nothing was launched for this attempt")
@@ -55,13 +55,21 @@ def execution_evidence(invs):
     s = last["status"]
     if s["state"] == "RESOLVED":
         raise JudgeError("invocation %s was resolved by the orchestrator; see judgment.json" % last["seq"])
-    ev = {"invocation": last["seq"], "state": s["state"], "rc": s.get("rc"), "signal": s.get("signal"),
-          "verdict": s.get("verdict"), "evidence": s.get("evidence"), "reason": s.get("reason")}
-    if any(i["status"]["state"] in ("UNCERTAIN", "CANCELLING") for i in invs):
-        return "uncertain", ev
-    if s["state"] == "EXITED" and s.get("rc") == 0 and not s.get("signal") and s.get("verdict") in (None, "COMPLETED"):
-        return "success", ev
-    return "failure", ev
+    def detail(i):
+        t = i["status"]
+        return {"invocation": i["seq"], "state": t["state"], "rc": t.get("rc"), "signal": t.get("signal"),
+                "verdict": t.get("verdict"), "evidence": t.get("evidence"), "reason": t.get("reason")}
+
+    def clean(t):
+        return t["state"] == "EXITED" and t.get("rc") == 0 and not t.get("signal") and t.get("verdict") in (None, "COMPLETED")
+    failed = [i for i in invs if i["status"]["state"] in ("CANCELLED", "LAUNCH_FAILED")
+              or (i["status"]["state"] == "EXITED" and not clean(i["status"]))]
+    if failed:
+        return "failure", detail(failed[-1])
+    unsure = [i for i in invs if i["status"]["state"] in ("UNCERTAIN", "CANCELLING")]
+    if unsure:
+        return "uncertain", detail(unsure[-1])
+    return ("success" if clean(s) else "failure"), detail(last)
 
 
 # ---- output predicates -------------------------------------------------------
@@ -133,6 +141,20 @@ def job_outputs(adir, unit):
     """Each declared output under attempts/a<N>/outputs/ (symlinks must stay inside it)."""
     out = os.path.join(adir, "outputs")
     results = []
+    watch = {}  # path -> (size, sha256) before any validator ran
+
+    def snap(f):
+        with open(f, "rb") as fh:
+            data = fh.read()
+        return len(data), hashlib.sha256(data).hexdigest()
+    if any(isinstance(o, dict) and o.get("validate") is not None for o in unit["outputs"]):
+        for o in unit["outputs"]:
+            try:
+                f = paths.safe_relpath(out, o["path"] if isinstance(o, dict) else o)
+                if os.path.isfile(f):
+                    watch[f] = snap(f)
+            except (paths.UnsafePath, OSError):
+                pass
     for o in unit["outputs"]:
         o = o if isinstance(o, dict) else {"path": o}
         p = o["path"]
@@ -149,8 +171,26 @@ def job_outputs(adir, unit):
                 def read(f=full):
                     with open(f, "rb") as fh:
                         return fh.read()
-                problems = _predicate(o, 1, os.path.getsize(full), read, _validate_runner(out, full))
-        results.append({"path": p, "ok": not problems, "problems": problems})
+                def run_v(cmd, full=full):  # a private copy: the validator never sees the live output
+                    tmp = tempfile.mkdtemp(prefix="ovr-validate-")
+                    try:
+                        f = os.path.join(tmp, os.path.basename(full))
+                        shutil.copyfile(full, f)
+                        return _validate_runner(tmp, f)(cmd)
+                    finally:
+                        shutil.rmtree(tmp, True)
+                problems = _predicate(o, 1, os.path.getsize(full), read, run_v)
+        results.append({"path": p, "ok": not problems, "problems": problems, "_full": full})
+    for r in results:  # after all validators: the originals must be unchanged
+        full = r.pop("_full")
+        if full in watch:
+            try:
+                same = snap(full) == watch[full]
+            except OSError:
+                same = False
+            if not same:
+                r["problems"].append("output changed while validators ran")
+                r["ok"] = False
     return results
 
 
@@ -203,9 +243,11 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
     norm = W.normalize(root, plan_id, unit, adir, n)
     j.update(base=norm["base"], candidate=norm["candidate"], reasons=list(norm["reasons"]),
              out_of_scope_dirty=norm["out_of_scope_dirty"], commits=norm["commits"])
-    if not norm["ok"]:
-        return j
     wt, cand = W.load_workspace(adir)["worktree"], norm["candidate"]
+    if not norm["ok"]:
+        if cand:  # per-output results are evidence even when the judgment fails
+            j["outputs"] = code_outputs(wt, cand, unit)
+        return j
     r = E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=wt)
     log = os.path.join(adir, "test.log")
     with open(log, "w", encoding="utf-8") as f:
@@ -216,10 +258,9 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
     elif r["rc"] != 0:
         j["reasons"].append("test_failed:rc=%s" % r["rc"])
     j["reasons"] += _worktree_problems(wt, cand, "test")
-    if not j["reasons"]:
-        j["outputs"] = code_outputs(wt, cand, unit)
-        j["reasons"] += ["output_failed:%s: %s" % (o["path"], "; ".join(o["problems"])) for o in j["outputs"] if not o["ok"]]
-        j["reasons"] += _worktree_problems(wt, cand, "validator")
+    j["outputs"] = code_outputs(wt, cand, unit)
+    j["reasons"] += ["output_failed:%s: %s" % (o["path"], "; ".join(o["problems"])) for o in j["outputs"] if not o["ok"]]
+    j["reasons"] += _worktree_problems(wt, cand, "validator")
     if not j["reasons"]:
         j["status"] = "DONE"
     return j

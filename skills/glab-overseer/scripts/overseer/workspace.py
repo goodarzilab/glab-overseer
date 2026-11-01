@@ -168,7 +168,7 @@ def dispatch_code(root, plan_id, unit, after_quota=False):
     X.check_slots(root, plan_id, plan["caps"]["workers"])
     target = check_branch_name(plan["target_branch"])
     try:
-        git(root, "fetch", "origin", "refs/heads/%s:refs/remotes/origin/%s" % (target, target), timeout=FETCH_TIMEOUT)
+        git(root, "fetch", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (target, target), timeout=FETCH_TIMEOUT)
     except GitError as e:
         raise WorkspaceError("git fetch origin %s failed; refusing to dispatch: %s" % (target, e))
     base = rev(root, "refs/remotes/origin/" + target)
@@ -268,9 +268,6 @@ def classify_dirty(wt, scope, outputs):
     for xy, path, origin in entries:
         if xy == "??" and excluded(path):
             continue
-        if xy != "??" and excluded(path):
-            reasons.append("cache_file_changed:" + path)
-            continue
         if "U" in xy or xy in ("AA", "DD"):
             reasons.append("unmerged:" + path)
             continue
@@ -325,6 +322,16 @@ def ignored_outputs(wt, scope, outputs):
     return found, reasons
 
 
+def ignored_in_scope(wt, scope, outputs):
+    """Ignored untracked files under the scope that are neither cache files nor declared outputs.
+
+    They are invisible to status and to the commit, yet a test could pass by reading them."""
+    ents = parse_status(git(wt, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=all",
+                            raw=True)["stdout"])
+    return sorted(p for xy, p, _ in ents
+                  if xy == "!!" and not excluded(p) and in_scope(p.rstrip("/"), scope) and p not in outputs)
+
+
 def normalize(root, plan_id, unit, adir, n):
     """Check the worktree and seal a candidate. Returns dict(ok, reasons, candidate, out_of_scope_dirty, commits)."""
     ws = load_workspace(adir)
@@ -359,7 +366,8 @@ def normalize(root, plan_id, unit, adir, n):
     res["commits"] = list(commits)
     add, staged, reasons, oos = classify_dirty(wt, scope, outputs)
     forced, freasons = ignored_outputs(wt, scope, outputs)
-    res["reasons"] += reasons + freasons
+    hidden = ignored_in_scope(wt, scope, outputs)
+    res["reasons"] += reasons + freasons + (["ignored_in_scope:" + ",".join(hidden)] if hidden else [])
     res["out_of_scope_dirty"] = oos
     res["reasons"] += ["out_of_scope_dirty:" + p for p in oos]
     if res["reasons"]:

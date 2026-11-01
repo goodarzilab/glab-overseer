@@ -322,12 +322,65 @@ class Hardening(Case):
         self.assertEqual(j["status"], "FAILED")
         self.assertTrue(any(r.startswith("validator_modified_tracked:") for r in j["reasons"]), j["reasons"])
 
+    EXCL = 'printf "src/alpha.py\\nsrc/alpha_junk*\\nbuild/\\n" >> "$(git rev-parse --git-path info/exclude)"'
+
     def test_gitignored_declared_output_is_force_added_but_other_ignored_files_are_not(self):
-        j = self.run_unit('mkdir -p src; echo a > src/alpha.py; echo j > src/alpha_junk.log; '
-                          'printf "src/alpha.py\\nsrc/alpha_junk*\\n" >> "$(git rev-parse --git-path info/exclude)"',
-                          expect="DONE")
-        self.assertEqual(sh(self.wt(), "ls-files", "src"), "src/alpha.py\nsrc/alpha_old.py")
-        self.assertTrue(os.path.exists(os.path.join(self.wt(), "src", "alpha_junk.log")))
+        self.run_unit('mkdir -p src build; echo a > src/alpha.py; echo j > build/junk.log; ' + self.EXCL, expect="DONE")
+        self.assertEqual(sh(self.wt(), "ls-files", "src", "build"), "src/alpha.py\nsrc/alpha_old.py")
+        self.assertTrue(os.path.exists(os.path.join(self.wt(), "build", "junk.log")))
+
+    def test_ignored_undeclared_file_inside_scope_fails(self):
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py; echo j > src/alpha_junk.log; ' + self.EXCL)
+        self.assertEqual((j["status"], j["reasons"]), ("FAILED", ["ignored_in_scope:src/alpha_junk.log"]))
+
+    def test_tracked_file_with_a_cache_name_is_judged_by_scope_not_excluded(self):
+        self.run_unit('mkdir -p src/t/__pycache__; echo a > src/alpha.py; echo 1 > src/t/__pycache__/in.txt; '
+                      'git add -f src/t; %s; echo 2 > src/t/__pycache__/in.txt' % COMMIT, expect="DONE",
+                      unit={"scope": ["src/**"]})
+        self.assertEqual(sh(self.wt(), "show", "HEAD:src/t/__pycache__/in.txt"), "2")
+
+    def test_fetch_follows_a_rewound_target(self):
+        self.approve()
+        init = sh(self.root, "rev-parse", "HEAD")
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "clone", "-q", "-b", "main", self.origin, other)
+        self.put("NEWS.md", "n\n", base=other)
+        sh(other, *(ID + ["add", "-A"]))
+        sh(other, *(ID + ["commit", "-q", "-m", "advance"]))
+        sh(other, "push", "-q", "origin", "main")
+        sh(self.root, "fetch", "-q", "origin")
+        sh(other, "push", "-q", "-f", "origin", init + ":refs/heads/main")
+        self.author("true")
+        self.assertEqual(self.cli("dispatch", "--unit", "alpha")[0], 0)
+        self.assertEqual(jload(os.path.join(self.attempt_dir(), "workspace.json"))["base"], init)
+
+    def test_earlier_uncertain_does_not_mask_a_later_definite_failure(self):
+        u = {"seq": "01", "status": {"state": "UNCERTAIN"}}
+        bad = {"seq": "02", "status": {"state": "EXITED", "rc": 3}}
+        ok = {"seq": "02", "status": {"state": "EXITED", "rc": 0}}
+        self.assertEqual(J.execution_evidence([u, bad])[0], "failure")
+        self.assertEqual(J.execution_evidence([bad, u])[0], "failure")
+        self.assertEqual(J.execution_evidence([u, ok])[0], "uncertain")
+        self.assertEqual(J.execution_evidence([ok])[0], "success")
+
+    def test_outputs_are_recorded_even_when_the_judgment_fails(self):
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py', unit={"test_command": "exit 7"})
+        self.assertEqual(j["reasons"], ["test_failed:rc=7"])
+        self.assertEqual([(o["path"], o["ok"]) for o in j["outputs"]], [("src/alpha.py", True)])
+
+    def test_job_validators_see_a_private_copy_and_cannot_change_outputs(self):
+        adir = os.path.join(self.tmp, "att2")
+        out = os.path.join(adir, "outputs")
+        self.put("ok.txt", "hello\n", base=out)
+        self.put("other.txt", "o\n", base=out)
+        res = J.job_outputs(adir, {"outputs": [{"path": "ok.txt", "validate": 'echo x >> "$OVERSEER_OUTPUT"'}]})
+        self.assertEqual(res[0]["problems"], [])
+        with open(os.path.join(out, "ok.txt")) as f:
+            self.assertEqual(f.read(), "hello\n")
+        res = J.job_outputs(adir, {"outputs": [{"path": "ok.txt", "validate": "echo x >> %s" % os.path.join(out, "other.txt")},
+                                              "other.txt"]})
+        self.assertEqual([r["ok"] for r in res], [True, False])
+        self.assertIn("changed while validators ran", res[1]["problems"][0])
 
 
 class Dispatch(Case):
