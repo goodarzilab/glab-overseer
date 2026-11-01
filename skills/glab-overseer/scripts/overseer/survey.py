@@ -182,16 +182,25 @@ def run_probe_transport(args):
         if rm is None:
             raise ValueError("no usable models.json: run `overseer.py models --host claude|google` first")
         transport = {}
+        tools = survey["tools"] if isinstance(survey.get("tools"), dict) else {}
         for family in adapters.FAMILIES:
             roles = models.roles_for(rm, family)
-            if not E.resolve_exe(adapters.BINARY[family], base.get("PATH", "")):
+            name = adapters.BINARY[family]
+            path = E.resolve_exe(name, base.get("PATH", ""))
+            if not path:
                 transport[family] = {"stdin": None, "schema": None, "note": "cli not found"}
-            elif roles is None:
-                transport[family] = {"stdin": "unavailable", "schema": "unavailable"}
+                continue
+            # Bind the result to the CLI that was probed; `prepare` ignores it if the CLI changes.
+            ver = _version(path, E.supervisor_env(base), QUERY_TIMEOUT)
+            tools[name] = {"found": True, "path": path, "version": ver}
+            if roles is None:
+                res = {"stdin": "unavailable", "schema": "unavailable"}
             else:
                 with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd:
-                    transport[family] = adapters.probe_transport(family, cwd, E.worker_env(base),
-                                                                 roles["review"], PROBE_TIMEOUT)
+                    res = adapters.probe_transport(family, cwd, E.worker_env(base),
+                                                   roles["review"], PROBE_TIMEOUT)
+            transport[family] = dict(res, path=path, version=ver)
+        survey["tools"] = tools
         survey["transport"] = transport
         _write(root, survey, "probe-transport")
     for family, t in transport.items():

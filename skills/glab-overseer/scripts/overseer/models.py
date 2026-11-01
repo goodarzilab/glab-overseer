@@ -102,22 +102,34 @@ def roles_for(record, family):
     return None if c.get("available") is False else c
 
 
-def _resolve_google(base, strict):
-    """Return (roles-or-unavailable dict, raw). Errors raise only when `strict`."""
-    env = E.worker_env(base)
+LIST_ATTEMPTS = 2  # measured 2026-11-01: agy 1.4.12 intermittently prints
+# "Error: timed out waiting for available models" and lists fine seconds later.
+
+
+def _list_once(env):
     r = E.run_tool(["agy", "models"], env, LIST_TIMEOUT)
-    raw = ""
-    try:
-        if r["timed_out"]:
-            raise ModelError("`agy models` timed out")
-        if r["rc"] != 0:
-            raise ModelError("`agy models` failed (rc %s): %s" % (r["rc"], r["stderr"].strip()[:200]))
-        raw = r["stdout"]
-        return dict(resolve_google(parse_listing(raw)), available=True), raw
-    except ModelError as e:
-        if strict:
-            raise
-        return {"available": False, "reason": str(e)}, raw
+    if r["timed_out"]:
+        raise ModelError("`agy models` timed out")
+    if r["rc"] != 0:
+        raise ModelError("`agy models` failed (rc %s): %s" % (r["rc"], r["stderr"].strip()[:200]))
+    return r["stdout"]
+
+
+def _resolve_google(base, strict):
+    """Return (roles-or-unavailable dict, raw). Errors raise only when `strict`.
+
+    The raw listing is kept even when it yields no eligible role."""
+    env = E.worker_env(base)
+    raw, err = "", None
+    for _ in range(LIST_ATTEMPTS):
+        try:
+            raw = _list_once(env)
+            return dict(resolve_google(parse_listing(raw)), available=True), raw
+        except ModelError as e:
+            err = e
+    if strict:
+        raise err
+    return {"available": False, "reason": str(err)}, raw
 
 
 def resolve(root, host, refresh=False, base=None, today=None):

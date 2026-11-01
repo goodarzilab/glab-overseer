@@ -98,10 +98,11 @@ def parse_claude(rc, stdout, stderr):
         return _fail("claude", rc, "", stderr, "output is not an event array or object")
     inits = [e for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
     results = [e for e in events if e.get("type") == "result"]
-    present = bool(inits) and "apiKeySource" in inits[0]
-    source = inits[0]["apiKeySource"] if present else None
+    declared = [e["apiKeySource"] for e in inits if "apiKeySource" in e]
+    bad = [v for v in declared if v != "none"]
+    source = bad[0] if bad else (declared[0] if declared else None)
     extra = {"api_key_source": source if isinstance(source, str) else None}
-    if present and source != "none":
+    if bad:
         return _result(False, "claude", rc, classification=CONFIG, reason="apiKeySource is not 'none'",
                        signature={"name": "api-key-billing", "provisional": False}, **extra)
     if not results:
@@ -182,9 +183,16 @@ def build_argv(family, model, prompt=None, schema=None):
 
 
 def _probe_flag(survey, family, key):
-    t = survey.get("transport") if isinstance(survey, dict) else None
+    """True only for a recorded True probe made with the CLI path and version the survey sees now."""
+    if not isinstance(survey, dict):
+        return False
+    t = survey.get("transport")
     entry = t.get(family) if isinstance(t, dict) else None
-    return isinstance(entry, dict) and entry.get(key) is True
+    tools = survey.get("tools")
+    cur = tools.get(BINARY[family]) if isinstance(tools, dict) else None
+    if not (isinstance(entry, dict) and entry.get(key) is True and isinstance(cur, dict)):
+        return False
+    return all(isinstance(entry.get(k), str) and entry.get(k) == cur.get(k) for k in ("path", "version"))
 
 
 def pointer(task_path):

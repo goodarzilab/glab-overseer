@@ -28,16 +28,23 @@ def _match(name, patterns):
     return any(fnmatch.fnmatchcase(up, p.upper()) for p in patterns)
 
 
+def _abs_path_only(env):
+    """Drop empty and relative PATH entries so no child resolves a binary from the project."""
+    if "PATH" in env:
+        env["PATH"] = os.pathsep.join(d for d in env["PATH"].split(os.pathsep) if d and os.path.isabs(d))
+    return env
+
+
 def worker_env(base=None, extras=None):
     base = os.environ if base is None else base
     out = {k: v for k, v in base.items() if _match(k, ALLOW)}
     out.update(extras or {})
-    return {k: v for k, v in out.items() if not _match(k, WORKER_DENY)}
+    return _abs_path_only({k: v for k, v in out.items() if not _match(k, WORKER_DENY)})
 
 
 def supervisor_env(base=None):
     base = os.environ if base is None else base
-    return {k: v for k, v in base.items() if not _match(k, LLM_DENY)}
+    return _abs_path_only({k: v for k, v in base.items() if not _match(k, LLM_DENY)})
 
 
 def llm_key_names(base=None):
@@ -46,13 +53,14 @@ def llm_key_names(base=None):
     return sorted(k for k in base if _match(k, LLM_DENY))
 
 
-def resolve_exe(name, path):
+def resolve_exe(name, path, cwd=None):
     """Absolute path of an executable, searching only absolute PATH entries; None if absent.
 
     Empty and relative entries are skipped so a project directory can never supply the binary.
     """
-    if os.sep in name:
-        return os.path.abspath(name) if os.path.isfile(name) and os.access(name, os.X_OK) else None
+    if os.sep in name:  # an explicit relative path is relative to the directory the child will run in
+        full = os.path.abspath(os.path.join(cwd, name)) if cwd else os.path.abspath(name)
+        return full if os.path.isfile(full) and os.access(full, os.X_OK) else None
     for d in (path or "").split(os.pathsep):
         if d and os.path.isabs(d):
             cand = os.path.join(d, name)
@@ -69,7 +77,7 @@ def run_tool(argv, env, timeout, cwd=None, stdin=None):
     files, so a detached grandchild holding the descriptors never delays the
     return. argv[0] is resolved with `resolve_exe` and spawned by absolute path.
     """
-    exe = resolve_exe(argv[0], env.get("PATH", ""))
+    exe = resolve_exe(argv[0], env.get("PATH", ""), cwd)
     if exe is None:
         return {"rc": 127, "timed_out": False, "stdout": "",
                 "stderr": "command not found: %s (only absolute PATH entries are searched)" % argv[0]}

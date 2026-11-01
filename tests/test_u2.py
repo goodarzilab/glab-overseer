@@ -27,6 +27,13 @@ AGY_RESULT = json.loads(fixture("agy_result.json"))
 AGY_MODELS = fixture("agy_models.txt")
 
 
+def sdoc(transport, version="1"):
+    """A survey whose recorded probes were made with the CLIs the survey currently sees."""
+    tools = {b: {"found": True, "path": "/opt/" + b, "version": version} for b in adapters.BINARY.values()}
+    bound = {f: dict(t, path="/opt/" + adapters.BINARY[f], version="1") for f, t in transport.items()}
+    return {"tools": tools, "transport": bound}
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="ovr-u2-"))
@@ -106,6 +113,26 @@ class EnvTests(Case):
         names = {l.split("=", 1)[0] for l in r["stdout"].splitlines()}
         self.assertFalse(names & set(self.CANARIES), names & set(self.CANARIES))
         self.assertTrue({"PATH", "HOME", "SLURM_JOB_ID", "XDG_CONFIG_HOME"} <= names)
+
+    def test_relative_and_empty_path_entries_are_dropped(self):
+        for fn in (E.worker_env, E.supervisor_env):
+            e = fn({"PATH": "/a::rel:.:/b:./x"})
+            self.assertEqual(e["PATH"], "/a:/b")
+        self.assertNotIn("PATH", E.worker_env({}))
+
+    def test_explicit_relative_argv0_resolves_against_target_cwd(self):
+        for d, word in (("here", "target"), ("other", "supervisor")):
+            os.makedirs(os.path.join(self.tmp, d))
+            with open(os.path.join(self.tmp, d, "tool"), "w") as f:
+                f.write("#!/bin/sh\necho %s\n" % word)
+            os.chmod(os.path.join(self.tmp, d, "tool"), 0o755)
+        old = os.getcwd()
+        os.chdir(os.path.join(self.tmp, "other"))
+        self.addCleanup(os.chdir, old)
+        r = E.run_tool(["./tool"], self.host_env(), 10, cwd=os.path.join(self.tmp, "here"))
+        self.assertEqual(r["stdout"].strip(), "target")
+        r = E.run_tool(["./tool"], self.host_env(), 10, cwd=self.root)  # no such file in the target cwd
+        self.assertEqual(r["rc"], 127)
 
     def test_extras_pass_but_denylist_still_applies(self):
         e = E.worker_env(self.host_env(), {"OVERSEER_OUT": "/o", "GH_TOKEN": "t"})
@@ -228,6 +255,17 @@ class ModelTests(Case):
         self.assertIs(rec["choices"]["google"]["available"], False)
         self.assertIn("claude-opus-5-5-high", rec["raw"])
 
+    def test_listing_is_retried_once_after_a_transient_failure(self):
+        # Measured: agy prints "Error: timed out waiting for available models" and lists fine moments later.
+        flag = os.path.join(self.tmp, "listed-once")
+        self.shim("agy", "if [ -e '%s' ]; then cat '%s'; else : > '%s'; "
+                         "echo 'Error: timed out waiting for available models'; fi"
+                  % (flag, os.path.join(FIX, "agy_models.txt"), flag))
+        rc, out, _ = self.run_cli("models", "--host", "google")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.calls(), ["agy models", "agy models"])
+        self.assertEqual(self.state("models.json")["choices"]["google"]["review"], "gemini-3.8-flash-high")
+
     def test_agy_failure_and_empty_listing_are_errors(self):
         self.shim("agy", "echo boom >&2; exit 3")
         rc, _, err = self.run_cli("models", "--host", "google")
@@ -301,6 +339,14 @@ class ParserTests(unittest.TestCase):
             r = adapters.parse_claude(rc, out, "")
             self.assertFalse(r["ok"], label)
             self.assertIn(r["classification"], (adapters.UNKNOWN, adapters.CONFIG, adapters.TRANSIENT), label)
+
+    def test_claude_checks_every_init_event(self):
+        ev = copy.deepcopy(CLAUDE_EVENTS)
+        later = dict(ev[0], apiKeySource="ANTHROPIC_API_KEY")
+        ev.insert(2, later)
+        r = adapters.parse_claude(0, json.dumps(ev), "")
+        self.assertEqual((r["ok"], r["classification"], r["api_key_source"]),
+                         (False, adapters.CONFIG, "ANTHROPIC_API_KEY"))
 
     def test_claude_api_key_source_is_config(self):
         for source in ("ANTHROPIC_API_KEY", None, 3):
@@ -414,7 +460,7 @@ class PrepareTests(Case):
 
     def test_agy_prompt_is_the_value_of_dash_p(self):
         self.agy_strict_shim()
-        both = {"transport": {"google": {"schema": True, "stdin": True}}}
+        both = sdoc({"google": {"schema": True, "stdin": True}})
         for role, schema, survey in (("author", None, {}), ("reviewer", self.SCHEMA, {}),
                                      ("reviewer", self.SCHEMA, both)):
             inv = adapters.prepare("google", role, "m", "T", self.root, task_dir=self.td(), survey=survey, schema=schema)
@@ -433,7 +479,7 @@ class PrepareTests(Case):
             adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), transport="stdin")
 
     def test_schema_flag_is_inline_compact_json_for_both_families(self):
-        ok = {"transport": {"claude": {"schema": True}, "google": {"schema": True}}}
+        ok = sdoc({"claude": {"schema": True}, "google": {"schema": True}})
         for family in adapters.FAMILIES:
             inv = adapters.prepare(family, "reviewer", "m", "T", self.root, task_dir=self.td(), survey=ok, schema=self.SCHEMA)
             i = inv["argv"].index("--json-schema")
@@ -474,21 +520,37 @@ class PrepareTests(Case):
 
     def test_stdin_requires_recorded_true_probe(self):
         for t in ({}, {"claude": {"stdin": False}}, {"claude": {"stdin": "true"}}, {"claude": {"stdin": None}}):
-            inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": t})
+            inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey=sdoc(t))
             self.assertEqual(inv["transport"], "file", t)
         for s in (None, [], {"transport": []}, {"transport": {"claude": 1}}):
             self.assertEqual(adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey=s)["transport"], "file")
-        inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": {"claude": {"stdin": True}}})
+        inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey=sdoc({"claude": {"stdin": True}}))
         self.assertEqual((inv["transport"], inv["stdin"], inv["argv"][-1]), ("stdin", "T", "json"))
-        other = adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": {"claude": {"stdin": True}}})
+        other = adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), survey=sdoc({"claude": {"stdin": True}}))
         self.assertEqual(other["transport"], "file")
+
+    def test_probe_results_expire_when_the_cli_changes(self):
+        base = sdoc({"claude": {"stdin": True, "schema": True}})
+        mutate = {
+            "version": lambda d: d["tools"]["claude"].update(version="2"),
+            "path": lambda d: d["tools"]["claude"].update(path="/elsewhere/claude"),
+            "tool missing": lambda d: d["tools"].pop("claude"),
+            "unbound": lambda d: d["transport"]["claude"].pop("path"),
+        }
+        for label, f in [("fresh", lambda d: None)] + sorted(mutate.items()):
+            doc = copy.deepcopy(base)
+            f(doc)
+            inv = adapters.prepare("claude", "reviewer", "m", "T", self.root, task_dir=self.td(),
+                                   survey=doc, schema=self.SCHEMA)
+            fresh = label == "fresh"
+            self.assertEqual((inv["transport"], inv["schema_flag"]), (("stdin", True) if fresh else ("file", False)), label)
 
     def test_reviewer_schema_flag_only_after_passing_probe(self):
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), schema=self.SCHEMA, survey={})
         self.assertNotIn("--json-schema", inv["argv"])
         with open(inv["prompt_file"]) as f:
             self.assertIn('{"type":"object"}', f.read())
-        ok = {"transport": {"google": {"schema": True}}}
+        ok = sdoc({"google": {"schema": True}})
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), schema=self.SCHEMA, survey=ok)
         self.assertIn("--json-schema", inv["argv"])
         with open(inv["prompt_file"]) as f:
@@ -610,15 +672,18 @@ class ProbeTransportTests(Case):
         rc, out, _ = self.run_cli("probe-transport")
         self.assertEqual(rc, 0, out)
         t = self.state("survey.json")["transport"]
-        self.assertEqual(t["claude"], {"stdin": True, "schema": True})
-        self.assertEqual(t["google"], {"stdin": "unsupported", "schema": False})
+        self.assertEqual((t["claude"]["stdin"], t["claude"]["schema"]), (True, True))
+        self.assertEqual((t["google"]["stdin"], t["google"]["schema"]), ("unsupported", False))
         with open(stdin_log) as f:
             self.assertIn("PROBE-OK", f.read())
-        calls = self.calls()  # each family is probed with its own review model
+        calls = [c for c in self.calls() if "--version" not in c]  # each family is probed with its own review model
         self.assertTrue(all("--model haiku" in c for c in calls if c.startswith("claude")), calls)
         self.assertTrue(all("--model gemini-9-flash-high" in c for c in calls if c.startswith("agy")), calls)
         self.assertTrue(any(c.startswith("agy") for c in calls))
         survey_doc = self.state("survey.json")
+        self.assertEqual(t["claude"]["path"], os.path.join(self.shims, "claude"))
+        self.assertEqual(survey_doc["tools"]["claude"]["path"], t["claude"]["path"])
+        self.assertIsInstance(t["claude"]["version"], str)
         inv = adapters.prepare("claude", "reviewer", "haiku", "T", self.root, task_dir=self.td(), survey=survey_doc, schema={"type": "object"})
         self.assertEqual((inv["transport"], inv["schema_flag"]), ("stdin", True))
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), survey=survey_doc, schema={"type": "object"})
@@ -635,8 +700,9 @@ class ProbeTransportTests(Case):
         self.shim("agy", "exit 1")
         self.write_models(google=False)
         self.run_cli("probe-transport")
-        self.assertEqual(self.state("survey.json")["transport"]["google"], {"stdin": "unavailable", "schema": "unavailable"})
-        self.assertEqual(self.calls(), [])
+        g = self.state("survey.json")["transport"]["google"]
+        self.assertEqual((g["stdin"], g["schema"]), ("unavailable", "unavailable"))
+        self.assertEqual([c for c in self.calls() if "--version" not in c], [])
 
     def test_schema_needs_native_structured_output(self):
         # JSON in the reply text alone does not show the CLI enforced the schema.
@@ -657,9 +723,10 @@ class ProbeTransportTests(Case):
     def test_probe_timeout_is_unknown(self):
         self.shim("claude", "sleep 30")
         self.write_models()
-        with mock.patch.object(survey, "PROBE_TIMEOUT", 1):
+        with mock.patch.object(survey, "PROBE_TIMEOUT", 1), mock.patch.object(survey, "QUERY_TIMEOUT", 1):
             self.run_cli("probe-transport")
-        self.assertEqual(self.state("survey.json")["transport"]["claude"], {"stdin": "unknown", "schema": "unknown"})
+        c = self.state("survey.json")["transport"]["claude"]
+        self.assertEqual((c["stdin"], c["schema"], c["version"]), ("unknown", "unknown", "unknown"))
 
 
 if __name__ == "__main__":
