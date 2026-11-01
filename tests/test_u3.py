@@ -84,7 +84,13 @@ class Case(TmpCase):
                     os.killpg(ln["pgid"], signal.SIGKILL)
                 except OSError:
                     pass
-        time.sleep(0.05)
+        for c in list(X._CHILDREN):  # reap what this test started, so nothing outlives it
+            try:
+                c.kill()
+                c.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        X._CHILDREN[:] = []
 
     def script(self, name, body):
         p = os.path.join(self.bin, name)

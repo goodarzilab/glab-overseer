@@ -33,14 +33,15 @@ TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NOD
 LOG_PATTERNS = (("time_limit", re.compile(r"DUE TO TIME LIMIT", re.I)),
                 ("out_of_memory", re.compile(r"oom[-_ ]?kill|out of memory|OUT_OF_MEMORY", re.I)),
                 ("cancelled", re.compile(r"CANCELLED AT|DUE TO (?:PREEMPTION|NODE FAILURE)", re.I)))
-LOG_TAIL = 200000
+LOG_FULL_MAX = 256 * 1024 * 1024
+LOG_EDGE = 16 * 1024 * 1024
 
 
 class SlurmError(X.ExecutionError):
     pass
 
 
-class SbatchRejected(OSError):
+class SbatchRejected(X.LaunchRejected):
     """sbatch exited non-zero: nothing was submitted (recorded as a launch error)."""
 
 
@@ -51,7 +52,8 @@ class SbatchAmbiguous(X.ExecutionError):
 # ---- backend choice and preconditions --------------------------------------
 
 def disabled(base=None):
-    return bool((os.environ if base is None else base).get("OVERSEER_DISABLE_SLURM"))
+    """True only when OVERSEER_DISABLE_SLURM is `1`, `true` or `yes` (case-insensitive)."""
+    return E.slurm_disabled(base)
 
 
 def _survey_slurm(root):
@@ -68,12 +70,27 @@ def choose_backend(root, base=None):
     return "slurm" if not disabled(base) and _survey_slurm(root).get("usable") is True else "local"
 
 
+def _slurm_host(root):
+    """Slurm tools are present here, per the survey; independent of OVERSEER_DISABLE_SLURM."""
+    try:
+        s = store.read_json(os.path.join(paths.state_dir(root), "survey.json"), {})
+    except ValueError:
+        return False
+    tools = s.get("tools") if isinstance(s, dict) else None
+    sbatch = tools.get("sbatch") if isinstance(tools, dict) else None
+    return _survey_slurm(root).get("usable") in (True, "unknown") or (
+        isinstance(sbatch, dict) and sbatch.get("found") is True)
+
+
 def local_agent_problem(root, base=None):
-    """Why an agent may not run locally here (a Slurm host outside an allocation), else None."""
+    """Why an agent may not run locally here (Slurm tools present, no job allocation), else None.
+
+    The disable flag does not lift this: it only stops the Slurm backend from being chosen.
+    """
     base = os.environ if base is None else base
-    if disabled(base) or base.get("SLURM_JOB_ID"):
+    if base.get("SLURM_JOB_ID"):
         return None
-    if _survey_slurm(root).get("usable") in (True, "unknown"):
+    if _slurm_host(root):
         return ("this is a Slurm host and no job allocation is active: an agent invocation must not run "
                 "on the login node; dispatch it through the slurm backend or run inside an allocation")
     return None
@@ -140,6 +157,25 @@ def resources(plan, unit):
     return out
 
 
+def _handshake_evidence(root, rec):
+    """The recorded token's directory lies under this root and holds the nonce and a matching reply."""
+    tok = rec.get("token")
+    if not (isinstance(tok, str) and paths.valid_id(tok)):
+        return False
+    base = os.path.realpath(os.path.join(paths.state_dir(root), "handshake"))
+    d = os.path.realpath(os.path.join(base, tok))
+    if os.path.dirname(d) != base:
+        return False
+    try:
+        with open(os.path.join(d, "nonce")) as f:
+            nonce = f.read()
+    except OSError:
+        return False
+    reply = X._load(os.path.join(d, "reply.json"))
+    return bool(nonce and isinstance(reply, dict) and reply.get("nonce") == nonce
+                and isinstance(reply.get("host"), str) and reply["host"] and reply["host"] == rec.get("host"))
+
+
 def check_handshake(root, now=None):
     rec = X._load(os.path.join(paths.state_dir(root), "handshake.json"))
     age = None
@@ -148,8 +184,9 @@ def check_handshake(root, now=None):
             age = (now or time.time()) - calendar.timegm(time.strptime(rec["time"], "%Y-%m-%dT%H:%M:%SZ"))
         except ValueError:
             pass
-    if not (isinstance(rec, dict) and rec.get("root") == os.path.realpath(root) and age is not None
-            and -300 <= age <= HANDSHAKE_MAX_AGE):
+    ok = (isinstance(rec, dict) and rec.get("root") == os.path.realpath(root) and age is not None
+          and -300 <= age <= HANDSHAKE_MAX_AGE and _handshake_evidence(root, rec))
+    if not ok:
         raise SlurmError("no successful Slurm handshake for %s in the last 7 days; run `overseer.py "
                          "slurm-handshake`" % os.path.realpath(root))
 
@@ -241,27 +278,49 @@ def query_sacct(job_id, name):
     return dict(_raw(r), outcome="not_known")
 
 
+def _scan_lines(f, limit, found):
+    """Scan up to `limit` bytes of f line by line (bounded memory); add matching labels to `found`."""
+    while limit > 0:
+        line = f.readline(min(1 << 16, limit))
+        if not line:
+            break
+        limit -= len(line)
+        text = line.decode("utf-8", "replace")
+        for label, rx in LOG_PATTERNS:
+            if label not in found and rx.search(text):
+                found.add(label)
+
+
 def scan_logs(adir, job_id):
-    """Failure messages (time limit, out of memory, cancellation) in slurm-<id>.out/.err. Failure only."""
+    """Failure messages (time limit, out of memory, cancellation) in slurm-<id>.out/.err. Failure only.
+
+    Each file is streamed completely. A file over LOG_FULL_MAX is scanned in its first and last
+    LOG_EDGE bytes only and reported as `partial`. Returns (hits, per-file state).
+    """
     hits, seen = [], {}
     for ext in ("out", "err"):
         name = "slurm-%s.%s" % (job_id, ext)
         path = os.path.join(adir, name)
         seen[name] = "absent"
+        found = set()
         try:
             if os.path.islink(path) or not os.path.isfile(path):
                 continue
             with open(path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - LOG_TAIL))
-                text = f.read().decode("utf-8", "replace")
+                size = os.fstat(f.fileno()).st_size
+                if size <= LOG_FULL_MAX:
+                    _scan_lines(f, size + 1, found)
+                    seen[name] = "read"
+                else:
+                    _scan_lines(f, LOG_EDGE, found)
+                    f.seek(size - LOG_EDGE)
+                    f.readline()  # drop the partial line the seek landed in
+                    _scan_lines(f, LOG_EDGE, found)
+                    seen[name] = "partial"
         except OSError:
             seen[name] = "unreadable"
             continue
-        seen[name] = "read"
-        for label, rx in LOG_PATTERNS:
-            if rx.search(text):
-                hits.append("%s@%s" % (label, name))
+        hits += ["%s@%s" % (label, name) for label, _ in LOG_PATTERNS if label in found]
     return hits, seen
 
 
@@ -275,14 +334,15 @@ def _cls(state):
     return "terminal" if state in TERMINAL else None
 
 
-def judge(squeue, scontrol, sacct, exit_rec, log_hits):
+def judge(squeue, scontrol, sacct, exit_rec, log_hits, logs_partial=False):
     """Combine evidence: returns (verdict, evidence list).
 
     Each scheduler argument is None (not consulted) or a dict with `outcome` (listed, known,
     absent, not_known, or any failure outcome) and, when listed or known, `state` and `exit`.
     `exit_rec` is the wrapper record already bound to token and argv digest, or None. Verdicts:
     QUEUED, RUNNING, COMPLETED, FAILED, UNCERTAIN. Failure evidence wins; success needs a
-    scheduler COMPLETED with 0:0 or a wrapper rc 0 and no failure; logs only add failure.
+    scheduler COMPLETED with 0:0 or a wrapper rc 0 and no failure; logs only add failure. When
+    the logs were only partially scanned (`logs_partial`), success needs scheduler evidence.
     """
     ev, fail, ok, unsure, active = [], [], [], [], None
     for name, s in (("squeue", squeue), ("scontrol", scontrol), ("sacct", sacct)):
@@ -320,6 +380,8 @@ def judge(squeue, scontrol, sacct, exit_rec, log_hits):
         return "FAILED", ev + ["failure:" + f for f in fail]
     if unsure:
         return "UNCERTAIN", ev + unsure
+    if logs_partial and not [o for o in ok if o != "wrapper_rc_0"]:
+        return "UNCERTAIN", ev + ["logs only partially scanned and no scheduler success"]
     return ("COMPLETED", ev + ["success:" + o for o in ok]) if ok else ("UNCERTAIN", ev + ["no terminal evidence"])
 
 
@@ -347,7 +409,8 @@ def gather(inv, intent, launch):
                    "record": exit_rec}
     hits, seen = scan_logs(os.path.dirname(os.path.dirname(inv)), jid)
     src["logs"] = {"files": seen, "hits": hits}
-    verdict, ev = judge(src["squeue"], src["scontrol"], src["sacct"], exit_rec, hits)
+    partial = "partial" in seen.values()
+    verdict, ev = judge(src["squeue"], src["scontrol"], src["sacct"], exit_rec, hits, partial)
     return verdict, ev, src, exit_rec
 
 
@@ -379,10 +442,8 @@ def probe(inv, intent, launch, write=False):
     cancel = X._load(os.path.join(inv, "cancel.json"))
     if isinstance(cancel, dict) and cancel.get("token") == intent["token"] \
             and isinstance(cancel.get("confirmed_at"), str):
-        ex = X._load(os.path.join(inv, "exit.json"))
-        if ex is not None and X._exit_matches(ex, intent):
-            return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal"), "job_id": jid}
-        return {"state": "CANCELLED", "job_id": jid}
+        # a confirmed cancellation is a failure for judgment whatever the wrapper recorded
+        return {"state": "CANCELLED", "job_id": jid, "verdict": "FAILED"}
     verdict, ev, src, exit_rec = gather(inv, intent, launch)
     if verdict in ("QUEUED", "RUNNING"):
         return {"state": verdict, "job_id": jid}
@@ -395,20 +456,28 @@ def probe(inv, intent, launch, write=False):
             "verdict": verdict, "evidence": ev}
 
 
-def find_by_token(token, name):
-    """Search squeue for a job carrying the token (comment or name): ('found', id), ('none',), ('many',), ('unknown',)."""
+def find_by_token(token):
+    """Search squeue for a job whose comment is the full token.
+
+    Returns ('found', id), ('none',), ('many',), ('unknown',) or ('unsupported',) when every listed
+    job has an empty comment (the site does not show comments): the name is never a substitute.
+    """
     sq = query_squeue()
     if sq["outcome"] != "ok":
         return ("unknown",)
-    ids = [r["id"] for r in sq["rows"] if r["comment"] == token or r["name"] == name]
-    return ("found", ids[0]) if len(ids) == 1 else (("many",) if ids else ("none",))
+    ids = [r["id"] for r in sq["rows"] if r["comment"] == token]
+    if ids:
+        return ("found", ids[0]) if len(ids) == 1 else ("many",)
+    if sq["rows"] and all(r["comment"].strip() in ("", "(null)") for r in sq["rows"]):
+        return ("unsupported",)
+    return ("none",)
 
 
 def reconcile(inv, intent, write):
     """Find the job of an intent without launch.json by its token; never submits."""
-    hit = find_by_token(intent["token"], job_name(intent))
+    hit = find_by_token(intent["token"])
     jid, source = (hit[1], "squeue") if hit[0] == "found" else (None, None)
-    if jid is None and hit[0] in ("none", "unknown"):
+    if jid is None and hit[0] in ("none", "unknown", "unsupported"):
         st = X._load(os.path.join(inv, "start.json"))  # the wrapper recorded its own job id
         if isinstance(st, dict) and st.get("token") == intent["token"] and isinstance(st.get("job_id"), str) \
                 and st["job_id"].isdigit():
@@ -451,7 +520,7 @@ def submit(d, env, argv, token, name):
     if m:
         store.write_json_atomic(out, dict(rec, outcome="submitted"))
         return m.group(1)
-    hit = find_by_token(token, name)  # ambiguous: reconcile by token, never call sbatch again
+    hit = find_by_token(token)  # ambiguous: reconcile by token, never call sbatch again
     if hit[0] == "found":
         store.write_json_atomic(out, dict(rec, outcome="recovered_by_squeue"))
         return hit[1]

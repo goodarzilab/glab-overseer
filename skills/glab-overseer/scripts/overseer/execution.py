@@ -28,7 +28,8 @@ SHELL = "/bin/sh"  # run.sh interpreter; the process search matches exactly `SHE
 PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12)
 KINDS = ("author", "fixer", "job")
 ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN", "CANCELLING")
-ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+RESERVED_PREFIX = "_OVR_"
 TOKEN_VAR = "OVERSEER_INV_TOKEN"  # exported by run.sh; every payload process inherits it
 BLOCKING_CLASSES = ("QUOTA", "AUTH")
 SIGNALS = ("TERM", "INT", "HUP")
@@ -43,6 +44,10 @@ class ExecutionError(ValueError):
 
 class SlotsFull(ExecutionError):
     pass
+
+
+class LaunchRejected(ExecutionError):
+    """The backend refused the launch outright: nothing started (recorded as launch_error.json)."""
 
 
 def _load(path):
@@ -417,27 +422,26 @@ def _run_sh(inv, intent, stdin_path):
     batch = intent["backend"] != "local"
     check = ""
     if batch:  # in a batch job the script must see this very invocation's token file before anything runs
-        check = ('t=; [ -r %s ] && IFS= read -r t <%s\n[ "$t" = "$TOKEN" ] || { rc=97; note=identity_mismatch; exit 97; }\n'
+        check = ('_OVR_t=; [ -r %s ] && IFS= read -r _OVR_t <%s\n[ "$_OVR_t" = "$_OVR_TOKEN" ] || '
+                 '{ _OVR_rc=97; _OVR_note=identity_mismatch; exit 97; }\n'
                  % (q(os.path.join(inv, "token")), q(os.path.join(inv, "token"))))
     exports = ""
     for k, v in sorted((intent.get("env_extras") or {}).items()):
-        if not (ENV_NAME_RE.match(k) and isinstance(v, str) and "\0" not in v):
-            raise ExecutionError("invalid environment export %r" % (k,))
         exports += "%s=%s; export %s\n" % (k, q(v), k)
     return """#!%s
-PY=%s; REC=%s; INV=%s; TOKEN=%s; SHA=%s
-sig=; rc=1; note=
-fin() { trap - EXIT; "$PY" -I "$REC" exit "$INV" "$TOKEN" "$SHA" "$rc" "$sig" "$note"; }
-trap fin EXIT
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=143; sig=TERM; exit "$rc"' TERM
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=130; sig=INT; exit "$rc"' INT
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=129; sig=HUP; exit "$rc"' HUP
-%scd %s || { rc=126; exit 126; }
-"$PY" -I "$REC" start "$INV" "$TOKEN" "$$"
-%s%s=$TOKEN; export %s
-%s <%s >"$INV/stdout.log" 2>"$INV/stderr.log"
-rc=$?
-exit "$rc"
+_OVR_PY=%s; _OVR_REC=%s; _OVR_INV=%s; _OVR_TOKEN=%s; _OVR_SHA=%s
+_OVR_sig=; _OVR_rc=1; _OVR_note=
+_ovr_fin() { trap - EXIT; "$_OVR_PY" -I "$_OVR_REC" exit "$_OVR_INV" "$_OVR_TOKEN" "$_OVR_SHA" "$_OVR_rc" "$_OVR_sig" "$_OVR_note"; }
+trap _ovr_fin EXIT
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=143; _OVR_sig=TERM; exit "$_OVR_rc"' TERM
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=130; _OVR_sig=INT; exit "$_OVR_rc"' INT
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=129; _OVR_sig=HUP; exit "$_OVR_rc"' HUP
+%scd %s || { _OVR_rc=126; exit 126; }
+"$_OVR_PY" -I "$_OVR_REC" start "$_OVR_INV" "$_OVR_TOKEN" "$$"
+%s%s=$_OVR_TOKEN; export %s
+%s <%s >"$_OVR_INV/stdout.log" 2>"$_OVR_INV/stderr.log"
+_OVR_rc=$?
+exit "$_OVR_rc"
 """ % (SHELL, q(sys.executable), q(os.path.join(inv, "rec.py")), q(inv), q(intent["token"]), q(intent["argv_sha256"]),
        check, q(intent["cwd"]), exports, TOKEN_VAR, TOKEN_VAR, " ".join(q(a) for a in intent["argv"]), q(stdin_path))
 
@@ -485,6 +489,11 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
         raise ExecutionError("backend must be a non-empty string")
     if stdin_text is not None and not isinstance(stdin_text, str):
         raise ExecutionError("stdin_text must be a string")
+    for k, v in (extras or {}).items():
+        if not (isinstance(k, str) and ENV_NAME_RE.match(k) and not k.startswith(RESERVED_PREFIX)
+                and k != TOKEN_VAR and isinstance(v, str) and "\0" not in v):
+            raise ExecutionError("invalid environment variable %r: names must be shell identifiers, must not "
+                                 "start with %s or equal %s, and values must be strings" % (k, RESERVED_PREFIX, TOKEN_VAR))
     if backend == "local" and kind != "job":
         problem = slurm.local_agent_problem(root, env)
         if problem:
@@ -519,6 +528,9 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
     except OSError as e:
         store.write_json_atomic(os.path.join(inv, "launch_error.json"), {"token": intent["token"], "error": str(e)})
         raise ExecutionError("launch failed: %s" % e)
+    except LaunchRejected as e:
+        store.write_json_atomic(os.path.join(inv, "launch_error.json"), {"token": intent["token"], "error": str(e)})
+        raise
     launch = {"token": intent["token"], "backend": backend, "time": store.utc_now()}
     launch.update(fields)
     if backend == "local":

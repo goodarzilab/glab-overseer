@@ -98,9 +98,15 @@ class SlurmCase(Case):
     def survey(self, usable):
         store.write_json_atomic(os.path.join(self.root, ".overseer", "survey.json"), {"slurm": {"usable": usable}})
 
-    def handshake_record(self, when=None, root=None):
+    def handshake_record(self, when=None, root=None, token="a1b2c3", reply=True):
+        d = os.path.join(self.root, ".overseer", "handshake", "a1b2c3")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "nonce"), "w") as f:
+            f.write("nonce-1")
+        if reply:
+            store.write_json_atomic(os.path.join(d, "reply.json"), {"nonce": "nonce-1", "host": "node001"})
         store.write_json_atomic(os.path.join(self.root, ".overseer", "handshake.json"), {
-            "root": root or self.root, "time": when or store.utc_now(), "token": "t", "host": "node001"})
+            "root": root or self.root, "time": when or store.utc_now(), "token": token, "host": "node001"})
 
     def shim(self, name, body):
         p = os.path.join(self.fakebin, name)
@@ -151,6 +157,14 @@ class ChoiceAndRefusals(SlurmCase):
         os.unlink(os.path.join(self.root, ".overseer", "survey.json"))
         self.assertEqual(S.choose_backend(self.root), "local")
 
+    def test_disable_flag_values(self):
+        for v in ("1", "true", "TRUE", "Yes", " yes "):
+            self.assertTrue(S.disabled({"OVERSEER_DISABLE_SLURM": v}), v)
+        for v in ("", "0", "false", "no", "2", "on", "enabled"):
+            self.assertFalse(S.disabled({"OVERSEER_DISABLE_SLURM": v}), v)
+            self.assertEqual(S.choose_backend(self.root, {"OVERSEER_DISABLE_SLURM": v}), "slurm", v)
+        self.assertFalse(S.disabled({}))
+
     def test_disable_routes_local_and_runs_no_slurm_shim(self):
         with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": "1"}):
             rec = self.dispatch()
@@ -192,6 +206,30 @@ class ChoiceAndRefusals(SlurmCase):
         self.handshake_record(when=week)
         self.assertEqual(self.dispatch()["launch"]["job_id"], "4242")
 
+    def test_handshake_record_needs_its_token_nonce_and_reply(self):
+        d = os.path.join(self.root, ".overseer", "handshake", "a1b2c3")
+        S.check_handshake(self.root)
+        os.makedirs(os.path.join(self.root, ".overseer", "handshake", "evil"))
+        for token in (None, "", "../a1b2c3", "nope", 7):
+            self.handshake_record(token=token)
+            with self.assertRaisesRegex(S.SlurmError, "handshake", msg=token):
+                S.check_handshake(self.root)
+        self.handshake_record(reply=False)
+        os.unlink(os.path.join(d, "reply.json"))
+        with self.assertRaisesRegex(S.SlurmError, "handshake"):
+            S.check_handshake(self.root)
+        for reply in ({"nonce": "other", "host": "node001"}, {"nonce": "nonce-1", "host": "elsewhere"},
+                      {"nonce": "nonce-1"}, []):
+            store.write_json_atomic(os.path.join(d, "reply.json"), reply)
+            with self.assertRaisesRegex(S.SlurmError, "handshake"):
+                S.check_handshake(self.root)
+        self.handshake_record()
+        S.check_handshake(self.root)
+        os.unlink(os.path.join(d, "nonce"))
+        with self.assertRaisesRegex(S.SlurmError, "handshake"):
+            self.dispatch()
+        self.assertEqual(self.calls(), [])
+
     def test_tmp_root_refused_before_any_submission(self):
         with mock.patch.object(S, "TMP_ROOTS", ("/tmp", "/var/tmp")):
             self.assertIn("private", S.root_problem(os.path.join(self.tmp, "x"), {}))
@@ -214,6 +252,18 @@ class ChoiceAndRefusals(SlurmCase):
             self.launch("j2", argv, kind="author", plan="sl")
         self.survey(False)
         self.launch("j3", argv, kind="fixer", plan="sl")
+
+    def test_login_node_guard_ignores_the_disable_flag(self):
+        store.write_json_atomic(os.path.join(self.root, ".overseer", "survey.json"), {
+            "slurm": {"usable": False, "reason": "disabled"}, "tools": {"sbatch": {"found": True}}})
+        argv = [self.script("ag", "true")]
+        for flag in ("1", "", "0"):
+            with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": flag}):
+                with self.assertRaisesRegex(X.ExecutionError, "login node"):
+                    self.launch("j1", argv, kind="author", plan="sl")
+        with mock.patch.dict(os.environ, {"OVERSEER_DISABLE_SLURM": "1", "SLURM_JOB_ID": "7"}):
+            self.launch("j1", argv, kind="author", plan="sl")
+        self.assertEqual(self.calls(), [])
 
 
 class Submission(SlurmCase):
@@ -262,14 +312,36 @@ class Submission(SlurmCase):
 
     def test_rejection_is_recorded_with_stderr_and_not_retried(self):
         self.fake("sbatch.mode", "reject")
-        with self.assertRaisesRegex(X.ExecutionError, "invalid partition specified"):
-            self.dispatch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):  # the CLI reports it and exits 1, no traceback
+            rc = cli.main(["--root", self.root, "dispatch", "--unit", "j1", "--plan", "sl"])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid partition specified", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertTrue(issubclass(S.SbatchRejected, X.ExecutionError))
         inv = next(X.iter_invocations(self.root, "sl", "j1"))["path"]
         self.assertIn("invalid partition", self.rec(inv, "launch_error.json")["error"])
         self.assertEqual(self.rec(inv, "sbatch.json")["outcome"], "rejected")
         self.assertEqual(X.invocation_status(inv, True)["state"], "LAUNCH_FAILED")
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(X.slots_in_use(self.root), 0)
+
+    def test_recovery_requires_the_full_token_in_the_comment(self):
+        cases = (("j1", 'echo "4242|$name|someone-elses-token|RUNNING|None"'),  # same name, other comment
+                 ("j2", 'echo "4242|$name|(null)|RUNNING|None"'))  # site shows no comments: no name fallback
+        for uid, squeue in cases:
+            self.fake("sbatch.mode", "hang")
+            self.unfake("sbatch.calls")
+            self.shim("squeue", '. "$F/common.sh"\n' + squeue)
+            with mock.patch.object(S, "SBATCH_TIMEOUT", 1):
+                with self.assertRaises(S.SbatchAmbiguous):
+                    self.dispatch(uid)
+            inv = next(X.iter_invocations(self.root, "sl", uid))["path"]
+            self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
+            self.assertFalse(os.path.exists(os.path.join(inv, "launch.json")))
+            self.assertEqual(X.abort_invocation(self.root, inv), "UNIDENTIFIED")  # nothing is scancelled
+            self.assertEqual(self.calls("scancel"), [])
+            self.assertEqual(len(self.calls()), 1)
 
     def test_ambiguous_sbatch_found_in_squeue_records_job_with_one_call(self):
         for mode in ("hang", "junk"):
@@ -331,15 +403,48 @@ class RunSh(SlurmCase):
         self.assertEqual(self.run_script(rec).returncode, 0)
         self.assertTrue(os.path.exists(marker))
 
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
     def test_matching_token_runs_payload_and_exports(self):
         rec = self.dispatch()
         self.assertEqual(self.run_script(rec).returncode, 0)
         self.assertEqual(self.rec(rec["dir"], "exit.json")["rc"], 0)
-        self.assertIn("OVERSEER_OUT", open(rec["run_sh"]).read())
+        self.assertIn("OVERSEER_OUT", self.read(rec["run_sh"]))
 
     def test_local_run_sh_has_no_identity_check(self):
         rec = self.launch("j1", [self.script("p", "true")], kind="job", plan="demo")
-        self.assertNotIn("identity_mismatch", open(rec["run_sh"]).read())
+        self.assertNotIn("identity_mismatch", self.read(rec["run_sh"]))
+        self.wait_for(rec["dir"])
+
+    def test_extras_named_like_wrapper_internals_cannot_break_it(self):
+        extras = {"INV": "/nonexistent", "TOKEN": "x", "rc": "9", "PY": "/bin/false", "REC": "r", "SHA": "s",
+                  "sig": "KILL", "note": "n", "fin": "f", "t": "t"}
+        payload = self.script("chk", 'test "$INV" = /nonexistent && test "$rc" = 9 && test "$TOKEN" = x')
+        plan = make_plan("ex", 1)
+        plan["slurm"] = dict(SLURM)
+        approval.approve_plan(self.root, plan, "me")
+        n, _ = X.allocate_attempt(self.root, "ex", "j1")
+        self.fake("sbatch.run")  # the shim runs run.sh inside sbatch, as a batch job would
+        rec = S.launch(self.root, "ex", "j1", n, "job", [payload], self.root, extras=extras)
+        ex = self.rec(rec["dir"], "exit.json")
+        self.assertEqual((ex["rc"], ex["token"]), (0, rec["token"]))
+        self.assertEqual(ex.get("error"), None)
+        rec2 = self.launch("j1", [payload], kind="job", plan="demo", extras=extras)  # local
+        self.assertEqual(self.wait_for(rec2["dir"])["rc"], 0)
+
+    def test_reserved_and_invalid_extras_are_refused(self):
+        n, _ = X.allocate_attempt(self.root, "sl", "j1")
+        for name in ("_OVR_x", "_OVR_PY", X.TOKEN_VAR, "has-dash", "1abc", "a b", "", "A=B"):
+            for fn in (lambda e: self.launch("j1", [self.script("p", "true")], kind="job", plan="demo", extras=e),
+                       lambda e: S.launch(self.root, "sl", "j1", n, "job", [self.script("p", "true")],
+                                          self.root, extras=e)):
+                with self.assertRaisesRegex(X.ExecutionError, "invalid environment variable", msg=name):
+                    fn({name: "v"})
+        with self.assertRaises(X.ExecutionError):
+            self.launch("j1", [self.script("p", "true")], kind="job", plan="demo", extras={"OK": 1})
+        self.assertEqual(self.calls(), [])
 
 
 class Evidence(SlurmCase):
@@ -386,8 +491,8 @@ class Evidence(SlurmCase):
         self.assertEqual(S.squeue_view(sq, "3507140", "tok-abcd1234"), {"outcome": "listed", "state": "RUNNING"})
         self.assertEqual(S.squeue_view(sq, "3507140", "other")["outcome"], "mismatch")
         self.assertEqual(S.squeue_view(sq, "1", "x")["outcome"], "absent")
-        self.assertEqual(S.find_by_token("tok-abcd1234", "n"), ("found", "3507140"))
-        self.assertEqual(S.find_by_token("x", "interactive"), ("many",))
+        self.assertEqual(S.find_by_token("tok-abcd1234"), ("found", "3507140"))
+        self.assertEqual(S.find_by_token("x"), ("none",))
         self.shim("scontrol", fixture("scontrol_done"))
         sc = S.query_scontrol("3507140", "tok-abcd1234")
         self.assertEqual((sc["outcome"], sc["state"], sc["exit"]), ("known", "FAILED", "3:0"))
@@ -483,6 +588,41 @@ class Evidence(SlurmCase):
         self.assertNotEqual(st["rc"], 0)
         self.assertIn("failure:log_time_limit@slurm-4242.err", st["evidence"])
 
+    def test_log_scan_streams_whole_files_and_flags_partial_scans(self):
+        adir = os.path.join(self.tmp, "logs")
+        os.makedirs(adir)
+        out = os.path.join(adir, "slurm-9.out")
+        with open(out, "w") as f:
+            f.write("slurmstepd: error: Detected 1 oom_kill event in StepId=9.batch\n")
+            f.write("filler line of ordinary output\n" * 20000)  # the match is far from the end
+        self.assertEqual(S.scan_logs(adir, "9"), (["out_of_memory@slurm-9.out"], {"slurm-9.out": "read", "slurm-9.err": "absent"}))
+        with open(out, "w") as f:
+            f.write("x\n" * 300 + "slurmstepd: error: oom_kill event\n" + "y\n" * 300)  # only in the middle
+        with mock.patch.object(S, "LOG_FULL_MAX", 400), mock.patch.object(S, "LOG_EDGE", 50):
+            hits, seen = S.scan_logs(adir, "9")
+        self.assertEqual((hits, seen["slurm-9.out"]), ([], "partial"))
+        with open(out, "w") as f:
+            f.write("x\n" * 300 + "y\n" * 20 + "DUE TO TIME LIMIT\n")  # inside the last edge
+        with mock.patch.object(S, "LOG_FULL_MAX", 400), mock.patch.object(S, "LOG_EDGE", 50):
+            self.assertEqual(S.scan_logs(adir, "9")[0], ["time_limit@slurm-9.out"])
+        ok0 = {"rc": 0, "signal": None}
+        sq = {"outcome": "absent"}
+        done = {"outcome": "known", "state": "COMPLETED", "exit": "0:0"}
+        self.assertEqual(S.judge(sq, None, None, ok0, [], True)[0], "UNCERTAIN")  # wrapper alone is not enough
+        self.assertEqual(S.judge(sq, done, None, ok0, [], True)[0], "COMPLETED")
+        self.assertEqual(S.judge(sq, None, None, ok0, ["oom@x"], True)[0], "FAILED")
+        self.assertEqual(S.judge(sq, None, None, ok0, [], False)[0], "COMPLETED")
+
+    def test_partial_log_scan_is_recorded_and_blocks_wrapper_only_success(self):
+        rec = self.dispatch()
+        self.exit_rec(rec, 0)
+        log = os.path.join(os.path.dirname(os.path.dirname(rec["dir"])), "slurm-4242.out")
+        with open(log, "w") as f:
+            f.write("a\n" * 500)
+        with mock.patch.object(S, "LOG_FULL_MAX", 100), mock.patch.object(S, "LOG_EDGE", 20):
+            self.assertEqual(self.status(rec)["state"], "UNCERTAIN")
+        self.assertEqual(self.evidence(rec)["sources"]["logs"]["files"]["slurm-4242.out"], "partial")
+
     def test_scheduler_terminal_state_survives_scontrol_forgetting(self):
         rec = self.dispatch()
         self.fake("scontrol.state", "FAILED 3:0")
@@ -532,8 +672,20 @@ class Abort(SlurmCase):
         self.fake("squeue.state", "COMPLETING")
         self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "UNCONFIRMED")
         self.unfake("squeue.state")
-        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "EXITED")
+        res = X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None)
+        self.assertEqual(res, "CANCELLED")
         self.assertEqual(self.calls("scancel"), ["4242"])  # the pending request is not repeated
+
+    def test_confirmed_cancellation_is_cancelled_even_when_wrapper_rc_is_0(self):
+        rec = self.dispatch()
+        self.fake("squeue.state", "RUNNING")
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "UNCONFIRMED")
+        self.unfake("squeue.state")
+        self.exit_rec(rec, 0)  # the payload finished as the cancel arrived
+        self.fake("scontrol.state", "CANCELLED 0:15")
+        st = X.invocation_status(rec["dir"], True)
+        self.assertEqual((st["state"], st["verdict"]), ("CANCELLED", "FAILED"))
+        self.assertNotIn("rc", st)
 
     def test_timed_out_scancel_is_not_repeated(self):
         rec = self.dispatch()

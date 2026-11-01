@@ -46,8 +46,8 @@ def parse_partitions(text):
 
 def _slurm(found, env, base, timeout):
     info = {"in_allocation": bool(base.get("SLURM_JOB_ID")), "partitions": None}
-    if base.get("OVERSEER_DISABLE_SLURM") == "1":
-        info.update(usable=False, reason="OVERSEER_DISABLE_SLURM=1")
+    if E.slurm_disabled(base):
+        info.update(usable=False, reason="OVERSEER_DISABLE_SLURM is set")
         return info
     missing = [t for t in SLURM_TOOLS if t not in found]
     if missing:
@@ -88,7 +88,7 @@ def _auth_probe(family, found, base, timeout, record):
 def collect(root, base=None, probe_auth=False, timeout=QUERY_TIMEOUT):
     base = dict(os.environ if base is None else base)
     senv = E.supervisor_env(base)
-    slurm_off = base.get("OVERSEER_DISABLE_SLURM") == "1"
+    slurm_off = E.slurm_disabled(base)
     found = {}
     for t in TOOLS:
         p = E.resolve_exe(t, base.get("PATH", ""))
