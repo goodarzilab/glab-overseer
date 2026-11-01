@@ -5,3 +5,6 @@
 .overseer/
 __pycache__/
 *.pyc
+
+# Agent worktrees created by Claude Code inside the checkout.
+.claude/
