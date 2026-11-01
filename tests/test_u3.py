@@ -28,6 +28,29 @@ def make_plan(pid="demo", n=4, workers=3):
     return p
 
 
+def live_group_members(pgid):
+    """Non-zombie processes in a process group. killpg(pgid, 0) also counts zombies, which
+    linger in containers whose PID 1 does not reap orphans (seen on CI)."""
+    if not os.path.isdir("/proc/self"):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return []
+        return ["unknown"]
+    live = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name) as f:
+                rest = f.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(rest[2]) == pgid and rest[0] != "Z":
+            live.append(int(name))
+    return live
+
+
 class Crash(Exception):
     pass
 
@@ -529,8 +552,7 @@ class CommandTests(Case):
                                  sleep=lambda _: (seen.append(X.slots_in_use(self.root)), time.sleep(0.1)))
         self.assertEqual(res, "CANCELLED")
         self.assertTrue(seen and set(seen) == {1})
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(rec["launch"]["pgid"], 0)
+        self.assertEqual(live_group_members(rec["launch"]["pgid"]), [])
         self.assertEqual(X.slots_in_use(self.root), 0)
 
     def test_abort_without_identifiable_launch_is_not_confirmed(self):
