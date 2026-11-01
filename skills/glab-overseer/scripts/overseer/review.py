@@ -62,6 +62,11 @@ def _obj(path):
     return d
 
 
+def _aborted(r):
+    return {"round": r, "state": "aborted", "candidate": None, "calls": [], "retried": False, "verdict": None,
+            "same_family_fallback": False, "reason": "round directory had no round.json (interrupted before the reviewer ran)"}
+
+
 def _rounds(adir):
     """[(R, directory, round.json)] in order; a round directory without a readable round.json is refused."""
     base = os.path.join(adir, "reviews")
@@ -70,8 +75,8 @@ def _rounds(adir):
         m = re.match(r"^r([1-9][0-9]*)$", name)
         if m:
             rd = _obj(os.path.join(base, name, "round.json"))
-            if rd is None:
-                raise ReviewError("review round %s has no round.json" % name)
+            if rd is None:  # crashed after mkdir, before round.json: no reviewer was invoked
+                rd = _aborted(int(m.group(1)))
             out.append((int(m.group(1)), os.path.join(base, name), rd))
     return out
 
@@ -303,15 +308,19 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
         if roles is None:
             raise ReviewError("the reviewer family %s is unavailable in models.json (%s)" % (other, cache["choices"][other].get("reason")))
         rounds = _rounds(adir)
+        for R0, rdir0, rd0 in rounds:  # persist orphaned round directories as aborted records
+            if not os.path.exists(os.path.join(rdir0, "round.json")):
+                store.write_json_atomic(os.path.join(rdir0, "round.json"), rd0)
         last = rounds[-1] if rounds else None
+        aborted = bool(last and last[2].get("state") == "aborted")
         reuse = None
         open_round = bool(last and last[2].get("state") in ("started", "failed") and last[2].get("candidate") == cand
                           and not last[2].get("retried"))
         if retry:
-            if not open_round:
+            if not open_round and not aborted:
                 raise ReviewError("--retry needs a latest round for this candidate that failed or has an unknown outcome "
                                   "and has not been retried")
-            reuse = last
+            reuse = last if open_round else None
         elif open_round:
             raise ReviewError("round r%d has no verdict; rerun with --retry (once), after which the round is consumed" % last[0])
         if reuse:
@@ -319,7 +328,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
             with open(os.path.join(rdir, "input.md"), encoding="utf-8") as f:
                 text = f.read()
         else:
-            R = (last[0] if last else 0) + 1
+            R = last[0] if (retry and aborted) else (last[0] if last else 0) + 1
             if R > _cap(plan):
                 raise ReviewError("review rounds are capped at %d; the orchestrator rules alone with "
                                   "`dispositions %s --orchestrator-decision TEXT`" % (_cap(plan), unit["id"]))
@@ -329,7 +338,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
                 raise ReviewError("review input is %d characters, above the limit %d; it is not truncated. Split the unit "
                                   "(`plan split %s --into SPEC.json --reason TEXT`)" % (len(text), max_chars, unit["id"]))
             rdir = os.path.join(adir, "reviews", "r%d" % R)
-            os.makedirs(rdir)
+            os.makedirs(rdir, exist_ok=True)
             with open(os.path.join(rdir, "input.md"), "w", encoding="utf-8") as f:
                 f.write(text)
             rd = {"round": R, "candidate": cand, "base": j["base"], "host": host, "reviewer_family": other,
@@ -385,9 +394,13 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
 
 def _evidence_ok(adir, ref):
     try:
-        return os.path.isfile(paths.safe_relpath(adir, ref))
+        full = paths.safe_relpath(adir, ref)
     except paths.UnsafePath:
         return False
+    if not os.path.isfile(full):
+        return False
+    rec = X._load(full) if full.endswith(".json") else None
+    return not (isinstance(rec, dict) and rec.get("valid") is False)
 
 
 def record_dispositions(root, plan_id, unit, data):
@@ -463,6 +476,9 @@ def review_state(root, plan_id, unit):
         return no("round r%d has no verdict (%s)" % (R, rd.get("state")))
     if rd.get("candidate") != cand:
         return no("round r%d reviewed %s, not the current candidate" % (R, str(rd.get("candidate"))[:12]))
+    sid = next((c.get("session_id") for c in rd["calls"] if c.get("state") == "ok"), None)
+    if not sid or sid in author_sessions(root, plan_id, unit["id"], n, rd["host"]):
+        return no("round r%d reviewer session id is missing or equals an author or fixer session id" % R)
     findings = _obj(os.path.join(rdir, "review.json"))["findings"]
     blocking = [f for f in findings if f["severity"] == "blocking"]
     if rd["verdict"] == "PASS" and not blocking:
@@ -487,20 +503,26 @@ def review_state(root, plan_id, unit):
 
 # ---- disposable worktrees: reproduce and nonvacuous --------------------------
 
+def _judged_state(wt):
+    ref = W.git(wt, "symbolic-ref", "-q", "HEAD", ok=(0, 1))["stdout"].strip()
+    return (W.rev(wt, "HEAD"), ref, W.rev(wt, ref) if ref else None)
+
+
 @contextlib.contextmanager
 def disposable(wt, commit):
-    """A detached worktree at `commit`, always removed. The judged worktree is not touched."""
+    """A separate shared clone detached at `commit`, always removed; yields (directory, check).
+
+    Nothing is shared with the judged repository except read-only objects, so a command cannot move its
+    refs. `check()` returns a problem string when the judged HEAD or branch ref changed, else None.
+    """
     parent = tempfile.mkdtemp(prefix="ovr-wt-")
     d = os.path.join(parent, "w")
+    before = _judged_state(wt)
     try:
-        W.git(wt, "worktree", "add", "--detach", d, commit)
-        yield d
+        W.git(parent, "clone", "--quiet", "--shared", "--no-checkout", wt, d)
+        W.git(d, "checkout", "--quiet", "--detach", commit)
+        yield d, lambda: None if _judged_state(wt) == before else "the judged worktree's HEAD or branch ref changed"
     finally:
-        try:
-            W.git(wt, "worktree", "remove", "--force", d)
-        except W.GitError:
-            with contextlib.suppress(W.GitError):
-                W.git(wt, "worktree", "prune")
         shutil.rmtree(parent, ignore_errors=True)
 
 
@@ -511,15 +533,19 @@ def reproduce(root, plan_id, unit, finding, command, timeout=600.0):
     R, rdir, rd, rv = _latest_complete(adir)
     if finding not in [f["id"] for f in rv["findings"]]:
         raise ReviewError("finding %r is not in round r%d" % (finding, R))
-    with disposable(wt, j["candidate"]) as d:
+    with disposable(wt, j["candidate"]) as (d, check):
         r = E.run_tool(["bash", "-c", command], E.worker_env(), timeout, cwd=d)
+        problem = check()
     edir = os.path.join(adir, "evidence")
     os.makedirs(edir, exist_ok=True)
     k = 1 + len([x for x in os.listdir(edir) if re.match(r"^rep-[0-9]+\.json$", x)])
     rel = "evidence/rep-%d.json" % k
     store.write_json_atomic(os.path.join(adir, rel), {
         "kind": "reproduce", "finding": finding, "round": R, "command": command, "candidate": j["candidate"],
-        "rc": r["rc"], "timed_out": r["timed_out"], "stdout": r["stdout"], "stderr": r["stderr"], "time": store.utc_now()})
+        "rc": r["rc"], "timed_out": r["timed_out"], "stdout": r["stdout"], "stderr": r["stderr"], "time": store.utc_now(),
+        "valid": problem is None, "problem": problem})
+    if problem:
+        raise ReviewError("reproduction record %s is invalid: %s" % (rel, problem))
     store.append_event(root, "reproduced", plan_id=plan_id, unit_id=unit["id"], finding=finding, rc=r["rc"], evidence=rel)
     return {"evidence": rel, "rc": r["rc"], "timed_out": r["timed_out"]}
 
@@ -535,7 +561,7 @@ def nonvacuous(root, plan_id, unit, timeout=J.TEST_TIMEOUT):
     """PASS when the tests fail once every non-test change is reverted; FAIL when they still pass."""
     plan = approval.effective_plan(root, plan_id)
     j, n, adir, wt = _current(root, plan_id, unit)
-    cand, base = j["candidate"], j["base"]
+    cand, base = j["candidate"], _diff_base(adir, j)
     globs = plan.get("test_globs") or list(DEFAULT_TEST_GLOBS)
     toks = W.zsplit(W.git(wt, "diff", "--name-status", "-z", "--no-renames", base, cand, raw=True)["stdout"])
     changed = [(toks[i], toks[i + 1]) for i in range(0, len(toks) - 1, 2)]
@@ -546,18 +572,27 @@ def nonvacuous(root, plan_id, unit, timeout=J.TEST_TIMEOUT):
     if not tests or not others:
         rec.update(status="NOT_APPLICABLE", reason="no test file changed" if not tests else "no non-test file changed")
     else:
-        with disposable(wt, cand) as d:
+        with disposable(wt, cand) as (d, check):
+            def run():
+                return E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=d)
+            r0 = run()
+            if r0["timed_out"] or r0["rc"] != 0:
+                raise ReviewError("baseline does not pass at the candidate (%s); no non-vacuity record written"
+                                  % ("timeout" if r0["timed_out"] else "rc %s" % r0["rc"]))
             todo = []
-            for s, p in others:
-                if s == "A":  # added since base: drop it from the index and the tree together
+            for s_, p in others:
+                if s_ == "A":  # added since base: drop it from the index and the tree together
                     W.git(d, "--literal-pathspecs", "rm", "-q", "-f", "-r", "--", p)
                 else:
                     todo.append(p)
             for i in range(0, len(todo), 100):
                 W.git(d, "--literal-pathspecs", "checkout", base, "--", *todo[i:i + 100])
-            r = E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=d)
-        if r["timed_out"] or r["rc"] == 127:
-            raise ReviewError("test command %s; no non-vacuity record written" % ("timed out" if r["timed_out"] else "was not found"))
+            r = run()
+            problem = check()
+        if problem:
+            raise ReviewError("%s; no non-vacuity record written" % problem)
+        if r["timed_out"]:
+            raise ReviewError("test command timed out after the revert; no non-vacuity record written")
         rec.update(status="PASS" if r["rc"] != 0 else "FAIL", test_rc=r["rc"], stdout_tail=r["stdout"][-2000:],
                    stderr_tail=r["stderr"][-2000:])
     store.write_json_atomic(os.path.join(adir, "nonvacuous.json"), rec)

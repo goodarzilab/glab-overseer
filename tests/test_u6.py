@@ -575,5 +575,78 @@ class Round1Fixes(Case):
         self.assertEqual(W.caps_of({"caps": {"workers": 1}}), {"workers": 1, "attempts": 2, "review_rounds": 3})
 
 
+class Round2Fixes(Case):
+    def test_m1_nonvacuous_uses_the_review_diff_base(self):
+        self.done(unit={"test_command": "test -f src/alpha.py"})
+        with open(os.path.join(self.attempt_dir(), "integration.json"), "w") as f:
+            json.dump({"integration_base": self.state_cand()}, f)
+        rec = json.loads(self.cli("nonvacuous", "alpha")[1])
+        self.assertEqual((rec["status"], rec["base"]), ("NOT_APPLICABLE", self.state_cand()))
+
+    def test_m2_baseline_must_pass_and_rc_127_after_revert_is_a_real_failure(self):
+        flag = os.path.join(self.tmp, "flag")
+        self.write_models("claude")
+        self.run_unit('mkdir -p src tests; echo true > src/alpha.py; echo t > tests/test_alpha.py', expect="DONE",
+                      unit={"test_command": "bash src/alpha.py; rc=$?; test -e %s && exit 9; exit $rc" % flag})
+        self.unit = X._unit_of(approval.effective_plan(self.root, "demo"), "alpha")
+        rec = json.loads(self.cli("nonvacuous", "alpha")[1])
+        self.assertEqual((rec["status"], rec["test_rc"]), ("PASS", 127))
+        os.unlink(os.path.join(self.attempt_dir(), "nonvacuous.json"))
+        with open(flag, "w") as f:
+            f.write("x")
+        rc, _, err = self.cli("nonvacuous", "alpha")
+        self.assertEqual(rc, 1)
+        self.assertIn("baseline does not pass", err)
+        self.assertFalse(os.path.exists(os.path.join(self.attempt_dir(), "nonvacuous.json")))
+
+    def test_m3_reproduce_cannot_move_judged_refs(self):
+        self.done()
+        self.reviewer("agy", agy_out(fail()))
+        self.review()
+        ref = "refs/heads/overseer/demo/alpha/a1"
+        before = sh(self.wt(), "rev-parse", ref)
+        rc, out, err = self.cli("reproduce", "alpha", "--finding", "f1", "--command",
+                                "git update-ref %s HEAD^; git branch -f other HEAD^; git tag t1 HEAD^" % ref)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sh(self.wt(), "rev-parse", ref), before)
+        self.assertEqual(sh(self.wt(), "branch", "--list", "other"), "")
+        # a command that reaches the judged repository by absolute path is detected and the record is invalid
+        rc, out, err = self.cli("reproduce", "alpha", "--finding", "f1", "--command",
+                                "git -C %s update-ref %s HEAD^" % (self.wt(), ref))
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid", err)
+        self.assertFalse(R._evidence_ok(self.attempt_dir(), "evidence/rep-2.json"))
+        self.assertTrue(R._evidence_ok(self.attempt_dir(), "evidence/rep-1.json"))
+
+    def test_m4_round_directory_without_round_json_is_aborted(self):
+        self.done()
+        self.reviewer("agy", agy_out(PASS))
+        os.makedirs(self.rdir(1))
+        rc, res, err = self.review()
+        self.assertEqual((rc, res["round"]), (0, 2), err)
+        self.assertEqual(jload(os.path.join(self.rdir(1), "round.json"))["state"], "aborted")
+
+    def test_m4_retry_reuses_the_aborted_round(self):
+        self.done()
+        self.reviewer("agy", agy_out(PASS))
+        os.makedirs(self.rdir(1))
+        rc, res, err = self.review("--retry")
+        self.assertEqual((rc, res["round"], res["verdict"]), (0, 1, "PASS"), err)
+        self.assertTrue(os.path.exists(os.path.join(self.rdir(1), "input.md")))
+
+    def test_m5_review_state_rechecks_session_collision(self):
+        self.done()
+        self.reviewer("agy", agy_out(PASS, "rev-conv"))
+        self.review()
+        self.assertEqual(self.state()["state"], "ELIGIBLE")
+        inv = os.path.join(self.attempt_dir(), "inv", "02-fixer")
+        os.makedirs(inv)
+        with open(os.path.join(inv, "stdout.log"), "w") as f:
+            json.dump([{"type": "result", "subtype": "success", "is_error": False, "result": "x", "session_id": "rev-conv"}], f)
+        st = self.state()
+        self.assertEqual(st["state"], "NOT_ELIGIBLE")
+        self.assertIn("session id", st["reasons"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
