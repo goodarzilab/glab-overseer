@@ -94,6 +94,11 @@ def prohibited_name(path):
             or b.endswith(".key") or b.startswith("id_rsa"))
 
 
+def caps_of(plan):
+    """Caps with U1's defaults for any that the plan does not set."""
+    return dict(X.P.CAP_MAX, **(plan.get("caps") or {}))
+
+
 def declared_outputs(unit):
     return set(o["path"] if isinstance(o, dict) else o for o in unit.get("outputs") or [])
 
@@ -165,7 +170,7 @@ def dispatch_code(root, plan_id, unit, after_quota=False):
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)
-    X.check_slots(root, plan_id, plan["caps"]["workers"])
+    X.check_slots(root, plan_id, caps_of(plan)["workers"])
     target = check_branch_name(plan["target_branch"])
     try:
         git(root, "fetch", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (target, target), timeout=FETCH_TIMEOUT)
@@ -236,7 +241,7 @@ def dispatch_fixer(root, plan_id, unit, prompt):
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)
-    X.check_slots(root, plan_id, plan["caps"]["workers"])
+    X.check_slots(root, plan_id, caps_of(plan)["workers"])
     survey = _survey(root)
     text = fixer_text(unit, prompt)
 

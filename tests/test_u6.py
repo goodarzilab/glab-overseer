@@ -115,7 +115,7 @@ class Review(Case):
                          (0, "PASS", "complete", "google", "gemini-9-flash-high"), err)
         (name, cwd, argv, count), = self.calls()
         self.assertEqual((name, count), ("agy", "0"))
-        self.assertFalse(cwd.startswith(self.root) or cwd.startswith(self.tmp + "/project"))
+        self.assertFalse(cwd.startswith(self.wt()))
         self.assertIn("gemini-9-flash-high", argv)
         rd = jload(os.path.join(self.rdir(), "round.json"))
         self.assertEqual((rd["state"], rd["candidate"], rd["same_family_fallback"]), ("complete", self.state_cand(), False))
@@ -486,6 +486,93 @@ class Units(Case):
         want = subprocess.run("git diff %s %s | git patch-id --stable" % (base, a), shell=True, cwd=r,
                               capture_output=True, text=True).stdout.split()[0]
         self.assertEqual(pid, want)
+
+
+class Round1Fixes(Case):
+    def test_k1_nonvacuous_restores_index_with_tree(self):
+        self.done(unit={"test_command": 'test -n "$(git ls-files src/alpha.py)"'})
+        self.assertEqual(json.loads(self.cli("nonvacuous", "alpha")[1])["status"], "PASS")
+
+    def test_k2_earlier_findings_carry_all_fields_and_ruling(self):
+        self.done()
+        self.reviewer("agy", agy_out(fail(finding(description="D-ESC", reproduction="R-CMD", line=7))))
+        self.review()
+        ev = ["reviews/r1/review.json"]
+        self.assertEqual(self.disp({"f1": {"ruling": "dismissed", "evidence": ev, "note": "N-OTE"}})[0], 0)
+        self.review()
+        with open(os.path.join(self.rdir(2), "input.md")) as f:
+            text = f.read()
+        for needle in ("D-ESC", "R-CMD", "line: 7", "file: src/alpha.py", "severity: blocking", "dismissed", "N-OTE"):
+            self.assertIn(needle, text)
+
+    def test_k3_diff_is_text_despite_diff_attribute(self):
+        self.done()
+        with open(os.path.join(self.root, sh(self.root, "rev-parse", "--git-path", "info/attributes")), "w") as f:
+            f.write("src/alpha.py -diff\n")
+        self.reviewer("agy", agy_out(PASS))
+        self.review()
+        with open(os.path.join(self.rdir(), "input.md")) as f:
+            text = f.read()
+        self.assertIn("+hi", text)
+        self.assertNotIn("Binary files", text)
+
+    def test_k4_second_review_refuses_while_locked_and_lock_is_released(self):
+        self.done()
+        self.reviewer("agy", agy_out(PASS))
+        lock = os.path.join(self.attempt_dir(), "review.lock")
+        with open(lock, "w") as f:
+            f.write("{}")
+        rc, _, err = self.review()
+        self.assertEqual(rc, 1)
+        self.assertIn("another review", err)
+        self.assertEqual(self.calls(), [])
+        os.unlink(lock)
+        self.assertEqual(self.review()[0], 0)
+        self.assertFalse(os.path.exists(lock))
+        self.reviewer("agy", agy_out(PASS), 1)  # failure path releases too
+        self.review()
+        self.assertFalse(os.path.exists(lock))
+
+    def test_k5_orphan_call_directory_is_recorded_and_skipped(self):
+        self.done()
+        self.reviewer("agy", dict(agy_out(PASS), response="not json"))
+        self.review()
+        os.mkdir(os.path.join(self.rdir(), "c2"))
+        self.assertEqual(R._next_call_dir(self.rdir()), 3)  # scans the directory, not the recorded calls
+        self.reviewer("agy", agy_out(PASS))
+        rc, res, err = self.review("--retry")
+        self.assertEqual((rc, res["state"]), (0, "complete"), err)
+        calls = jload(os.path.join(self.rdir(), "round.json"))["calls"]
+        self.assertEqual([(c["dir"], c["classification"]) for c in calls], [("c1", "MALFORMED"), ("c2", "ORPHANED"), ("c3", "OK")])
+
+    def test_k6_scratch_is_outside_worktree_even_with_tmpdir_inside(self):
+        self.done()
+        inside = os.path.join(self.wt(), "tmpx")
+        os.makedirs(inside)
+        os.environ["TMPDIR"] = inside
+        self.reviewer("agy", agy_out(PASS))
+        self.assertEqual(self.review()[0], 0)
+        cwd = self.calls()[0][1]
+        self.assertTrue(cwd.startswith(os.path.join(self.attempt_dir(), "scratch")), cwd)
+        self.assertFalse(cwd.startswith(self.wt()))
+        self.assertEqual(os.listdir(os.path.join(self.attempt_dir(), "scratch")), [])
+
+    def test_k7_author_session_appearing_during_the_review_is_caught(self):
+        self.done()
+        inv = os.path.join(self.attempt_dir(), "inv", "02-fixer")
+        late = json.dumps([{"type": "result", "subtype": "success", "is_error": False, "result": "x", "session_id": "late-sess"}])
+        out = os.path.join(self.tmp, "late.out")
+        with open(out, "w") as f:
+            json.dump(agy_out(PASS, "late-sess"), f)
+        self.author("mkdir -p %s; echo '%s' > %s/stdout.log; cat %s" % (inv, late, inv, out), "agy")
+        rc, res, err = self.review()
+        self.assertEqual((rc, res["reason"]), (1, "reviewer session id equals the author's"))
+
+    def test_k8_missing_caps_use_defaults(self):
+        self.assertEqual(R._cap({}), 3)
+        self.assertEqual(R._cap({"caps": {"workers": 1}}), 3)
+        self.assertEqual(R._cap({"caps": {"review_rounds": 2}}), 2)
+        self.assertEqual(W.caps_of({"caps": {"workers": 1}}), {"workers": 1, "attempts": 2, "review_rounds": 3})
 
 
 if __name__ == "__main__":

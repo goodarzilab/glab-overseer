@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import tempfile
 
 from . import adapters, approval, env as E, execution as X, judge as J, models, paths, store, workspace as W
@@ -90,7 +91,7 @@ def _current(root, plan_id, unit):
 
 
 def _cap(plan):
-    return plan["caps"]["review_rounds"]
+    return W.caps_of(plan)["review_rounds"]
 
 
 def _latest_complete(adir):
@@ -160,9 +161,10 @@ def _earlier(rounds):
         disp = (_obj(os.path.join(rdir, "dispositions.json")) or {}).get("dispositions", {})
         for f in (rv or {}).get("findings", []):
             d = disp.get(f["id"])
-            out.append("- r%d %s [%s] %s:%s %s | disposition: %s" % (
-                R, f["id"], f["severity"], f["file"], f["line"], f["claim"],
-                "%s (%s)" % (d["ruling"], d.get("note", "")) if d else "none"))
+            out.append("- r%d finding %s" % (R, f["id"]))
+            out += ["    %s: %s" % (k, f[k]) for k in FINDING_KEYS[1:]]
+            out.append("    ruling: %s" % ("%s; note: %s; evidence: %s" % (d["ruling"], d.get("note", ""), ", ".join(d.get("evidence", [])))
+                                           if d else "none"))
     return out
 
 
@@ -192,15 +194,25 @@ def _update_round(root, rdir, fn):
         return rd
 
 
-def _call(root, rdir, rd, purpose, family, model, task, survey, timeout, author_sids):
+def _next_call_dir(rdir):
+    nums = [int(m.group(1)) for m in (re.match(r"^c([0-9]+)$", x) for x in os.listdir(rdir)) if m]
+    return max(nums or [0]) + 1
+
+
+def _call(root, rdir, rd, wt, purpose, family, model, task, survey, timeout, sids_fn):
     """One reviewer call: intent recorded before it runs, result after. Returns the call record."""
-    seq = len(rd["calls"]) + 1
+    seq = _next_call_dir(rdir)
     cdir = os.path.join(rdir, "c%d" % seq)
     os.mkdir(cdir)
     call = {"seq": seq, "purpose": purpose, "family": family, "model": model, "dir": "c%d" % seq,
             "state": "started", "classification": None, "session_id": None, "reason": None}
-    scratch = tempfile.mkdtemp(prefix="ovr-review-")
+    sroot = os.path.join(os.path.dirname(os.path.dirname(rdir)), "scratch")
+    os.makedirs(sroot, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix="review-", dir=sroot)
     try:
+        rw, rs = os.path.realpath(wt), os.path.realpath(scratch)
+        if os.path.commonpath([rw, rs]) == rw:
+            raise ReviewError("scratch directory %s is inside the judged worktree" % scratch)
         try:
             inv = adapters.prepare(family, "reviewer", model, task, scratch, task_dir=cdir, survey=survey, schema=REVIEW_SCHEMA)
         except ValueError as e:
@@ -232,7 +244,7 @@ def _call(root, rdir, rd, purpose, family, model, task, survey, timeout, author_
         elif not res["session_id"]:
             review = None
             call.update(state="failed", classification="NO_SESSION", reason="the reviewer reported no session id")
-        elif res["session_id"] in author_sids:
+        elif res["session_id"] in sids_fn():
             review = None
             call.update(state="failed", classification="SESSION_REUSE", reason="reviewer session id equals the author's")
         else:
@@ -247,7 +259,37 @@ def _call(root, rdir, rd, purpose, family, model, task, survey, timeout, author_
     return dict(call, review=review)
 
 
+@contextlib.contextmanager
+def unit_review_lock(root, plan_id, unit):
+    """Per-unit review lock for a whole review command, created atomically in the attempt directory."""
+    n = approval.load_unit_state(root, plan_id, unit["id"])["counters"]["attempts"]
+    if not X._int(n):
+        raise ReviewError("unit %s has no attempt" % unit["id"])
+    path = os.path.join(paths.attempt_dir(root, plan_id, unit["id"], n), "review.lock")
+    holder = {"pid": os.getpid(), "host": socket.gethostname(), "time": store.utc_now()}
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        cur = X._load(path)
+        raise ReviewError("another review of %s is running or crashed (lock %s, holder %s); remove the file only "
+                          "after confirming that holder is gone" % (unit["id"], path, cur if isinstance(cur, dict) else "unreadable"))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(holder, f)
+        yield
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def run_review(root, plan_id, unit, retry=False, timeout=DEFAULT_TIMEOUT, max_chars=MAX_INPUT):
+    with unit_review_lock(root, plan_id, unit):
+        return _run_review(root, plan_id, unit, retry, timeout, max_chars)
+
+
+def _run_review(root, plan_id, unit, retry, timeout, max_chars):
     with store.ProjectLock(root, "review"):
         plan = approval.effective_plan(root, plan_id)
         j, n, adir, wt = _current(root, plan_id, unit)
@@ -281,7 +323,7 @@ def run_review(root, plan_id, unit, retry=False, timeout=DEFAULT_TIMEOUT, max_ch
             if R > _cap(plan):
                 raise ReviewError("review rounds are capped at %d; the orchestrator rules alone with "
                                   "`dispositions %s --orchestrator-decision TEXT`" % (_cap(plan), unit["id"]))
-            diff = W.git(wt, "diff", "--no-ext-diff", "--no-textconv", "--no-color", _diff_base(adir, j), cand)["stdout"]
+            diff = W.git(wt, "diff", "--text", "--no-ext-diff", "--no-textconv", "--no-color", _diff_base(adir, j), cand)["stdout"]
             text = build_input(unit, j, diff, _earlier(rounds))
             if len(text) > max_chars:
                 raise ReviewError("review input is %d characters, above the limit %d; it is not truncated. Split the unit "
@@ -299,15 +341,21 @@ def run_review(root, plan_id, unit, retry=False, timeout=DEFAULT_TIMEOUT, max_ch
             approval.save_unit_state(root, plan_id, unit["id"], st)
             store.append_event(root, "review_round_started", plan_id=plan_id, unit_id=unit["id"], round=R, candidate=cand)
         if reuse:
+            known = set(c.get("dir") for c in rd["calls"])
+            for name in sorted(os.listdir(rdir), key=lambda x: (len(x), x)):
+                if re.match(r"^c[0-9]+$", name) and name not in known:
+                    rd["calls"].append({"seq": int(name[1:]), "purpose": "orphan", "dir": name, "state": "failed",
+                                        "classification": "ORPHANED", "session_id": None, "family": other, "model": roles["review"],
+                                        "reason": "call directory had no recorded call (interrupted before it was recorded)"})
             rd.update(retried=True, state="started")
             store.write_json_atomic(os.path.join(rdir, "round.json"), rd)
-        sids = author_sessions(root, plan_id, unit["id"], n, host)
+        sids_fn = lambda: author_sessions(root, plan_id, unit["id"], n, host)
         survey = W._survey(root)
     task = INSTRUCTIONS + text
     plans = [("retry" if reuse else "primary", other, roles["review"])]
     while plans:
         purpose, fam, model = plans.pop(0)
-        c = _call(root, rdir, rd, purpose, fam, model, task, survey, timeout, sids)
+        c = _call(root, rdir, rd, wt, purpose, fam, model, task, survey, timeout, sids_fn)
         rd = _obj(os.path.join(rdir, "round.json"))
         if c["state"] == "ok":
             store.write_json_atomic(os.path.join(rdir, "review.json"), c["review"])
@@ -501,8 +549,8 @@ def nonvacuous(root, plan_id, unit, timeout=J.TEST_TIMEOUT):
         with disposable(wt, cand) as d:
             todo = []
             for s, p in others:
-                if s == "A":
-                    os.unlink(os.path.join(d, p))
+                if s == "A":  # added since base: drop it from the index and the tree together
+                    W.git(d, "--literal-pathspecs", "rm", "-q", "-f", "-r", "--", p)
                 else:
                     todo.append(p)
             for i in range(0, len(todo), 100):
@@ -561,7 +609,8 @@ def run_review_cmd(args):
 def configure_reproduce(p):
     _plan_arg(p)
     p.add_argument("--finding", required=True, metavar="ID")
-    p.add_argument("--command", required=True, dest="repro_command", metavar="CMD")
+    p.add_argument("--command", required=True, dest="repro_command", metavar="CMD",
+                   help="runs with cwd set to a disposable checkout of the candidate; use relative paths, not your shell PWD")
     p.add_argument("--timeout", type=float, default=600.0, metavar="S")
 
 
