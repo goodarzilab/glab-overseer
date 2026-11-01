@@ -106,16 +106,18 @@ def _resolve_google(base, strict):
     """Return (roles-or-unavailable dict, raw). Errors raise only when `strict`."""
     env = E.worker_env(base)
     r = E.run_tool(["agy", "models"], env, LIST_TIMEOUT)
+    raw = ""
     try:
         if r["timed_out"]:
             raise ModelError("`agy models` timed out")
         if r["rc"] != 0:
             raise ModelError("`agy models` failed (rc %s): %s" % (r["rc"], r["stderr"].strip()[:200]))
-        return dict(resolve_google(parse_listing(r["stdout"])), available=True), r["stdout"]
+        raw = r["stdout"]
+        return dict(resolve_google(parse_listing(raw)), available=True), raw
     except ModelError as e:
         if strict:
             raise
-        return {"available": False, "reason": str(e)}, ""
+        return {"available": False, "reason": str(e)}, raw
 
 
 def resolve(root, host, refresh=False, base=None, today=None):

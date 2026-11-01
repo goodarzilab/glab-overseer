@@ -5,7 +5,6 @@ Each external query runs under a timeout. A timeout is recorded as
 """
 import os
 import platform
-import shutil
 import sys
 import tempfile
 
@@ -71,10 +70,11 @@ def _auth_probe(family, found, base, timeout, record):
         models.CLAUDE_ROLES if family == "claude" else None)
     if roles is None:
         return {"status": "skipped", "reason": "no review model for %s (run models first)" % family}
-    with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd:
+    with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd, \
+            tempfile.TemporaryDirectory(prefix="ovr-task-") as task_dir:
         model = roles["review"]
         inv = adapters.prepare(family, "author", model, "Reply with the single word ok.", cwd,
-                               transport="file")
+                               task_dir=task_dir, transport="file")
         r = E.run_tool(inv["argv"], E.worker_env(base), timeout, cwd=cwd)
     if r["timed_out"]:
         return {"status": UNKNOWN}
@@ -91,9 +91,9 @@ def collect(root, base=None, probe_auth=False, timeout=QUERY_TIMEOUT):
     slurm_off = base.get("OVERSEER_DISABLE_SLURM") == "1"
     found = {}
     for t in TOOLS:
-        p = shutil.which(t, path=base.get("PATH", ""))
+        p = E.resolve_exe(t, base.get("PATH", ""))
         if p:
-            found[t] = os.path.abspath(p)
+            found[t] = p
     tools = {}
     for t in TOOLS:
         if t not in found:
@@ -184,7 +184,7 @@ def run_probe_transport(args):
         transport = {}
         for family in adapters.FAMILIES:
             roles = models.roles_for(rm, family)
-            if not shutil.which(adapters.BINARY[family], path=base.get("PATH", "")):
+            if not E.resolve_exe(adapters.BINARY[family], base.get("PATH", "")):
                 transport[family] = {"stdin": None, "schema": None, "note": "cli not found"}
             elif roles is None:
                 transport[family] = {"stdin": "unavailable", "schema": "unavailable"}

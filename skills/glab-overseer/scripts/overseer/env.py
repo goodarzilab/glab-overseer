@@ -7,7 +7,6 @@ authenticates.
 """
 import fnmatch
 import os
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -47,18 +46,33 @@ def llm_key_names(base=None):
     return sorted(k for k in base if _match(k, LLM_DENY))
 
 
+def resolve_exe(name, path):
+    """Absolute path of an executable, searching only absolute PATH entries; None if absent.
+
+    Empty and relative entries are skipped so a project directory can never supply the binary.
+    """
+    if os.sep in name:
+        return os.path.abspath(name) if os.path.isfile(name) and os.access(name, os.X_OK) else None
+    for d in (path or "").split(os.pathsep):
+        if d and os.path.isabs(d):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None
+
+
 def run_tool(argv, env, timeout, cwd=None, stdin=None):
     """Run argv with a timeout; returns dict(rc, stdout, stderr, timed_out).
 
     A timeout yields rc None and timed_out True (the whole process group is
     killed). A missing binary yields rc 127. Output goes through temporary
     files, so a detached grandchild holding the descriptors never delays the
-    return. argv[0] is resolved to an absolute path against env's PATH first.
+    return. argv[0] is resolved with `resolve_exe` and spawned by absolute path.
     """
-    exe = argv[0]
-    if os.sep not in exe:
-        found = shutil.which(exe, path=env.get("PATH", ""))
-        exe = os.path.abspath(found) if found else exe
+    exe = resolve_exe(argv[0], env.get("PATH", ""))
+    if exe is None:
+        return {"rc": 127, "timed_out": False, "stdout": "",
+                "stderr": "command not found: %s (only absolute PATH entries are searched)" % argv[0]}
     with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
         if stdin is not None:
             fin.write(stdin.encode("utf-8"))

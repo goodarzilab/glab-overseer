@@ -8,6 +8,7 @@ sanitized failure confirms them.
 import json
 import os
 import re
+import tempfile
 
 from . import env as E
 
@@ -20,7 +21,7 @@ QUOTA, AUTH, TRANSIENT, CONFIG, UNKNOWN = "QUOTA", "AUTH", "TRANSIENT", "CONFIG"
 # so a specific QUOTA or AUTH phrase beats a bare 429 in the same text.
 SIGNATURES = [
     (CONFIG, "binary-missing", r"command not found|not executable", False),
-    (CONFIG, "invalid-model", r"(invalid|unknown|unsupported|unrecognized) model|model[^\n]{0,40}(not found|does not exist)", False),
+    (CONFIG, "invalid-model", r"(invalid|unknown|unsupported|unrecognized) model|model\b[^\n]{0,60}\b(is invalid|invalid|not found|does not exist|not supported|unsupported|unknown)\b", False),
     (QUOTA, "usage-limit", r"usage limit (reached|exceeded)|(5-hour|weekly|daily|monthly) limit reached|you(?:'ve| have) hit your (usage )?limit", True),
     (QUOTA, "quota-exhausted", r"quota (exceeded|exhausted)|exceeded your (current )?quota|out of (credits|usage)", True),
     (AUTH, "login-required", r"please (run )?/?login|please log in|not logged in|login required|run [`']?(claude|agy) (auth )?login", True),
@@ -186,29 +187,28 @@ def _probe_flag(survey, family, key):
     return isinstance(entry, dict) and entry.get(key) is True
 
 
-TASK_FILE = ".overseer-task.md"
-TASK_MARKER = "<!-- overseer task -->"
-POINTER = "Read the file %s in the current directory and follow it exactly." % TASK_FILE
+def pointer(task_path):
+    return "Read the file %s and follow it exactly." % task_path
 
 
-def _write_task(cwd, text):
-    path = os.path.join(cwd, TASK_FILE)
+def _task_path(cwd, task_dir):
+    """`<task_dir>/task.md`, absolute. The directory must be outside cwd and hold no task yet."""
+    if not task_dir:
+        raise ValueError("file transport needs task_dir (a fresh directory outside the working directory)")
+    td, wd = os.path.realpath(task_dir), os.path.realpath(cwd)
+    if os.path.commonpath([td, wd]) == wd:
+        raise ValueError("task_dir %r is inside the working directory" % (task_dir,))
+    path = os.path.join(td, "task.md")
     if os.path.lexists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                first = f.readline().rstrip("\n")
-        except (OSError, UnicodeDecodeError):
-            first = None
-        if first != TASK_MARKER:
-            raise ValueError("%s exists and was not written by overseer; refusing to overwrite" % path)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(TASK_MARKER + "\n" + text)
+        raise ValueError("%s already exists; each invocation owns a fresh task_dir" % path)
     return path
 
 
-def prepare(family, role, model, task_text, cwd, survey=None, schema=None,
+def prepare(family, role, model, task_text, cwd, task_dir=None, survey=None, schema=None,
             transport=None, schema_flag=None):
-    """Write the task file (file transport) and return the invocation.
+    """Write `<task_dir>/task.md` (file transport) and return the invocation.
+
+    Nothing is written into `cwd`. The prompt pointer names the task file's absolute path.
 
     `transport` and `schema_flag` override what the survey's probes allow
     (the probes themselves use the overrides). agy always uses the file
@@ -229,11 +229,13 @@ def prepare(family, role, model, task_text, cwd, survey=None, schema=None,
         use_flag = _probe_flag(survey, family, "schema") if schema_flag is None else schema_flag
         if not use_flag:
             text += "\n\nReply with one JSON object matching this JSON schema:\n" + schema_arg(schema)
-    prompt_file = None
-    if transport == "file":
-        prompt_file = _write_task(cwd, text)
-    argv = build_argv(family, model, POINTER if transport == "file" else None,
+    prompt_file = _task_path(cwd, task_dir) if transport == "file" else None
+    argv = build_argv(family, model, pointer(prompt_file) if prompt_file else None,
                       schema if use_flag else None)
+    if prompt_file:
+        os.makedirs(os.path.dirname(prompt_file), exist_ok=True)
+        with open(prompt_file, "x", encoding="utf-8") as f:
+            f.write(text)
     return {"argv": argv, "stdin": text if transport == "stdin" else None, "transport": transport,
             "prompt_file": prompt_file, "schema_flag": use_flag, "cwd": cwd}
 
@@ -261,9 +263,10 @@ def probe_transport(family, cwd, env, model=None, timeout=180):
         out["stdin"] = state or bool(res["ok"] and "PROBE-OK" in res["text"])
     else:
         out["stdin"] = "unsupported"
-    inv = prepare(family, "reviewer", model, 'Set the field "answer" to the word ok.',
-                  cwd, schema=PROBE_SCHEMA, transport="file", schema_flag=True)
-    state, res = _call(family, inv, env, timeout)
+    with tempfile.TemporaryDirectory(prefix="ovr-task-") as task_dir:
+        inv = prepare(family, "reviewer", model, 'Set the field "answer" to the word ok.', cwd,
+                      task_dir=task_dir, schema=PROBE_SCHEMA, transport="file", schema_flag=True)
+        state, res = _call(family, inv, env, timeout)
     # The flag works when the CLI itself returns a schema-valid structured_output.
     # The value is not judged: measured models sometimes nest JSON text in it.
     out["schema"] = state or bool(res["ok"] and res["structured_native"]

@@ -75,6 +75,12 @@ class Case(unittest.TestCase):
             rc = cli.main(["--root", self.root] + list(args))
         return rc, out.getvalue(), err.getvalue()
 
+    def td(self):
+        """A fresh task directory outside the project, like U3's per-invocation directory."""
+        d = os.path.join(self.tmp, "tasks", str(len(os.listdir(self.tmp)) + time.time_ns()))
+        os.makedirs(d)
+        return d
+
     def write_models(self, google=True, date=None):
         g = ({"available": True, "plan": "gemini-9-argon-high", "code": "gemini-9-argon-high",
               "review": "gemini-9-flash-high"} if google else {"available": False, "reason": "agy not found"})
@@ -125,17 +131,24 @@ class EnvTests(Case):
         self.assertEqual((r2["rc"], r2["stdout"].strip()), (0, "hi"))
         self.assertLess(time.time() - t, 6)
 
-    def test_relative_path_entry_is_resolved_before_cwd_changes(self):
-        os.makedirs(os.path.join(self.tmp, "rel"))
-        p = os.path.join(self.tmp, "rel", "tool")
-        with open(p, "w") as f:
-            f.write("#!/bin/sh\necho ran\n")
-        os.chmod(p, 0o755)
+    def test_only_absolute_path_entries_are_searched(self):
+        for d in ("rel", "project"):
+            os.makedirs(os.path.join(self.tmp, d), exist_ok=True)
+            with open(os.path.join(self.tmp, d, "tool"), "w") as f:
+                f.write("#!/bin/sh\necho ran\n")
+            os.chmod(os.path.join(self.tmp, d, "tool"), 0o755)
         old = os.getcwd()
         os.chdir(self.tmp)
         self.addCleanup(os.chdir, old)
-        r = E.run_tool(["tool"], dict(self.host_env(), PATH="rel:" + self.host_env()["PATH"]), 10, cwd=self.root)
+        sysbin = self.host_env()["PATH"].split(os.pathsep)[1]
+        for path in ("rel", "rel:" + sysbin, ":" + sysbin, ".:" + sysbin, ""):
+            for cwd in (self.tmp, os.path.join(self.tmp, "project")):  # cwd holds a binary named tool
+                r = E.run_tool(["tool"], {"PATH": path}, 10, cwd=cwd)
+                self.assertEqual(r["rc"], 127, (path, cwd))
+                self.assertIn("absolute PATH", r["stderr"])
+        r = E.run_tool(["tool"], {"PATH": "rel:" + os.path.join(self.tmp, "rel")}, 10, cwd=self.root)
         self.assertEqual((r["rc"], r["stdout"].strip()), (0, "ran"))
+        self.assertIsNone(E.resolve_exe("tool", "rel"))
 
     def test_timeout_kills_process_group(self):
         self.shim("slow", "sleep 30")
@@ -206,6 +219,14 @@ class ModelTests(Case):
         self.assertEqual(rc, 0)
         self.assertIs(c["google"]["available"], False)
         self.assertIn("boom", c["google"]["reason"])
+
+    def test_listing_without_eligible_role_keeps_raw_on_claude_host(self):
+        listing = "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n"
+        self.shim("agy", "printf '%%s' '%s'" % listing.replace("\n", "").replace("\t", "'\"\t\"'"))
+        self.run_cli("models", "--host", "claude")
+        rec = self.state("models.json")
+        self.assertIs(rec["choices"]["google"]["available"], False)
+        self.assertIn("claude-opus-5-5-high", rec["raw"])
 
     def test_agy_failure_and_empty_listing_are_errors(self):
         self.shim("agy", "echo boom >&2; exit 3")
@@ -346,6 +367,9 @@ class ClassifierTests(unittest.TestCase):
         ("google", 1, "", "503 Service Unavailable", "TRANSIENT", "service-unavailable"),
         ("claude", 1, "", "usage limit reached (429)", "QUOTA", "usage-limit"),
         ("claude", 1, "", "unknown model: foo", "CONFIG", "invalid-model"),
+        ("google", 1, "", "model gemini-0 is invalid", "CONFIG", "invalid-model"),
+        ("google", 1, "", "Error: model not found", "CONFIG", "invalid-model"),
+        ("claude", 1, "", "There's an issue with the selected model (x). It may not exist", "UNKNOWN", None),
         ("google", 127, "", "", "CONFIG", "binary-missing"),
         ("claude", None, "", "", "UNKNOWN", "timeout"),
         ("claude", 1, "", "segfault", "UNKNOWN", None),
@@ -381,7 +405,7 @@ class PrepareTests(Case):
                 with self.assertRaises(ValueError):
                     adapters.build_argv(fam, bad, "P")
                 with self.assertRaises(ValueError):
-                    adapters.prepare(fam, "author", bad, "T", self.root)
+                    adapters.prepare(fam, "author", bad, "T", self.root, task_dir=self.td())
 
     def agy_strict_shim(self):
         # Like the real agy: exits 2 when the value after -p looks like a flag.
@@ -393,10 +417,10 @@ class PrepareTests(Case):
         both = {"transport": {"google": {"schema": True, "stdin": True}}}
         for role, schema, survey in (("author", None, {}), ("reviewer", self.SCHEMA, {}),
                                      ("reviewer", self.SCHEMA, both)):
-            inv = adapters.prepare("google", role, "m", "T", self.root, survey=survey, schema=schema)
+            inv = adapters.prepare("google", role, "m", "T", self.root, task_dir=self.td(), survey=survey, schema=schema)
             argv = inv["argv"]
             i = argv.index("-p")
-            self.assertEqual(argv[i + 1], adapters.POINTER)
+            self.assertEqual(argv[i + 1], adapters.pointer(inv["prompt_file"]))
             self.assertEqual(inv["transport"], "file")
             self.assertFalse(argv[i + 1].startswith("-"))
             r = E.run_tool(argv, self.host_env(), 10, cwd=self.root)
@@ -406,74 +430,75 @@ class PrepareTests(Case):
 
     def test_agy_never_uses_stdin(self):
         with self.assertRaises(ValueError):
-            adapters.prepare("google", "author", "m", "T", self.root, transport="stdin")
+            adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), transport="stdin")
 
     def test_schema_flag_is_inline_compact_json_for_both_families(self):
         ok = {"transport": {"claude": {"schema": True}, "google": {"schema": True}}}
         for family in adapters.FAMILIES:
-            inv = adapters.prepare(family, "reviewer", "m", "T", self.root, survey=ok, schema=self.SCHEMA)
+            inv = adapters.prepare(family, "reviewer", "m", "T", self.root, task_dir=self.td(), survey=ok, schema=self.SCHEMA)
             i = inv["argv"].index("--json-schema")
             self.assertEqual(json.loads(inv["argv"][i + 1]), self.SCHEMA)
             self.assertEqual(inv["argv"][i + 1], '{"type":"object"}')
             self.assertFalse(os.path.exists(os.path.join(self.root, "schema.json")))
 
-    def test_file_transport_is_default_and_never_truncates(self):
+    def test_file_transport_writes_outside_cwd_and_points_at_absolute_path(self):
         task = "x" * 500000
-        inv = adapters.prepare("claude", "author", "sonnet", task, self.root)
+        td = self.td()
+        inv = adapters.prepare("claude", "author", "sonnet", task, self.root, task_dir=td)
         self.assertEqual((inv["transport"], inv["stdin"]), ("file", None))
-        with open(os.path.join(self.root, ".overseer-task.md")) as f:
-            self.assertEqual(f.read(), adapters.TASK_MARKER + "\n" + task)
-        self.assertLess(len(inv["argv"][-1]), 200)
+        self.assertEqual(inv["prompt_file"], os.path.join(td, "task.md"))
+        with open(inv["prompt_file"]) as f:
+            self.assertEqual(f.read(), task)
+        self.assertEqual(inv["argv"][-1], adapters.pointer(inv["prompt_file"]))
+        self.assertTrue(os.path.isabs(inv["prompt_file"]))
+        self.assertLess(len(inv["argv"][-1]), 400)
         self.assertNotIn("\n", inv["argv"][-1])
-        self.assertIn(".overseer-task.md", inv["argv"][-1])
+        self.assertEqual(os.listdir(self.root), [])  # nothing lands in the worktree
 
-    def test_task_file_never_overwrites_a_foreign_file(self):
-        for name in ("task.md", ".overseer-task.md"):
-            path = os.path.join(self.root, name)
-            with open(path, "w") as f:
-                f.write("project notes\n")
-            try:
-                adapters.prepare("claude", "author", "m", "T", self.root)
-            except ValueError as e:
-                self.assertEqual(name, ".overseer-task.md")
-                self.assertIn("refusing", str(e))
-            else:
-                self.assertEqual(name, "task.md")
-            with open(path) as f:
-                self.assertEqual(f.read(), "project notes\n")
-        os.unlink(os.path.join(self.root, ".overseer-task.md"))
-        adapters.prepare("claude", "author", "m", "A", self.root)
-        adapters.prepare("claude", "author", "m", "B", self.root)  # our own file is replaced
-        with open(os.path.join(self.root, ".overseer-task.md")) as f:
-            self.assertTrue(f.read().endswith("\nB"))
+    def test_task_dir_rules(self):
+        sub = os.path.join(self.root, "sub")
+        os.makedirs(sub)
+        link = os.path.join(self.tmp, "alias")
+        os.symlink(self.root, link)
+        for bad in (None, "", self.root, sub, os.path.join(link, "sub")):
+            with self.assertRaises(ValueError, msg=bad):
+                adapters.prepare("claude", "author", "m", "T", self.root, task_dir=bad)
+        td = self.td()
+        a = adapters.prepare("claude", "author", "m", "A", self.root, task_dir=td)
+        with self.assertRaises(ValueError):  # a second invocation may not reuse the directory
+            adapters.prepare("claude", "author", "m", "B", self.root, task_dir=td)
+        with open(a["prompt_file"]) as f:
+            self.assertEqual(f.read(), "A")
+        self.assertEqual(os.listdir(self.root), ["sub"])
+        adapters.prepare("claude", "author", "m", "C", self.root, task_dir=None, transport="stdin")
 
     def test_stdin_requires_recorded_true_probe(self):
         for t in ({}, {"claude": {"stdin": False}}, {"claude": {"stdin": "true"}}, {"claude": {"stdin": None}}):
-            inv = adapters.prepare("claude", "author", "m", "T", self.root, survey={"transport": t})
+            inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": t})
             self.assertEqual(inv["transport"], "file", t)
         for s in (None, [], {"transport": []}, {"transport": {"claude": 1}}):
-            self.assertEqual(adapters.prepare("claude", "author", "m", "T", self.root, survey=s)["transport"], "file")
-        inv = adapters.prepare("claude", "author", "m", "T", self.root, survey={"transport": {"claude": {"stdin": True}}})
+            self.assertEqual(adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey=s)["transport"], "file")
+        inv = adapters.prepare("claude", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": {"claude": {"stdin": True}}})
         self.assertEqual((inv["transport"], inv["stdin"], inv["argv"][-1]), ("stdin", "T", "json"))
-        other = adapters.prepare("google", "author", "m", "T", self.root, survey={"transport": {"claude": {"stdin": True}}})
+        other = adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), survey={"transport": {"claude": {"stdin": True}}})
         self.assertEqual(other["transport"], "file")
 
     def test_reviewer_schema_flag_only_after_passing_probe(self):
-        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, schema=self.SCHEMA, survey={})
+        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), schema=self.SCHEMA, survey={})
         self.assertNotIn("--json-schema", inv["argv"])
-        with open(os.path.join(self.root, ".overseer-task.md")) as f:
+        with open(inv["prompt_file"]) as f:
             self.assertIn('{"type":"object"}', f.read())
         ok = {"transport": {"google": {"schema": True}}}
-        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, schema=self.SCHEMA, survey=ok)
+        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), schema=self.SCHEMA, survey=ok)
         self.assertIn("--json-schema", inv["argv"])
-        with open(os.path.join(self.root, ".overseer-task.md")) as f:
+        with open(inv["prompt_file"]) as f:
             self.assertNotIn("JSON schema", f.read())
-        inv = adapters.prepare("google", "author", "m", "T", self.root, schema=self.SCHEMA, survey=ok)
+        inv = adapters.prepare("google", "author", "m", "T", self.root, task_dir=self.td(), schema=self.SCHEMA, survey=ok)
         self.assertNotIn("--json-schema", inv["argv"])
 
     def test_bad_arguments(self):
         with self.assertRaises(ValueError):
-            adapters.prepare("claude", "judge", "m", "T", self.root)
+            adapters.prepare("claude", "judge", "m", "T", self.root, task_dir=self.td())
         with self.assertRaises(ValueError):
             adapters.prepare("claude", "author", "m", "T", os.path.join(self.root, "missing"))
 
@@ -498,6 +523,15 @@ class SurveyTests(Case):
         self.assertEqual(s["slurm"]["partitions"],
                          [{"name": "batch-cpu", "time_limit": "1-00:00:00", "availability": "up"}])
         self.assertIs(survey.collect(self.root, self.host_env())["slurm"]["in_allocation"], False)
+
+    def test_relative_path_entries_do_not_discover_tools(self):
+        self.shim("claude", "echo c")
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        base = self.host_env()
+        base["PATH"] = "shims:" + base["PATH"].split(os.pathsep)[1]
+        self.assertFalse(survey.collect(self.root, base)["tools"]["claude"]["found"])
 
     def test_slurm_missing_tools_is_unusable(self):
         s = survey.collect(self.root, self.host_env())
@@ -585,9 +619,9 @@ class ProbeTransportTests(Case):
         self.assertTrue(all("--model gemini-9-flash-high" in c for c in calls if c.startswith("agy")), calls)
         self.assertTrue(any(c.startswith("agy") for c in calls))
         survey_doc = self.state("survey.json")
-        inv = adapters.prepare("claude", "reviewer", "haiku", "T", self.root, survey=survey_doc, schema={"type": "object"})
+        inv = adapters.prepare("claude", "reviewer", "haiku", "T", self.root, task_dir=self.td(), survey=survey_doc, schema={"type": "object"})
         self.assertEqual((inv["transport"], inv["schema_flag"]), ("stdin", True))
-        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, survey=survey_doc, schema={"type": "object"})
+        inv = adapters.prepare("google", "reviewer", "m", "T", self.root, task_dir=self.td(), survey=survey_doc, schema={"type": "object"})
         self.assertEqual((inv["transport"], inv["schema_flag"]), ("file", False))
 
     def test_probe_requires_models_cache(self):
