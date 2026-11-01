@@ -62,7 +62,8 @@ def execution_evidence(invs):
 
     def clean(t):
         return t["state"] == "EXITED" and t.get("rc") == 0 and not t.get("signal") and t.get("verdict") in (None, "COMPLETED")
-    failed = [i for i in invs if i["status"]["state"] in ("CANCELLED", "LAUNCH_FAILED")
+    # LAUNCH_FAILED means the worker never ran: not failure evidence (a retry reuses that attempt)
+    failed = [i for i in invs if i["status"]["state"] == "CANCELLED"
               or (i["status"]["state"] == "EXITED" and not clean(i["status"]))]
     if failed:
         return "failure", detail(failed[-1])
@@ -103,6 +104,14 @@ def _validate_runner(cwd, file_path):
     return run
 
 
+def _file_sha(f):
+    try:
+        with open(f, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def code_outputs(wt, candidate, unit):
     """Each declared output at the candidate commit: a regular blob, never a symlink or submodule."""
     results = []
@@ -129,7 +138,9 @@ def code_outputs(wt, candidate, unit):
                     f = os.path.join(tmp, os.path.basename(p))
                     with open(f, "wb") as fh:
                         fh.write(blob())
-                    return _validate_runner(tmp, f)(cmd)
+                    before = _file_sha(f)
+                    rc = _validate_runner(tmp, f)(cmd)
+                    return rc if _file_sha(f) == before else "(modified its input)"
                 finally:
                     shutil.rmtree(tmp, True)
             problems = _predicate(o, 0, size, blob, run_v)
@@ -137,32 +148,34 @@ def code_outputs(wt, candidate, unit):
     return results
 
 
+def _tree(out):
+    """{relative path: (size, sha256) or ("link", target)} of every file under the outputs directory."""
+    base, tree = os.path.realpath(out), {}
+    for d, _, files in os.walk(base):
+        for name in files:
+            f = os.path.join(d, name)
+            rel = os.path.relpath(f, base)
+            if os.path.islink(f):
+                tree[rel] = ("link", os.readlink(f))
+            else:
+                tree[rel] = (os.path.getsize(f), _file_sha(f))
+    return tree
+
+
 def job_outputs(adir, unit):
-    """Each declared output under attempts/a<N>/outputs/ (symlinks must stay inside it)."""
+    """Each declared output under attempts/a<N>/outputs/ (symlinks must stay inside it).
+
+    Existence, size and digest of every output are decided before any validator runs. Validators
+    run on private copies, and afterwards the directory's files must be exactly as they were.
+    """
     out = os.path.join(adir, "outputs")
     results = []
-    watch = {}  # path -> (size, sha256) before any validator ran
-
-    def snap(f):
-        with open(f, "rb") as fh:
-            data = fh.read()
-        return len(data), hashlib.sha256(data).hexdigest()
-    if any(isinstance(o, dict) and o.get("validate") is not None for o in unit["outputs"]):
-        for o in unit["outputs"]:
-            try:
-                f = paths.safe_relpath(out, o["path"] if isinstance(o, dict) else o)
-                if os.path.isfile(f):
-                    watch[f] = snap(f)
-            except (paths.UnsafePath, OSError):
-                pass
     for o in unit["outputs"]:
         o = o if isinstance(o, dict) else {"path": o}
-        p = o["path"]
-        problems = []
+        problems, full = [], None
         try:
-            full = paths.safe_relpath(out, p)
+            full = paths.safe_relpath(out, o["path"])
         except paths.UnsafePath as e:
-            full = None
             problems.append(str(e))
         if full is not None:
             if not os.path.isfile(full):
@@ -171,26 +184,36 @@ def job_outputs(adir, unit):
                 def read(f=full):
                     with open(f, "rb") as fh:
                         return fh.read()
-                def run_v(cmd, full=full):  # a private copy: the validator never sees the live output
-                    tmp = tempfile.mkdtemp(prefix="ovr-validate-")
-                    try:
-                        f = os.path.join(tmp, os.path.basename(full))
-                        shutil.copyfile(full, f)
-                        return _validate_runner(tmp, f)(cmd)
-                    finally:
-                        shutil.rmtree(tmp, True)
-                problems = _predicate(o, 1, os.path.getsize(full), read, run_v)
-        results.append({"path": p, "ok": not problems, "problems": problems, "_full": full})
-    for r in results:  # after all validators: the originals must be unchanged
-        full = r.pop("_full")
-        if full in watch:
-            try:
-                same = snap(full) == watch[full]
-            except OSError:
-                same = False
-            if not same:
-                r["problems"].append("output changed while validators ran")
-                r["ok"] = False
+                problems = _predicate(dict((k, v) for k, v in o.items() if k != "validate"), 1,
+                                      os.path.getsize(full), read, None)
+        results.append({"path": o["path"], "ok": not problems, "problems": problems, "_full": full, "_o": o})
+    todo = [r for r in results if r["ok"] and r["_o"].get("validate") is not None]
+    before = _tree(out) if todo else None
+    for r in todo:
+        v, full = r["_o"]["validate"], r["_full"]
+        if not (isinstance(v, str) and v.strip()):
+            r["problems"].append("invalid validator")
+            continue
+        tmp = tempfile.mkdtemp(prefix="ovr-validate-")
+        try:
+            f = os.path.join(tmp, os.path.basename(full))
+            shutil.copyfile(full, f)  # a private copy: the validator never sees the live output
+            rc = _validate_runner(tmp, f)(v)
+        finally:
+            shutil.rmtree(tmp, True)
+        if rc != 0:
+            r["problems"].append("validator exited %s" % ("(timeout)" if rc is None else rc))
+    if before is not None:
+        after = _tree(out)
+        changed = set(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        base = os.path.realpath(out)
+        declared = set(os.path.relpath(r["_full"], base) for r in results if r["_full"])
+        for r in results:
+            if changed and (set(before) != set(after) or changed - declared or (r["_full"] and os.path.relpath(r["_full"], base) in changed)):
+                r["problems"].append("outputs directory changed while validators ran: " + ",".join(sorted(changed)))
+    for r in results:
+        r.pop("_full"), r.pop("_o")
+        r["ok"] = not r["problems"]
     return results
 
 
@@ -248,16 +271,31 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
         if cand:  # per-output results are evidence even when the judgment fails
             j["outputs"] = code_outputs(wt, cand, unit)
         return j
-    r = E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=wt)
+    # the test runs in a clean, disposable detached checkout of the candidate, so untracked or
+    # ignored worktree-only files cannot make it pass; the live worktree is checked afterwards
+    scratch = tempfile.mkdtemp(prefix="ovr-test-")
+    try:
+        W.git(wt, "worktree", "add", "--detach", scratch, cand)
+        r = E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=scratch)
+        after = _worktree_problems(scratch, cand, "test")
+    finally:
+        try:
+            W.git(wt, "worktree", "remove", "--force", scratch)
+        except W.GitError:
+            pass
+        shutil.rmtree(scratch, True)
+        W.git(wt, "worktree", "prune", ok=(0, 128))
     log = os.path.join(adir, "test.log")
     with open(log, "w", encoding="utf-8") as f:
         f.write(r["stdout"] + ("\n--- stderr ---\n" + r["stderr"] if r["stderr"] else ""))
-    j["test_rc"], j["test_log"] = r["rc"], log
+    j["test_rc"], j["test_log"], j["test_clean_checkout"] = r["rc"], log, True
     if r["timed_out"]:
         j["reasons"].append("test_timeout:%gs" % timeout)
     elif r["rc"] != 0:
         j["reasons"].append("test_failed:rc=%s" % r["rc"])
-    j["reasons"] += _worktree_problems(wt, cand, "test")
+    for why in after + _worktree_problems(wt, cand, "test"):
+        if why not in j["reasons"]:
+            j["reasons"].append(why)
     j["outputs"] = code_outputs(wt, cand, unit)
     j["reasons"] += ["output_failed:%s: %s" % (o["path"], "; ".join(o["problems"])) for o in j["outputs"] if not o["ok"]]
     j["reasons"] += _worktree_problems(wt, cand, "validator")
@@ -342,6 +380,9 @@ def resolve_unit(root, plan_id, unit, as_, reason, evidence):
          "execution": {"state": "UNCERTAIN", "invocations": [i["seq"] for i in targets]},
          "invocation_token": (X._load(os.path.join(invs[-1]["path"], "intent.json")) or {}).get("token")}
     if as_ == "done":
+        live = [i for i in invs if i["status"]["state"] != "RESOLVED"]
+        if live and execution_evidence(live)[0] == "failure":
+            raise JudgeError("refusing --as done; another invocation has definite failure evidence")
         if unit["kind"] != "job":
             raise JudgeError("code units cannot be resolved as done; resolve the author as failed, or judge a new attempt")
         j["outputs"] = job_outputs(adir, unit)

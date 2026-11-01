@@ -56,7 +56,7 @@ class Case(TmpCase):
         sh(self.origin, "symbolic-ref", "HEAD", "refs/heads/main")
         sh(self.root, "init", "-q")
         sh(self.root, "symbolic-ref", "HEAD", "refs/heads/main")
-        for rel, text in (("src/alpha_old.py", "old\n"), ("lib/x.py", "x\n"), ("README.md", "readme\n"),
+        for rel, text in (("src/alpha_old.py", "old\n"), ("src/alpha.key", "k\n"), ("lib/x.py", "x\n"), ("README.md", "readme\n"),
                           (".coverage", "cov-fixture\n")):
             self.put(rel, text)
         sh(self.root, *(ID + ["add", "-A"]))
@@ -232,7 +232,7 @@ class CodeJudgment(Case):
         wt = self.wt()
         for rel in ("src/__pycache__/m.pyc", ".pytest_cache/f", "src/alpha.pyc"):
             self.assertTrue(os.path.exists(os.path.join(wt, rel)), rel)
-        self.assertEqual(sh(wt, "ls-files", "src", ".pytest_cache"), "src/alpha.py\nsrc/alpha_old.py")
+        self.assertEqual(sh(wt, "ls-files", "src", ".pytest_cache"), "src/alpha.key\nsrc/alpha.py\nsrc/alpha_old.py")
         with open(os.path.join(wt, ".coverage")) as f:
             self.assertEqual(f.read(), "cov-fixture\n")
         self.assertEqual(sh(wt, "diff", "--cached", "--name-only"), "")
@@ -326,7 +326,7 @@ class Hardening(Case):
 
     def test_gitignored_declared_output_is_force_added_but_other_ignored_files_are_not(self):
         self.run_unit('mkdir -p src build; echo a > src/alpha.py; echo j > build/junk.log; ' + self.EXCL, expect="DONE")
-        self.assertEqual(sh(self.wt(), "ls-files", "src", "build"), "src/alpha.py\nsrc/alpha_old.py")
+        self.assertEqual(sh(self.wt(), "ls-files", "src", "build"), "src/alpha.key\nsrc/alpha.py\nsrc/alpha_old.py")
         self.assertTrue(os.path.exists(os.path.join(self.wt(), "build", "junk.log")))
 
     def test_ignored_undeclared_file_inside_scope_fails(self):
@@ -381,6 +381,45 @@ class Hardening(Case):
                                               "other.txt"]})
         self.assertEqual([r["ok"] for r in res], [True, False])
         self.assertIn("changed while validators ran", res[1]["problems"][0])
+
+
+class Round4(Case):
+    def test_intent_to_add_rename_commits_both_sides(self):
+        self.run_unit('mkdir -p src; mv src/alpha_old.py src/alpha.py; git add -N src/alpha.py', expect="DONE")
+        self.assertEqual(sh(self.wt(), "ls-tree", "-r", "--name-only", "HEAD", "src"), "src/alpha.key\nsrc/alpha.py")
+
+    def test_staged_rename_that_deletes_a_prohibited_name_is_allowed(self):
+        self.run_unit('mkdir -p src; git mv src/alpha.key src/alpha_k.txt; echo a > src/alpha.py', expect="DONE")
+
+    def test_launch_failed_is_not_failure_evidence(self):
+        lf = {"seq": "01", "status": {"state": "LAUNCH_FAILED"}}
+        ok = {"seq": "02", "status": {"state": "EXITED", "rc": 0}}
+        self.assertEqual(J.execution_evidence([lf, ok])[0], "success")
+        self.assertEqual(J.execution_evidence([lf])[0], "failure")
+
+    def test_test_runs_in_a_clean_checkout_of_the_candidate(self):
+        j = self.run_unit('mkdir -p src/__pycache__; echo a > src/alpha.py; echo c > src/__pycache__/needed.pyc',
+                          unit={"test_command": "test -f src/__pycache__/needed.pyc"})
+        self.assertEqual((j["status"], j["reasons"]), ("FAILED", ["test_failed:rc=1"]))
+        self.assertTrue(j["test_clean_checkout"])
+        self.assertEqual(sh(self.wt(), "worktree", "list", "--porcelain").count("worktree "), 2)  # scratch removed
+
+    def test_code_validator_that_rewrites_its_input_fails(self):
+        wt, head = Predicates.repo(self)
+        res = J.code_outputs(wt, head, {"outputs": [{"path": "ok.txt", "validate": 'echo x > "$OVERSEER_OUTPUT"'}]})
+        self.assertEqual(res[0]["problems"], ["validator exited (modified its input)"])
+
+    def test_job_validator_cannot_create_outputs_or_add_files(self):
+        adir = os.path.join(self.tmp, "att3")
+        out = os.path.join(adir, "outputs")
+        self.put("ok.txt", "hello\n", base=out)
+        res = J.job_outputs(adir, {"outputs": [{"path": "ok.txt", "validate": "echo z > %s" % os.path.join(out, "new.txt")},
+                                              "new.txt"]})
+        self.assertEqual([r["ok"] for r in res], [False, False])
+        self.assertEqual(res[1]["problems"][0], "missing")  # decided before the validator ran
+        os.unlink(os.path.join(out, "new.txt"))
+        res = J.job_outputs(adir, {"outputs": [{"path": "ok.txt", "validate": "echo z > %s" % os.path.join(out, "extra.txt")}]})
+        self.assertIn("changed while validators ran", res[0]["problems"][0])
 
 
 class Dispatch(Case):
@@ -561,6 +600,16 @@ class Jobs(Case):
         self.assertEqual(cancel["orchestrator_resolved"]["as"], "failed")
         self.assertEqual((X.invocation_status(inv, True)["state"], X.slots_in_use(self.root, True)), ("RESOLVED", 0))
         self.assertEqual(jload(os.path.join(self.attempt_dir("crunch"), "judgment.json"))["status"], "FAILED")
+
+    def test_resolve_done_is_refused_when_another_invocation_definitely_failed(self):
+        self.uncertain_job()
+        self.put("result.txt", "data\n", base=os.path.join(self.attempt_dir("crunch"), "outputs"))
+        rec = X.launch_invocation(self.root, "demo", "crunch", 1, "job", ["sh", "-c", "exit 3"], self.root)
+        self.wait_done("crunch")
+        self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "EXITED")
+        rc, _, err = self.cli("resolve", "crunch", "--as", "done", "--reason", "r", "--evidence", "e")
+        self.assertEqual((rc, "definite failure" in err), (1, True))
+        self.assertEqual(self.cli("resolve", "crunch", "--as", "failed", "--reason", "r", "--evidence", "e")[0], 0)
 
     def test_resolve_requires_reason_and_evidence(self):
         self.uncertain_job()

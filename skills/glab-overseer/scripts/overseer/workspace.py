@@ -262,8 +262,9 @@ def classify_dirty(wt, scope, outputs):
     """(to_add, staged, reasons, out_of_scope) for everything the author left in the worktree."""
     entries = parse_status(git(wt, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                                "--ignore-submodules=none", raw=True)["stdout"])
-    gitlinks = set(l.split("\t", 1)[1] for l in git(wt, "ls-files", "--stage", "-z", raw=False)["stdout"].split("\0")
-                   if l.startswith("160000 "))
+    index = [l.split("\t", 1) for l in git(wt, "ls-files", "--stage", "-z", raw=False)["stdout"].split("\0") if "\t" in l]
+    gitlinks = set(p for m, p in index if m.startswith("160000 "))
+    tracked = set(p for _, p in index)
     add, staged, reasons, oos = [], False, [], []
     for xy, path, origin in entries:
         if xy == "??" and excluded(path):
@@ -283,12 +284,12 @@ def classify_dirty(wt, scope, outputs):
             reasons.append("symlink:" + path)
         elif os.path.lexists(full) and (prohibited_name(path) or (os.path.getsize(full) > MAX_BLOB and path not in outputs)):
             reasons.append("prohibited_or_oversize:" + path)
-        elif origin and prohibited_name(origin):
-            reasons.append("prohibited_path:" + origin)
         if xy[0] not in " ?":
             staged = True
-        if xy[1] != " ":
+        if xy[1] != " ":  # both sides of a rename: the destination is added, the origin's deletion staged
             add.append(path)
+            if origin and origin in tracked:
+                add.append(origin)
     return add, staged, reasons, sorted(set(oos))
 
 
