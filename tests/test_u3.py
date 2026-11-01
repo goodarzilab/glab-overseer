@@ -624,6 +624,53 @@ class CommandTests(Case):
             self.assertEqual(X.find_by_script("/a b/run.sh"), [])
             self.assertEqual(X.find_by_script("/ab/run.sh"), [456])
 
+    @unittest.skipIf(os.getuid() == 0, "root can read every environ")
+    def test_abort_not_confirmed_while_an_undumpable_payload_may_run(self):
+        ready = os.path.join(self.tmp, "ready")
+        code = "import ctypes,time;ctypes.CDLL(None).prctl(4,0);open(%r,'w').close();time.sleep(30)" % ready
+        rec = self.launch("j1", [self.script("ud", "exec '%s' -c \"%s\"" % (sys.executable, code))])
+        while not os.path.exists(ready):
+            time.sleep(0.02)
+        os.kill(rec["launch"]["pid"], signal.SIGKILL)  # wrapper gone; the payload hides its environ
+        self.wait_for(rec["dir"], ("UNCERTAIN",))
+        token = self.rec(rec["dir"], "intent.json")["token"]
+        self.assertTrue(X._token_pids(token, (rec["launch"]["pid"], rec["launch"]["pgid"])).unknown)
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0.2, confirm_wait=0.2), "UNCONFIRMED")
+        cancel = self.rec(rec["dir"], "cancel.json")
+        self.assertNotIn("confirmed_at", cancel)
+        self.assertIn("unreadable", cancel["cancel_unconfirmed_reason"])
+        self.assertEqual(X.invocation_status(rec["dir"])["state"], "CANCELLING")
+
+    def test_without_proc_surviving_group_member_blocks_confirmation(self):
+        ready = os.path.join(self.tmp, "ready")
+        rec = self.launch("j1", [self.script("kid", "(trap '' TERM; echo > %s; exec sleep 30) & wait" % ready)])
+        while not os.path.exists(ready):
+            time.sleep(0.02)
+        with mock.patch.object(X, "_token_pids", return_value=None):
+            res = X.abort_invocation(self.root, rec["dir"], grace=0.3, confirm_wait=0.3)
+        self.assertEqual(res, "UNCONFIRMED")  # the wrapper exits on TERM; its child lives in the group
+        self.assertNotIn("confirmed_at", self.rec(rec["dir"], "cancel.json"))
+        self.assertEqual(X.slots_in_use(self.root), 1)
+
+    def test_unidentified_cancel_is_not_cleared_by_a_later_exit_json(self):
+        with self.assertRaises(Crash):
+            self.launch("j1", spawn=mock.Mock(side_effect=Crash))
+        inv = next(X.iter_invocations(self.root))["path"]
+        self.assertEqual(X.abort_invocation(self.root, inv, grace=0.1), "UNIDENTIFIED")
+        it = self.rec(inv, "intent.json")
+        store.write_json_atomic(os.path.join(inv, "exit.json"), {
+            "token": it["token"], "argv_sha256": it["argv_sha256"], "rc": 0, "signal": None})
+        self.assertEqual(X.invocation_status(inv)["state"], "UNCERTAIN")
+        self.assertEqual(X.slots_in_use(self.root), 1)
+
+    def test_several_process_matches_are_not_adopted(self):
+        with self.assertRaises(Crash):
+            self.launch("j1", spawn=mock.Mock(side_effect=Crash))
+        inv = next(X.iter_invocations(self.root))["path"]
+        with mock.patch.object(X, "find_by_script", return_value=[os.getpid(), os.getppid()]):
+            self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
+        self.assertFalse(os.path.exists(os.path.join(inv, "launch.json")))
+
     def test_unconfirmed_abort_keeps_slot(self):
         rec = self.launch("j1")
         with mock.patch.object(X, "identified_alive", return_value=True), \

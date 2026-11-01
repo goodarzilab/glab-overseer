@@ -181,6 +181,8 @@ def _reconcile_launch(inv, intent, write):
     st = _load(os.path.join(inv, "start.json"))
     if isinstance(st, dict) and st.get("token") == intent["token"] and st.get("pid") in cands:
         cands = [st["pid"]]
+    if len(cands) != 1:  # zero or several matches: never guess
+        return None
     for pid in cands:
         start = proc_start(pid)
         if start is None:
@@ -222,6 +224,9 @@ def invocation_status(inv, write=False):
     if intent is BAD or not _valid_intent(intent, inv):
         return {"state": "UNCERTAIN", "reason": "intent.json is invalid"}
     cancel = _load(os.path.join(inv, "cancel.json"))
+    if isinstance(cancel, dict) and cancel.get("token") == intent["token"] and "unidentified" in cancel:
+        # an unidentifiable payload may still run: exit.json cannot clear it, only an orchestrator resolve
+        return {"state": "UNCERTAIN", "reason": "cancel unidentified: %s" % cancel["unidentified"]}
     if _cancel_pending(cancel, intent):  # an abort is outstanding: hold the slot until it confirms
         return {"state": "CANCELLING"}
     ex = _load(os.path.join(inv, "exit.json"))
@@ -525,21 +530,49 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
 
 # ---- abort -----------------------------------------------------------------
 
-def _token_pids(token):
-    """Pids of processes carrying this invocation's token in their environment; None without /proc."""
+class PidList(list):
+    unknown = False  # True when one of our own processes could not be inspected
+
+
+def _in_scope(name, scope):
+    """True when /proc/<name> is in the wrapper's session or process group (stat stays readable)."""
+    try:
+        with open("/proc/%s/stat" % name) as f:
+            data = f.read()
+        rest = data[data.rindex(")") + 2:].split()
+        return int(rest[3]) == scope[0] or int(rest[2]) == scope[1]
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _token_pids(token, scope=None):
+    """Our-uid processes carrying this invocation's token in their environment; None without /proc.
+
+    Other users' processes are ignored. If a process of ours has an unreadable environment
+    and lies in the wrapper's session or process group (`scope` = (sid, pgid); with no scope
+    every such process counts), the result is flagged `unknown`: it may be a payload that made
+    itself undumpable. Unrelated undumpable processes of ours (agents, browsers) are not.
+    """
     if not os.path.isdir("/proc/self"):
         return None
     want = ("%s=%s" % (TOKEN_VAR, token)).encode()
-    out = []
+    out = PidList()
     for name in os.listdir("/proc"):
-        if name.isdigit() and int(name) != os.getpid():
-            try:
-                with open("/proc/%s/environ" % name, "rb") as f:
-                    data = f.read()
-            except OSError:
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            if os.stat("/proc/%s" % name).st_uid != os.getuid():
                 continue
-            if want in data.split(b"\0"):
-                out.append(int(name))
+            with open("/proc/%s/environ" % name, "rb") as f:
+                data = f.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # exited meanwhile
+        except OSError:
+            if scope is None or _in_scope(name, scope):
+                out.unknown = True
+            continue
+        if want in data.split(b"\0"):
+            out.append(int(name))
     return out
 
 
@@ -550,8 +583,12 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
     is gone, members are found by the invocation token in /proc/<pid>/environ and signalled
     one by one (a group is never signalled on a bare pgid, which could have been reused).
     Without /proc nothing else can be identified: a dead wrapper then yields
-    `cancel_unidentified`. cancel.json gets requested_at before any signal and
-    confirmed_at only when the wrapper is gone and no process carries the token.
+    `cancel_unidentified`; while the wrapper lives the group is signalled, and afterwards the
+    group is only probed (`killpg(pgid, 0)`, never a real signal), so survivors keep the
+    abort unconfirmed. A child that calls setsid() can escape that probe (cooperative
+    boundary C20). cancel.json gets requested_at before any signal and confirmed_at only when
+    the wrapper is gone and no process carries the token; an unreadable environment of one
+    of our processes counts as alive (`cancel_unconfirmed_reason`).
     """
     st = invocation_status(inv, True)
     if st["state"] not in ACTIVE:
@@ -582,8 +619,26 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
         store.write_json_atomic(cpath, cancel)
         store.append_event(root, "cancel_requested", **ref)
 
+    def group_probe():
+        if launch["pgid"] != launch["pid"] or launch["pgid"] == os.getpgrp():
+            return False
+        try:
+            os.killpg(launch["pgid"], 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        return True
+
+    scope = (launch["pid"], launch["pgid"])
+
     def alive():
-        return wrapper() or bool(_token_pids(intent["token"]))
+        if wrapper():
+            return True
+        pids = _token_pids(intent["token"], scope)
+        if pids is None:
+            return group_probe()
+        return bool(pids) or pids.unknown
 
     def send(sig):
         try:
@@ -593,7 +648,7 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
                 else:
                     os.kill(launch["pid"], sig)
             else:
-                for pid in _token_pids(intent["token"]) or []:
+                for pid in _token_pids(intent["token"], scope) or []:
                     os.kill(pid, sig)
         except ProcessLookupError:
             pass
@@ -609,6 +664,10 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
         while alive() and time.monotonic() < end:
             sleep(0.05)
     if alive():
+        pids = _token_pids(intent["token"], scope)
+        if pids is not None and not wrapper() and not pids and pids.unknown:
+            cancel["cancel_unconfirmed_reason"] = "a process of ours has an unreadable environment"
+            store.write_json_atomic(cpath, cancel)
         return "UNCONFIRMED"
     cancel["confirmed_at"] = store.utc_now()
     store.write_json_atomic(cpath, cancel)
