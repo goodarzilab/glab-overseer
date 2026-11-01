@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, paths, plan as P, store
+from . import approval, models, paths, plan as P, store, survey
 
 COMMANDS = {}  # name -> dict(help, configure, run), in registration order
 
@@ -127,10 +127,10 @@ def _run_unlock(args):
 
 register("plan", "validate, approve, show or split a plan", _configure_plan, _run_plan)
 register("unlock", "force-remove a stale project lock (records an event)", _configure_unlock, _run_unlock)
+register("survey", "probe the host and repository", survey.configure_survey, survey.run_survey)
+register("probe-transport", "probe stdin and --json-schema support of each CLI", None, survey.run_probe_transport)
+register("models", "resolve model roles for a host", models.configure, models.run)
 for _name, _help in [
-    ("survey", "probe the host and repository (U2)"),
-    ("probe-transport", "probe how workers are launched (U2)"),
-    ("models", "resolve model roles for a host (U2)"),
     ("issues", "file issues from an approved plan (U7)"),
     ("slurm-handshake", "verify Slurm and shared storage (U4)"),
     ("dispatch", "launch a unit attempt (U3)"),

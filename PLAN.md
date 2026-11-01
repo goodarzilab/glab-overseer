@@ -181,6 +181,9 @@ evidence the attempt is UNCERTAIN.
 | P9 | `sacct` timed out to the accounting database while `scontrol show job` answered. |
 | P10 | `agy models` lists Claude models alongside Gemini models and listed no carbon tier. |
 | P11 | Both `claude --help` and `agy --help` list a `--json-schema` option for print mode; its behavior is not yet measured. |
+| P12 | `claude --json-schema` takes inline JSON text and returns a schema-valid `structured_output`; `agy --json-schema` accepts inline JSON or a file path and does the same. Models sometimes nest JSON text inside a string field, so the value still needs local validation. |
+| P13 | `agy -p` takes the next argument as its prompt value; a flag placed there is consumed as the prompt and agy exits 2. `claude -p` is a boolean flag and reads the prompt positionally or from stdin. |
+| P14 | `overseer.py probe-transport` (U2) measured: claude stdin and schema both work; agy schema works and agy has no plain-text stdin transport. |
 
 ### Committee decisions
 
