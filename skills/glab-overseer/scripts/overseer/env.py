@@ -23,6 +23,13 @@ LLM_DENY = [
 WORKER_DENY = LLM_DENY + ["*_TOKEN", "GH_*", "GITHUB_*", "AWS_*"]
 
 
+def slurm_disabled(base=None):
+    """OVERSEER_DISABLE_SLURM disables Slurm only when it is `1`, `true` or `yes` (case-insensitive);
+    unset, empty or any other value means not disabled."""
+    v = (os.environ if base is None else base).get("OVERSEER_DISABLE_SLURM")
+    return isinstance(v, str) and v.strip().lower() in ("1", "true", "yes")
+
+
 def _match(name, patterns):
     up = name.upper()
     return any(fnmatch.fnmatchcase(up, p.upper()) for p in patterns)

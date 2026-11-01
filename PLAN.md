@@ -184,6 +184,7 @@ evidence the attempt is UNCERTAIN.
 | P12 | `claude --json-schema` takes inline JSON text and returns a schema-valid `structured_output`; `agy --json-schema` accepts inline JSON or a file path and does the same. Models sometimes nest JSON text inside a string field, so the value still needs local validation. |
 | P13 | `agy -p` takes the next argument as its prompt value; a flag placed there is consumed as the prompt and agy exits 2. `claude -p` is a boolean flag and reads the prompt positionally or from stdin. |
 | P14 | `overseer.py probe-transport` (U2) measured: claude stdin and schema both work; agy schema works and agy has no plain-text stdin transport. |
+| P15 | `sbatch` exited 1 with `Batch job submission failed: Socket timed out on send/recv operation`, yet the job had been submitted and ran to completion. A non-zero sbatch exit is therefore not proof of rejection. |
 
 ### Committee decisions
 

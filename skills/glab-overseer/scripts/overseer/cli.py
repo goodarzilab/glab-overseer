@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, execution, models, paths, plan as P, store, survey
+from . import approval, execution, models, paths, plan as P, slurm, store, survey
 
 COMMANDS = {}  # name -> dict(help, configure, run), in registration order
 
@@ -130,7 +130,8 @@ register("unlock", "force-remove a stale project lock (records an event)", _conf
 register("survey", "probe the host and repository", survey.configure_survey, survey.run_survey)
 register("probe-transport", "probe stdin and --json-schema support of each CLI", None, survey.run_probe_transport)
 register("models", "resolve model roles for a host", models.configure, models.run)
-register("dispatch", "launch a job unit attempt on the local backend",
+register("slurm-handshake", "verify that batch jobs see this project root", slurm.configure_handshake, slurm.run_handshake)
+register("dispatch", "launch a job unit attempt on the chosen backend",
          execution.configure_dispatch, execution.run_dispatch)
 register("status", "show unit facets, active invocations and slots",
          execution.configure_status, execution.run_status)
@@ -139,7 +140,6 @@ register("wait", "wait until an active invocation changes state (exit 3 on timeo
 register("abort", "abort a unit's active invocations", execution.configure_abort, execution.run_abort)
 for _name, _help in [
     ("issues", "file issues from an approved plan (U7)"),
-    ("slurm-handshake", "verify Slurm and shared storage (U4)"),
     ("resolve", "record an orchestrator resolution (U5)"),
     ("judge", "judge an attempt against its evidence (U5)"),
     ("review", "run a cross-family review (U6)"),

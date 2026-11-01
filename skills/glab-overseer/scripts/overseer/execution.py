@@ -28,6 +28,10 @@ SHELL = "/bin/sh"  # run.sh interpreter; the process search matches exactly `SHE
 PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12)
 KINDS = ("author", "fixer", "job")
 ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN", "CANCELLING")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+RESERVED_PREFIX = "_OVR_"
+RESERVED_NAMES = frozenset("PPID UID EUID GROUPS SHELLOPTS BASHOPTS BASHPID FUNCNAME LINENO RANDOM SECONDS PWD OLDPWD "
+                           "IFS PATH HOME SHELL OPTIND OPTARG PS1 PS2 PS4 ENV".split())
 TOKEN_VAR = "OVERSEER_INV_TOKEN"  # exported by run.sh; every payload process inherits it
 BLOCKING_CLASSES = ("QUOTA", "AUTH")
 SIGNALS = ("TERM", "INT", "HUP")
@@ -42,6 +46,10 @@ class ExecutionError(ValueError):
 
 class SlotsFull(ExecutionError):
     pass
+
+
+class LaunchRejected(ExecutionError):
+    """The backend refused the launch outright: nothing started (recorded as launch_error.json)."""
 
 
 def _load(path):
@@ -160,6 +168,9 @@ def _valid_launch(launch, intent):
     if intent["backend"] == "local":
         return bool(_int(launch.get("pid")) and _int(launch.get("pgid"))
                     and isinstance(launch.get("start"), str) and launch["start"])
+    if intent["backend"] == "slurm":
+        jid = launch.get("job_id")
+        return isinstance(jid, str) and jid.isdigit()
     return True
 
 
@@ -177,6 +188,9 @@ def _cancel_pending(cancel, intent):
 
 def _reconcile_launch(inv, intent, write):
     """Find a live run.sh for an intent without launch.json; never launches anything."""
+    if intent["backend"] != "local":
+        hook = RECONCILE.get(intent["backend"])
+        return hook(inv, intent, write) if hook else None
     cands = find_by_script(intent["run_sh"])
     st = _load(os.path.join(inv, "start.json"))
     if isinstance(st, dict) and st.get("token") == intent["token"] and st.get("pid") in cands:
@@ -199,7 +213,7 @@ def _reconcile_launch(inv, intent, write):
     return None
 
 
-def _probe_local(inv, intent, launch):
+def _probe_local(inv, intent, launch, write=False):
     if not identified_alive(launch["pid"], launch["start"]):
         return "GONE"
     st = _load(os.path.join(inv, "start.json"))
@@ -208,7 +222,10 @@ def _probe_local(inv, intent, launch):
     return "RUNNING"
 
 
-PROBES = {"local": _probe_local}  # backend -> fn(inv, intent, launch) -> RUNNING|QUEUED|GONE
+# backend -> fn(inv, intent, launch, write) -> RUNNING|QUEUED|GONE, or a complete status dict
+PROBES = {"local": _probe_local}
+RECONCILE = {}  # backend -> fn(inv, intent, write) -> launch dict or None (find a launch by token)
+CANCEL_CHECK = {}  # backend -> fn(inv, intent, cancel) -> True once a pending cancel is confirmed
 
 
 def invocation_status(inv, write=False):
@@ -225,12 +242,21 @@ def invocation_status(inv, write=False):
         return {"state": "UNCERTAIN", "reason": "intent.json is invalid"}
     cancel = _load(os.path.join(inv, "cancel.json"))
     if isinstance(cancel, dict) and cancel.get("token") == intent["token"] and "unidentified" in cancel:
-        # an unidentifiable payload may still run: exit.json cannot clear it, only an orchestrator resolve
-        return {"state": "UNCERTAIN", "reason": "cancel unidentified: %s" % cancel["unidentified"]}
+        # an unidentifiable payload may still run: exit.json cannot clear it, only an orchestrator resolve.
+        # A batch job whose id turns up later (squeue token, own start.json) is identified again and the
+        # cancel request stays outstanding, so a later abort verifies and cancels it.
+        if not (write and intent["backend"] != "local" and _load(os.path.join(inv, "launch.json")) is None
+                and _reconcile_launch(inv, intent, True)):
+            return {"state": "UNCERTAIN", "reason": "cancel unidentified: %s" % cancel["unidentified"]}
+        cancel = {"token": intent["token"], "requested_at": cancel.get("requested_at") or store.utc_now()}
+        store.write_json_atomic(os.path.join(inv, "cancel.json"), cancel)
     if _cancel_pending(cancel, intent):  # an abort is outstanding: hold the slot until it confirms
-        return {"state": "CANCELLING"}
+        check = CANCEL_CHECK.get(intent["backend"])
+        if not (write and check and check(inv, intent, cancel)):
+            return {"state": "CANCELLING"}
+        cancel = _load(os.path.join(inv, "cancel.json"))
     ex = _load(os.path.join(inv, "exit.json"))
-    if ex is not None and _exit_matches(ex, intent):
+    if intent["backend"] == "local" and ex is not None and _exit_matches(ex, intent):
         return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal")}
     stale = " (exit.json does not match this invocation)" if ex is not None else ""
     fail = _load(os.path.join(inv, "launch_error.json"))
@@ -246,7 +272,9 @@ def invocation_status(inv, write=False):
     elif not _valid_launch(launch, intent):
         return {"state": "UNCERTAIN", "reason": "launch.json is invalid or belongs to another invocation"}
     probe = PROBES.get(intent["backend"])
-    s = probe(inv, intent, launch) if probe else "GONE"
+    s = probe(inv, intent, launch, write) if probe else "GONE"
+    if isinstance(s, dict):
+        return s
     if s in ("RUNNING", "QUEUED"):
         return {"state": s, "pid": launch.get("pid")}
     if isinstance(cancel, dict) and cancel.get("token") == intent["token"] \
@@ -387,31 +415,43 @@ def w(path, rec):
 a = sys.argv
 now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 if a[1] == "start":
-    w(a[2] + "/start.json", {"token": a[3], "pid": int(a[4]), "host": socket.gethostname(), "time": now})
+    w(a[2] + "/start.json", {"token": a[3], "pid": int(a[4]), "host": socket.gethostname(), "time": now,
+                             "job_id": os.environ.get("SLURM_JOB_ID")})
 else:
-    w(a[2] + "/exit.json", {"token": a[3], "argv_sha256": a[4], "rc": int(a[5]), "signal": a[6] or None,
-                            "end_time": now})
+    rec = {"token": a[3], "argv_sha256": a[4], "rc": int(a[5]), "signal": a[6] or None, "end_time": now}
+    if len(a) > 7 and a[7]:
+        rec["error"] = a[7]
+    w(a[2] + "/exit.json", rec)
 '''
 
 
 def _run_sh(inv, intent, stdin_path):
     q = shlex.quote
+    batch = intent["backend"] != "local"
+    check = ""
+    if batch:  # in a batch job the script must see this very invocation's token file before anything runs
+        check = ('_OVR_t=; [ -r %s ] && IFS= read -r _OVR_t <%s\n[ "$_OVR_t" = "$_OVR_TOKEN" ] || '
+                 '{ _OVR_rc=97; _OVR_note=identity_mismatch; exit 97; }\n'
+                 % (q(os.path.join(inv, "token")), q(os.path.join(inv, "token"))))
+    exports = ""
+    for k, v in sorted((intent.get("env_extras") or {}).items()):
+        exports += "%s=%s; export %s\n" % (k, q(v), k)
     return """#!%s
-PY=%s; REC=%s; INV=%s; TOKEN=%s; SHA=%s
-sig=; rc=1
-fin() { trap - EXIT; "$PY" -I "$REC" exit "$INV" "$TOKEN" "$SHA" "$rc" "$sig"; }
-trap fin EXIT
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=143; sig=TERM; exit "$rc"' TERM
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=130; sig=INT; exit "$rc"' INT
-trap 'rc=$?; [ "$rc" -eq 0 ] && rc=129; sig=HUP; exit "$rc"' HUP
-cd %s || { rc=126; exit 126; }
-"$PY" -I "$REC" start "$INV" "$TOKEN" "$$"
-%s=$TOKEN; export %s
-%s <%s >"$INV/stdout.log" 2>"$INV/stderr.log"
-rc=$?
-exit "$rc"
+_OVR_PY=%s; _OVR_REC=%s; _OVR_INV=%s; _OVR_TOKEN=%s; _OVR_SHA=%s
+_OVR_sig=; _OVR_rc=1; _OVR_note=
+_ovr_fin() { trap - EXIT; "$_OVR_PY" -I "$_OVR_REC" exit "$_OVR_INV" "$_OVR_TOKEN" "$_OVR_SHA" "$_OVR_rc" "$_OVR_sig" "$_OVR_note"; }
+trap _ovr_fin EXIT
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=143; _OVR_sig=TERM; exit "$_OVR_rc"' TERM
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=130; _OVR_sig=INT; exit "$_OVR_rc"' INT
+trap '_OVR_rc=$?; [ "$_OVR_rc" -eq 0 ] && _OVR_rc=129; _OVR_sig=HUP; exit "$_OVR_rc"' HUP
+%scd %s || { _OVR_rc=126; exit 126; }
+"$_OVR_PY" -I "$_OVR_REC" start "$_OVR_INV" "$_OVR_TOKEN" "$$"
+%s%s=$_OVR_TOKEN; export %s
+%s <%s >"$_OVR_INV/stdout.log" 2>"$_OVR_INV/stderr.log"
+_OVR_rc=$?
+exit "$_OVR_rc"
 """ % (SHELL, q(sys.executable), q(os.path.join(inv, "rec.py")), q(inv), q(intent["token"]), q(intent["argv_sha256"]),
-       q(intent["cwd"]), TOKEN_VAR, TOKEN_VAR, " ".join(q(a) for a in intent["argv"]), q(stdin_path))
+       check, q(intent["cwd"]), exports, TOKEN_VAR, TOKEN_VAR, " ".join(q(a) for a in intent["argv"]), q(stdin_path))
 
 
 def _write_scripts(inv, intent, stdin_text):
@@ -420,6 +460,9 @@ def _write_scripts(inv, intent, stdin_text):
         stdin_path = os.path.join(inv, "stdin.txt")
         with open(stdin_path, "w", encoding="utf-8") as f:
             f.write(stdin_text)
+    if intent["backend"] != "local":
+        with open(os.path.join(inv, "token"), "w") as f:
+            f.write(intent["token"] + "\n")
     with open(os.path.join(inv, "rec.py"), "w") as f:
         f.write(_REC)
     with open(intent["run_sh"], "w") as f:
@@ -436,7 +479,7 @@ def _spawn_local(inv, run_sh, envd, cwd):
 
 
 def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend="local",
-                      stdin_text=None, env=None, extras=None, spawn=None):
+                      stdin_text=None, env=None, extras=None, spawn=None, extra_intent=None):
     """Launch one author, fixer or job invocation; returns its record (intent plus launch plus `dir`).
 
     The caller holds the project lock and has allocated the attempt. `argv[0]` is
@@ -454,6 +497,15 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
         raise ExecutionError("backend must be a non-empty string")
     if stdin_text is not None and not isinstance(stdin_text, str):
         raise ExecutionError("stdin_text must be a string")
+    for k, v in (extras or {}).items():
+        if not (isinstance(k, str) and ENV_NAME_RE.match(k) and not k.startswith(RESERVED_PREFIX)
+                and k != TOKEN_VAR and k not in RESERVED_NAMES and not k.startswith("BASH") and isinstance(v, str) and "\0" not in v):
+            raise ExecutionError("invalid environment variable %r: names must be shell identifiers, must not "
+                                 "start with %s or equal %s, and values must be strings" % (k, RESERVED_PREFIX, TOKEN_VAR))
+    if backend == "local" and kind != "job":
+        problem = slurm.local_agent_problem(root)  # the supervisor's own environment, not the payload's
+        if problem:
+            raise ExecutionError(problem)
     approval.require_approval(root, plan_id)
     cap = approval.effective_plan(root, plan_id)["caps"]["workers"]
     adir = paths.attempt_dir(root, plan_id, unit_id, attempt)
@@ -474,6 +526,7 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
     intent = {"token": uuid.uuid4().hex, "kind": kind, "argv": argv, "argv_sha256": argv_digest(argv),
               "backend": backend, "cwd": cwd, "time": store.utc_now(), "run_sh": os.path.join(inv, "run.sh"),
               "plan_id": plan_id, "unit_id": unit_id, "attempt": attempt}
+    intent.update(extra_intent or {})
     _write_scripts(inv, intent, stdin_text)
     store.write_json_atomic(os.path.join(inv, "intent.json"), intent)  # the intent precedes the effect
     store.append_event(root, "invocation_intent", plan_id=plan_id, unit_id=unit_id, attempt=attempt,
@@ -483,6 +536,9 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
     except OSError as e:
         store.write_json_atomic(os.path.join(inv, "launch_error.json"), {"token": intent["token"], "error": str(e)})
         raise ExecutionError("launch failed: %s" % e)
+    except LaunchRejected as e:
+        store.write_json_atomic(os.path.join(inv, "launch_error.json"), {"token": intent["token"], "error": str(e)})
+        raise
     launch = {"token": intent["token"], "backend": backend, "time": store.utc_now()}
     launch.update(fields)
     if backend == "local":
@@ -508,6 +564,9 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     """Run a job unit's command through the local backend with OVERSEER_OUT set."""
     plan = approval.effective_plan(root, plan_id)
     uid = unit["id"]
+    backend = slurm.choose_backend(root)
+    if backend == "slurm":
+        slurm.preflight(root, plan, unit)  # refuses before any attempt is allocated or sbatch runs
     check_slots(root, plan_id, plan["caps"]["workers"])
     last = _admit(root, plan_id, uid, after_quota)[2]
     reuse = False  # an allocated attempt that never launched anything is reused, not burned
@@ -524,8 +583,10 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     sh = E.resolve_exe("sh", E.worker_env().get("PATH", ""))
     if sh is None:
         raise ExecutionError("sh not found on an absolute PATH entry")
-    return launch_invocation(root, plan_id, uid, n, "job", [sh, "-c", unit["command"]], root,
-                             extras={"OVERSEER_OUT": out})
+    argv = [sh, "-c", unit["command"]]
+    if backend == "slurm":
+        return slurm.launch(root, plan_id, uid, n, "job", argv, root, extras={"OVERSEER_OUT": out})
+    return launch_invocation(root, plan_id, uid, n, "job", argv, root, extras={"OVERSEER_OUT": out})
 
 
 # ---- abort -----------------------------------------------------------------
@@ -594,6 +655,8 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
     if st["state"] not in ACTIVE:
         return st["state"]
     intent = _load(os.path.join(inv, "intent.json"))
+    if intent["backend"] == "slurm":
+        return slurm.abort(root, inv, intent, confirm_wait=grace, sleep=sleep)
     if intent["backend"] != "local":
         raise ExecutionError("abort is not supported for backend %r here" % intent["backend"])
     launch = _load(os.path.join(inv, "launch.json"))
@@ -738,7 +801,7 @@ def run_dispatch(args):
             raise ExecutionError("unit %s is a code unit; code workers are launched by the worker flow" % unit["id"])
         rec = dispatch_job(root, pid, unit, args.after_quota)
     print(json.dumps({"plan": pid, "unit": unit["id"], "attempt": rec["attempt"], "invocation": rec["seq"],
-                      "pid": rec["launch"].get("pid")}, sort_keys=True))
+                      "pid": rec["launch"].get("pid"), "job_id": rec["launch"].get("job_id")}, sort_keys=True))
     return 0
 
 
@@ -793,7 +856,8 @@ def collect_status(root, write=False):
             units[u["id"]] = dict(
                 dict((f, st[f]) for f in approval.FACETS), kind=u["kind"], attempts=st["counters"]["attempts"],
                 active=[{"attempt": i["attempt"], "invocation": i["seq"], "kind": i["kind"],
-                         "state": i["status"]["state"], "pid": i["status"].get("pid")}
+                         "state": i["status"]["state"], "pid": i["status"].get("pid"),
+                         "job_id": i["status"].get("job_id")}
                         for i in act if i["unit_id"] == u["id"]])
         plans[pid] = {"workers_cap": plan["caps"]["workers"], "slots_in_use": slots_in_use(root, write, pid),
                       "units": units}
@@ -818,5 +882,8 @@ def run_status(args):
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
                 u["closure"].get("state"), u["attempts"]))
             for a in u["active"]:
-                print("    a%d/%s %s pid=%s" % (a["attempt"], a["invocation"], a["state"], a["pid"]))
+                print("    a%d/%s %s %s" % (a["attempt"], a["invocation"], a["state"],
+                                   "job=%s" % a["job_id"] if a.get("job_id") else "pid=%s" % a.get("pid")))
     return 0
+
+from . import slurm  # noqa: E402  registers the slurm hooks; slurm imports this module
