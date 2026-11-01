@@ -177,14 +177,13 @@ class SplitTests(TmpCase):
         changed["units"][1]["prompt"] = "different"
         res = A.approve_plan(self.root, changed, "tester")
         self.assertEqual(res["status"], "updated")
-        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"],
-                         {"state": "blocked", "note": "x"})
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"], {"state": "open"})
         units = os.path.join(paths.plan_dir(self.root, "demo"), "units")
         self.assertEqual(sorted(os.listdir(units)), ["alpha", "beta", "crunch"])
         arch = os.path.join(paths.plan_dir(self.root, "demo"), "archive")
         stamps = os.listdir(arch)
         self.assertEqual(len(stamps), 1)
-        self.assertEqual(sorted(os.listdir(os.path.join(arch, stamps[0]))), ["alpha-a", "alpha-b", "beta"])
+        self.assertEqual(sorted(os.listdir(os.path.join(arch, stamps[0]))), ["alpha", "alpha-a", "alpha-b", "beta"])
         self.assertFalse(os.path.exists(os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")))
         self.assertEqual([u["id"] for u in A.effective_plan(self.root, "demo")["units"]],
                          ["alpha", "beta", "crunch"])
@@ -208,6 +207,71 @@ class SplitTests(TmpCase):
         arch = os.path.join(paths.plan_dir(self.root, "demo"), "archive")
         got = os.path.join(arch, os.listdir(arch)[0], "beta", "unit.json")
         self.assertEqual(store.read_json(got)["closure"]["state"], "merged")
+
+    def test_child_slurm_must_equal_parent(self):
+        kid = {"id": "crunch-a", "outputs": ["result.txt"], "slurm": {"time": "10-00", "mem": "1T"}}
+        with self.assertRaisesRegex(A.OwnerStop, "changes the slurm block of crunch"):
+            self.split([kid], unit="crunch")
+        p = plan_copy()
+        p["units"][2]["slurm"] = {"time": "02:00:00", "mem": "8G"}
+        A.approve_plan(self.root, p, "tester")
+        self.split([{"id": "crunch-a", "outputs": ["result.txt"]}], unit="crunch")
+        self.assertEqual(A.effective_plan(self.root, "demo")["units"][2]["slurm"], p["units"][2]["slurm"])
+
+    def mark(self, uid, state="merged"):
+        st = A.load_unit_state(self.root, "demo", uid)
+        st["closure"] = {"state": state}
+        A.save_unit_state(self.root, "demo", uid, st)
+
+    def test_boundary_change_archives_every_unit(self):
+        self.mark("alpha")
+        self.mark("beta")
+        p = plan_copy()
+        p["target_branch"] = "release"
+        A.approve_plan(self.root, p, "tester")
+        for uid in ("alpha", "beta"):
+            self.assertEqual(A.load_unit_state(self.root, "demo", uid)["closure"]["state"], "open")
+
+    def test_new_unit_reusing_former_child_id_starts_fresh(self):
+        self.split(self.good_children())
+        self.mark("alpha-a")
+        p = plan_copy()
+        p["units"].append({"id": "alpha-a", "kind": "job", "title": "Reuse", "command": "true",
+                           "outputs": ["z.txt"]})
+        A.approve_plan(self.root, p, "tester")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha-a")["closure"]["state"], "open")
+
+    def test_interrupted_reapproval_converges(self):
+        from unittest import mock
+        self.mark("alpha")
+        p = plan_copy()
+        p["units"][0]["prompt"] = "changed"
+        real = store.write_json_atomic
+        def boom(path, data):
+            if path.endswith("issues.json"):
+                raise OSError("disk full")
+            return real(path, data)
+        with mock.patch.object(store, "write_json_atomic", side_effect=boom):
+            with self.assertRaises(OSError):
+                A.approve_plan(self.root, p, "tester")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"]["state"], "open")
+        self.assertEqual(A.approve_plan(self.root, p, "tester")["status"], "updated")
+        A.require_approval(self.root, "demo")
+        self.assertEqual(len(store.read_json(os.path.join(paths.plan_dir(self.root, "demo"),
+                                                          "approval_history.json"))), 1)
+
+    def test_interrupted_split_is_healed_and_stale_marker_tolerated(self):
+        from unittest import mock
+        with mock.patch.object(A, "_apply_split_state", side_effect=OSError("crash")):
+            with self.assertRaises(OSError):
+                self.split(self.good_children())
+        self.assertEqual(len(A.load_revisions(self.root, "demo")), 1)
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"]["state"], "open")
+        self.split([{"id": "beta-a", "outputs": ["src/beta.py"]}], unit="beta")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"]["state"], "split")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha-a")["lineage"]["parent"], "alpha")
+        self.mark("crunch", "split")  # marked split, no revision names it
+        self.split([{"id": "crunch-a", "outputs": ["result.txt"]}], unit="crunch")
 
     def revisions_path(self):
         return os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")

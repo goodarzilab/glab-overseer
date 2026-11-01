@@ -95,6 +95,19 @@ def read_events(root):
         return []
 
 
+def publish_record(path, record):
+    """Atomically create `path` containing `record` (temp file + link); FileExistsError if present."""
+    tmp = "%s.%s.tmp" % (path, record["token"])
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)
+
+
 class LockHeld(RuntimeError):
     def __init__(self, holder):
         self.holder = holder or {}
@@ -132,17 +145,10 @@ class ProjectLock(object):
             "command": self.command, "host": socket.gethostname(),
             "pid": os.getpid(), "time": utc_now(), "token": self.token,
         }
-        tmp = os.path.join(paths.state_dir(self.root), ".lock.%s.tmp" % self.token)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-            f.flush()
-            os.fsync(f.fileno())
         try:
-            os.link(tmp, paths.lock_path(self.root))
+            publish_record(paths.lock_path(self.root), record)
         except FileExistsError:
             raise LockHeld(read_lock(self.root))
-        finally:
-            os.unlink(tmp)
         self.held = True
         return self
 
@@ -189,21 +195,53 @@ class UnlockBusy(RuntimeError):
     pass
 
 
+def _read_record(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        return {}
+
+
+def _take_unlock_guard(root, guard):
+    rec = {"command": "unlock", "host": socket.gethostname(), "pid": os.getpid(),
+           "time": utc_now(), "token": uuid.uuid4().hex}
+    for attempt in (1, 2):
+        try:
+            publish_record(guard, rec)
+            return
+        except FileExistsError:
+            g = _read_record(guard)
+            if attempt == 1 and g and g.get("host") == rec["host"] and not holder_alive(g):
+                cur = _read_record(guard)
+                if cur and cur.get("token") == g.get("token"):
+                    try:
+                        os.unlink(guard)
+                    except FileNotFoundError:
+                        pass
+                    append_event(root, "unlock_guard_removed", stale_guard=g)
+                continue
+            raise UnlockBusy("another unlock is in progress (pid %s)" % (g or {}).get("pid", "unknown"))
+
+
 def force_unlock(root, reason, even_if_alive=False):
     """Remove the lock and record an event. Returns the removed holder or None.
 
-    Forced unlocks are serialized by `lock.unlock` (created atomically, removed
-    in a finally); the holder is read and judged only inside that section, so a
-    second unlocker sees any new live holder and refuses.
+    Forced unlocks are serialized by `lock.unlock`, published like the project
+    lock with a holder record. The holder is read and judged only inside that
+    section, so a second unlocker sees any new live holder and refuses. A guard
+    left by a dead process on this host is removed (with an event) and taken
+    once; a live or other-host guard refuses. Accepted limit: a guard left by a
+    crashed process on another host needs a manual remove, and two unlockers
+    removing the same stale guard at once can still race.
     """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("unlock requires a non-blank --reason")
     paths.ensure_state_dir(root)
     guard = paths.lock_path(root) + ".unlock"
-    try:
-        os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-    except FileExistsError:
-        raise UnlockBusy("another unlock is in progress (%s)" % os.path.basename(guard))
+    _take_unlock_guard(root, guard)
     try:
         holder = read_lock(root)
         if holder is None:

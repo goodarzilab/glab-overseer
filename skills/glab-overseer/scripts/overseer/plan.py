@@ -89,10 +89,16 @@ def parse_walltime(value):
     return total if total > 0 else None
 
 
+def clean_slurm(block):
+    """Drop null and blank-string values: they count as absent."""
+    return dict((k, v) for k, v in (block or {}).items()
+                if not (v is None or (isinstance(v, str) and not v.strip())))
+
+
 def merge_slurm(plan_slurm, unit_slurm):
     """Unit values override plan defaults; setting one memory key drops the other default."""
-    merged = dict(plan_slurm or {})
-    u = dict(unit_slurm or {})
+    merged = clean_slurm(plan_slurm)
+    u = clean_slurm(unit_slurm)
     if "mem" in u:
         merged.pop("mem_per_cpu", None)
     if "mem_per_cpu" in u:
@@ -163,8 +169,15 @@ def _check_outputs(label, outs, errors):
 
 
 def _slurm_errors(label, block, errors):
+    block = clean_slurm(block)
     if "mem" in block and "mem_per_cpu" in block:
         errors.append("%s: slurm block has both mem and mem_per_cpu" % label)
+    for k in ("mem", "mem_per_cpu"):
+        if k in block and not isinstance(block[k], str):
+            errors.append("%s: slurm %s must be a non-empty string" % (label, k))
+    c = block.get("cpus")
+    if "cpus" in block and (isinstance(c, bool) or not isinstance(c, int) or c < 1):
+        errors.append("%s: slurm cpus must be a positive integer" % label)
 
 
 def validate_plan(plan):

@@ -169,6 +169,8 @@ class StoreTests(TmpCase):
         self.make_dead_holder_lock()
         real, nested = store.holder_alive, []
         def probe(holder):
+            if holder.get("command") == "unlock":
+                return real(holder)
             with self.assertRaises(store.UnlockBusy):
                 store.force_unlock(self.root, "second")
             nested.append(1)
@@ -182,6 +184,26 @@ class StoreTests(TmpCase):
             store.force_unlock(self.root, "late")
         self.assertFalse(os.path.exists(paths.lock_path(self.root) + ".unlock"))
         self.assertEqual(store.read_lock(self.root)["command"], "new")
+
+    def write_guard(self, **kw):
+        rec = {"command": "unlock", "host": store.socket.gethostname(), "pid": self.dead_pid(),
+               "time": store.utc_now(), "token": "t"}
+        rec.update(kw)
+        with open(paths.lock_path(self.root) + ".unlock", "w") as f:
+            json.dump(rec, f)
+
+    def test_stale_local_guard_removed_live_or_remote_refused(self):
+        paths.ensure_state_dir(self.root)
+        self.write_guard()
+        self.assertIsNone(store.force_unlock(self.root, "x"))
+        self.assertEqual([e["kind"] for e in store.read_events(self.root)], ["unlock_guard_removed"])
+        self.assertFalse(os.path.exists(paths.lock_path(self.root) + ".unlock"))
+        for kw in ({"pid": os.getpid()}, {"host": "some-other-host"}):
+            self.write_guard(**kw)
+            with self.assertRaises(store.UnlockBusy):
+                store.force_unlock(self.root, "x")
+            self.assertTrue(os.path.exists(paths.lock_path(self.root) + ".unlock"))
+            os.unlink(paths.lock_path(self.root) + ".unlock")
 
     def test_release_only_removes_own_lock(self):
         a = store.ProjectLock(self.root, "a").acquire()

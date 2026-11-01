@@ -114,27 +114,27 @@ def approve_plan(root, plan, approver):
 
     paths.ensure_state_dir(root)
     filed = {}
-    old_revs = []
     if prev and prev.get("digest") != digest:
         result["status"] = "updated"
         old_revs = store.read_json(_p(root, pid, "revisions.json"), [])
         hist = store.read_json(_p(root, pid, "approval_history.json"), [])
-        hist.append({"approval": prev, "superseded_at": store.utc_now(), "superseded_by": digest,
-                     "filed": (old_issues or {}).get("filed", {}), "revisions": old_revs})
-        store.write_json_atomic(_p(root, pid, "approval_history.json"), hist)
+        if not hist or hist[-1]["approval"].get("digest") != prev.get("digest"):
+            hist.append({"approval": prev, "superseded_at": store.utc_now(), "superseded_by": digest,
+                         "filed": (old_issues or {}).get("filed", {}), "revisions": old_revs})
+            store.write_json_atomic(_p(root, pid, "approval_history.json"), hist)
         ids = set(u["id"] for u in norm["units"])
         filed = dict((k, v) for k, v in (old_issues or {}).get("filed", {}).items() if k in ids)
+        # Reset unit state first, so a crash later converges on retry.
+        _archive_stale_units(root, pid, norm, prev, old_plan, old_revs)
+        try:
+            os.unlink(_p(root, pid, "revisions.json"))
+        except FileNotFoundError:
+            pass
     elif old_issues:
         filed = old_issues.get("filed", {})
 
     store.write_json_atomic(_p(root, pid, "plan.json"), norm)
     store.write_json_atomic(_p(root, pid, "issues.json"), {"drafts": drafts, "filed": filed})
-    if result["status"] == "updated":
-        _reset_after_reapproval(root, pid, norm["units"], old_plan, old_revs)
-        try:
-            os.unlink(_p(root, pid, "revisions.json"))
-        except FileNotFoundError:
-            pass
     for u in norm["units"]:
         st = load_unit_state(root, pid, u["id"])
         st["authorization"] = {"state": "approved", "plan_digest": digest}
@@ -147,30 +147,37 @@ def approve_plan(root, plan, approver):
     return result
 
 
-def _reset_after_reapproval(root, plan_id, new_units, old_plan, old_revs):
-    """Archive state of units that are gone or whose content changed; undo split closures."""
-    new_ids = set(u["id"] for u in new_units)
-    old = dict((u["id"], u) for u in (old_plan or {}).get("units", []))
-    changed = set(u["id"] for u in new_units if u["id"] in old and old[u["id"]] != u)
+def _archive_stale_units(root, plan_id, norm, prev, old_plan, old_revs):
+    """Archive (so they restart fresh) the state of every unit that cannot carry over.
+
+    Everything is archived when repo or target_branch changed. Otherwise a unit is
+    archived when it is gone, differs from (or is absent in) the previous effective
+    plan (original plus revisions), or is still marked split. Idempotent.
+    """
     udir = os.path.join(paths.plan_dir(root, plan_id), "units")
     present = sorted(os.listdir(udir)) if os.path.isdir(udir) else []
-    stale = [n for n in present if n not in new_ids or n in changed]
-    if stale:
-        stamp = store.utc_now().replace(":", "").replace("-", "")
-        dest = os.path.join(paths.plan_dir(root, plan_id), "archive", stamp)
-        n = 1
-        while os.path.exists(dest):
-            n += 1
-            dest = os.path.join(paths.plan_dir(root, plan_id), "archive", "%s-%d" % (stamp, n))
-        os.makedirs(dest)
-        for name in stale:
-            os.rename(os.path.join(udir, name), os.path.join(dest, name))
-    for rev in old_revs:
-        if rev["parent"] in new_ids and rev["parent"] not in stale and rev["parent"] in present:
-            st = load_unit_state(root, plan_id, rev["parent"])
-            if st["closure"].get("state") == "split":
-                st["closure"] = rev.get("pre_split_closure") or {"state": "open"}
-                save_unit_state(root, plan_id, rev["parent"], st)
+    b = (prev or {}).get("boundary") or {}
+    if (b.get("repo"), b.get("target_branch")) != (norm["repo"], norm["target_branch"]):
+        stale = present
+    else:
+        new = dict((u["id"], u) for u in norm["units"])
+        old = old_plan or {"units": []}
+        for r in old_revs:
+            old = apply_revision(old, r)
+        old = dict((u["id"], u) for u in old["units"])
+        stale = [n for n in present if n not in new or old.get(n) != new[n]
+                 or load_unit_state(root, plan_id, n)["closure"].get("state") == "split"]
+    if not stale:
+        return
+    stamp = store.utc_now().replace(":", "").replace("-", "")
+    dest = os.path.join(paths.plan_dir(root, plan_id), "archive", stamp)
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(paths.plan_dir(root, plan_id), "archive", "%s-%d" % (stamp, n))
+    os.makedirs(dest)
+    for name in stale:
+        os.rename(os.path.join(udir, name), os.path.join(dest, name))
 
 
 def require_approval(root, plan_id):
@@ -304,6 +311,8 @@ def check_split(parent, kids):
             raise OwnerStop("child %s changes the unit kind of %s" % (kid, parent["id"]))
         if k.get("test_command") != parent.get("test_command"):
             raise OwnerStop("child %s changes test_command of %s" % (kid, parent["id"]))
+        if k.get("slurm") != parent.get("slurm"):
+            raise OwnerStop("child %s changes the slurm block of %s" % (kid, parent["id"]))
         if k.get("command") != parent.get("command"):
             raise OwnerStop("child %s changes command of %s" % (kid, parent["id"]))
         dropped = sorted(set(parent["needs"]) - set(k["needs"]))
@@ -331,16 +340,36 @@ def check_split(parent, kids):
         raise OwnerStop("split of %s drops parent claim(s) %r" % (parent["id"], lost))
 
 
+def _apply_split_state(root, plan_id, rev, digest):
+    """Create missing child states, then mark the parent split last. Idempotent."""
+    pstate = load_unit_state(root, plan_id, rev["parent"])
+    for k in rev["children"]:
+        if not os.path.exists(unit_state_path(root, plan_id, k["id"])):
+            st = default_unit_state(plan_id, k["id"], digest)
+            st["lineage"] = {"parent": rev["parent"], "reason": rev["reason"], "time": rev["time"]}
+            st["counters"] = dict(pstate["counters"])
+            st["authorization"]["via"] = "split"
+            save_unit_state(root, plan_id, k["id"], st)
+    if pstate["closure"].get("state") != "split":
+        pstate["closure"] = {"state": "split", "children": [k["id"] for k in rev["children"]],
+                             "time": rev["time"]}
+        save_unit_state(root, plan_id, rev["parent"], pstate)
+
+
 def split_unit(root, plan_id, unit_id, spec, reason):
     """Replace an unclosed unit with children. Returns the revision record."""
     if not isinstance(reason, str) or not reason.strip():
         raise PlanStateError("split requires a non-blank reason")
-    require_approval(root, plan_id)
+    digest0 = require_approval(root, plan_id)["digest"]
+    for r in load_revisions(root, plan_id):  # finish any interrupted split
+        _apply_split_state(root, plan_id, r, digest0)
     eff = effective_plan(root, plan_id)
     parent = next((u for u in eff["units"] if u["id"] == unit_id), None)
     if parent is None:
         raise PlanStateError("unit %r is not in plan %s (already split?)" % (unit_id, plan_id))
     pstate = load_unit_state(root, plan_id, unit_id)
+    if pstate["closure"].get("state") == "split":  # marked split but no revision names it
+        pstate["closure"] = {"state": "open"}
     if pstate["closure"].get("state") in CLOSED_STATES:
         raise PlanStateError("unit %s is closed (%s); only unclosed units can be split"
                              % (unit_id, pstate["closure"].get("state")))
@@ -366,15 +395,8 @@ def split_unit(root, plan_id, unit_id, spec, reason):
 
     digest = require_approval(root, plan_id)["digest"]
     rev["revision_digest"] = revision_digest(digest, rev)
-    for k in kids:
-        st = default_unit_state(plan_id, k["id"], digest)
-        st["lineage"] = {"parent": unit_id, "reason": rev["reason"], "time": now}
-        st["counters"] = dict(pstate["counters"])
-        st["authorization"]["via"] = "split"
-        save_unit_state(root, plan_id, k["id"], st)
-    pstate["closure"] = {"state": "split", "children": [k["id"] for k in kids], "time": now}
-    save_unit_state(root, plan_id, unit_id, pstate)
     store.write_json_atomic(_p(root, plan_id, "revisions.json"), load_revisions(root, plan_id) + [rev])
+    _apply_split_state(root, plan_id, rev, digest)
     store.append_event(root, "unit_split", plan_id=plan_id, parent=unit_id,
                        children=[k["id"] for k in kids], reason=rev["reason"])
     return rev

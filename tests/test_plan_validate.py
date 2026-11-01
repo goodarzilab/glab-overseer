@@ -201,6 +201,22 @@ class ValidateTests(unittest.TestCase):
         self.unit(p, "crunch")["scope"] = ["src/x.py"]
         self.assertEqual(errs(p), [])
 
+    def test_slurm_null_and_blank_count_as_absent(self):
+        for key in ("mem", "time"):
+            for bad in (None, "", "  "):
+                p = plan_copy()
+                p["slurm"][key] = bad
+                self.assertTrue(errs(p), (key, bad))
+        p = plan_copy()
+        p["slurm"]["mem_per_cpu"] = ""
+        self.assertEqual(errs(p), [])  # blank mem_per_cpu is absent, so no "both"
+        p["slurm"]["mem"] = 4
+        self.assertError(p, "slurm mem must be a non-empty string")
+        for bad in (0, -1, "4", True):
+            p = plan_copy()
+            p["slurm"]["cpus"] = bad
+            self.assertError(p, "slurm cpus must be a positive integer")
+
     def test_slurm_checked_for_code_units_too(self):
         p = plan_copy()
         del p["slurm"]
