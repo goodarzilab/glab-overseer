@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -199,14 +200,26 @@ class RecordTests(Case):
     def test_payload_sigkill_is_failure_not_success(self):
         rec = self.launch("j1", [self.script("k9", "kill -9 $$")])
         st = self.wait_for(rec["dir"])
-        self.assertEqual((st["rc"], st["payload_signal"], st["signal"]), (137, "KILL", None))
+        self.assertEqual((st["rc"], st["signal"]), (137, None))
 
-    def test_payload_signal_recorded_apart_from_wrapper_signal(self):
+    def test_exit_json_has_no_payload_signal_field(self):
         rec = self.launch("j1", [self.script("t", "kill -TERM $$")])
-        st = self.wait_for(rec["dir"])
-        self.assertEqual((st["rc"], st["payload_signal"], st["signal"]), (143, "TERM", None))
-        rec = self.launch("j2", [self.script("e", "exit 5")])
-        self.assertIsNone(self.wait_for(rec["dir"])["payload_signal"])
+        self.wait_for(rec["dir"])
+        self.assertEqual(self.rec(rec["dir"], "exit.json")["rc"], 143)
+        self.assertNotIn("payload_signal", self.rec(rec["dir"], "exit.json"))
+
+    def test_signalled_wrapper_never_records_rc_zero(self):
+        # The payload ignores TERM and exits 0; only the wrapper is signalled, so its trap
+        # sees $? == 0. A signalled invocation must still record a nonzero rc.
+        ready = os.path.join(self.tmp, "ready-t")
+        rec = self.launch("j1", [self.script("ign", "trap '' TERM; : > '%s'; sleep 1; exit 0" % ready)])
+        end = time.time() + 10
+        while not os.path.exists(ready) and time.time() < end:
+            time.sleep(0.05)
+        os.kill(rec["launch"]["pid"], signal.SIGTERM)
+        self.wait_for(rec["dir"])
+        ex = self.rec(rec["dir"], "exit.json")
+        self.assertEqual((ex["rc"], ex["signal"]), (143, "TERM"))
 
     def test_wrapper_sigkill_is_uncertain(self):
         rec = self.launch("j1")
@@ -455,13 +468,26 @@ class CommandTests(Case):
         self.assertEqual((line["from"], line["to"], line["rc"], line["unit"]), ("RUNNING", "EXITED", 0, "j1"))
         self.assertEqual(self.run_cli("wait", "--timeout", "0.2")[0], 0)  # nothing active
 
+    def test_wait_reports_a_new_invocation(self):
+        self.launch("j1")
+        n, _ = X.allocate_attempt(self.root, "demo", "j2")
+        t = threading.Timer(0.4, lambda: self.launch("j2", n=n))
+        t.start()
+        self.addCleanup(t.join)
+        lines = []
+        self.assertEqual(X.wait_for_change(self.root, timeout=5, poll=0.1, emit=lines.append), 0)
+        got = json.loads(lines[0])
+        self.assertEqual((got["unit"], got["from"]), ("j2", None))
+
     def test_abort_cooperative(self):
-        rec = self.launch("j1")
-        self.wait_for_start(rec["dir"])
+        ready = os.path.join(self.tmp, "ready")
+        rec = self.launch("j1", [self.script("rd", "echo > %s; sleep 30" % ready)])
+        while not os.path.exists(ready):
+            time.sleep(0.02)
         rc, out, _ = self.run_cli("abort", "j1", "--grace", "5")
         self.assertEqual(rc, 0, out)
         st = X.invocation_status(rec["dir"])
-        self.assertEqual((st["state"], st["signal"]), ("EXITED", "TERM"))
+        self.assertEqual((st["state"], st["signal"], st["rc"]), ("EXITED", "TERM", 143))  # rc read before sig is set
         self.assertEqual(X.slots_in_use(self.root), 0)
         self.assertEqual(self.run_cli("abort", "j1")[1].strip(), "nothing to abort for j1")
 
@@ -519,10 +545,89 @@ class CommandTests(Case):
         self.assertEqual(kinds, ["cancel_unidentified"])
         self.assertEqual(self.run_cli("abort", "j1")[0], 1)
 
+    def start_decoy(self):
+        d = subprocess.Popen([shutil.which("sleep"), "30"], start_new_session=True)
+        self.addCleanup(d.wait)
+        self.addCleanup(d.kill)
+        return d
+
+    def test_abort_never_signals_a_reused_pgid(self):
+        rec = self.launch("j1", [self.script("pl", "sleep 30")])
+        self.wait_for_start(rec["dir"])
+        time.sleep(0.2)
+        os.kill(rec["launch"]["pid"], signal.SIGKILL)  # wrapper gone, payload lives
+        decoy = self.start_decoy()  # an unrelated session now owns the recorded pid and pgid
+        ln = self.rec(rec["dir"], "launch.json")
+        ln.update(pid=decoy.pid, pgid=decoy.pid)
+        store.write_json_atomic(os.path.join(rec["dir"], "launch.json"), ln)
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=1), "CANCELLED")
+        self.assertIsNone(decoy.poll())
+        self.assertEqual(X._token_pids(self.rec(rec["dir"], "intent.json")["token"]), [])
+
+    def test_abort_without_proc_and_dead_wrapper_is_unidentified(self):
+        rec = self.launch("j1", [self.script("pl", "sleep 30")])
+        self.wait_for_start(rec["dir"])
+        os.kill(rec["launch"]["pid"], signal.SIGKILL)
+        self.wait_for(rec["dir"], ("UNCERTAIN",))
+        with mock.patch.object(X, "_token_pids", return_value=None):
+            self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0.1), "UNIDENTIFIED")
+        self.assertNotIn("confirmed_at", self.rec(rec["dir"], "cancel.json"))
+        self.assertEqual(X.slots_in_use(self.root), 1)
+
+    def test_outstanding_abort_holds_slot_after_exit_json(self):
+        rec = self.launch("j1", [self.script("bg", "sleep 30 &")])  # wrapper exits, a child survives
+        self.wait_for(rec["dir"])
+        token = self.rec(rec["dir"], "intent.json")["token"]
+        self.assertEqual(len(X._token_pids(token)), 1)
+        store.write_json_atomic(os.path.join(rec["dir"], "cancel.json"),
+                                {"token": token, "requested_at": store.utc_now()})
+        self.assertEqual(X.invocation_status(rec["dir"])["state"], "CANCELLING")
+        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=1), "EXITED")  # resumed and confirmed
+        self.assertEqual(X._token_pids(token), [])
+        self.assertEqual(X.slots_in_use(self.root), 0)
+
+    def test_launch_without_start_identity_is_terminated(self):
+        pids = []
+
+        def spawn(inv, run_sh, envd, cwd):
+            f = X._spawn_local(inv, run_sh, envd, cwd)
+            pids.append(f["pid"])
+            return f
+        with mock.patch.object(X, "proc_start", return_value=None):
+            with self.assertRaisesRegex(X.ExecutionError, "no start identity"):
+                self.launch("j1", spawn=spawn)
+        inv = next(X.iter_invocations(self.root))["path"]
+        self.assertEqual(X.invocation_status(inv)["state"], "LAUNCH_FAILED")
+        end = time.time() + 5
+        while time.time() < end:
+            X._reap(0)
+            try:
+                os.killpg(pids[0], 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pids[0], 0)
+        self.assertEqual(X.slots_in_use(self.root), 0)
+
+    def test_ps_is_found_without_path(self):
+        with mock.patch.dict(os.environ, {"PATH": "/nonexistent"}):
+            self.assertIn(X._ps_exe(), ("/bin/ps", "/usr/bin/ps"))
+
+    def test_whitespace_run_sh_is_not_adopted_without_proc(self):
+        real = os.path.isdir
+        out = {"rc": 0, "stdout": "123 /bin/sh /a b/run.sh\n456 /bin/sh /ab/run.sh\n", "stderr": "", "timed_out": False}
+        with mock.patch.object(X.os.path, "isdir", lambda p: False if p == "/proc/self" else real(p)), \
+                mock.patch.object(X, "_ps_exe", return_value="/bin/ps"), \
+                mock.patch.object(X.E, "run_tool", return_value=out):
+            self.assertEqual(X.find_by_script("/a b/run.sh"), [])
+            self.assertEqual(X.find_by_script("/ab/run.sh"), [456])
+
     def test_unconfirmed_abort_keeps_slot(self):
         rec = self.launch("j1")
         with mock.patch.object(X, "identified_alive", return_value=True), \
-                mock.patch.object(X, "_signal"):
+                mock.patch.object(X.os, "killpg"), mock.patch.object(X.os, "kill"):
             self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0.1, sleep=lambda s: None, confirm_wait=0.2), "UNCONFIRMED")
         self.assertNotIn("confirmed_at", self.rec(rec["dir"], "cancel.json"))
         self.assertEqual(X.slots_in_use(self.root), 1)

@@ -27,7 +27,8 @@ from . import approval, env as E, paths, plan as P, store
 SHELL = "/bin/sh"  # run.sh interpreter; the process search matches exactly `SHELL run.sh`
 PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12)
 KINDS = ("author", "fixer", "job")
-ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN")
+ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN", "CANCELLING")
+TOKEN_VAR = "OVERSEER_INV_TOKEN"  # exported by run.sh; every payload process inherits it
 BLOCKING_CLASSES = ("QUOTA", "AUTH")
 SIGNALS = ("TERM", "INT", "HUP")
 BAD = object()  # a record file exists but is unreadable or not an object
@@ -66,7 +67,11 @@ def argv_digest(argv):
 # ---- process identity ------------------------------------------------------
 
 def _ps_exe():
-    return E.resolve_exe("ps", os.environ.get("PATH", ""))
+    """`ps` from fixed absolute locations, independent of the (scrubbed) worker PATH."""
+    for cand in ("/bin/ps", "/usr/bin/ps"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
 
 
 def proc_start(pid, allow_zombie=False):
@@ -108,7 +113,12 @@ def identified_alive(pid, start):
 
 
 def find_by_script(script):
-    """Pids of live processes running `script` (sh run.sh), by command line."""
+    """Pids of live processes running `script` (sh run.sh), by command line.
+
+    Without /proc, `ps` flattens argv, so a path containing whitespace cannot be matched
+    unambiguously: adoption is disabled and such an invocation stays UNCERTAIN until an
+    orchestrator resolves it.
+    """
     found = []
     if os.path.isdir("/proc/self"):
         for name in os.listdir("/proc"):
@@ -124,7 +134,7 @@ def find_by_script(script):
                     found.append(int(name))
         return sorted(found)
     ps = _ps_exe()
-    if ps is not None:
+    if ps is not None and not any(c.isspace() for c in script):
         r = E.run_tool([ps, "-axo", "pid=,command="], E.worker_env(), 15)
         for line in r["stdout"].splitlines():
             p = line.strip().split(None, 1)
@@ -156,8 +166,13 @@ def _valid_launch(launch, intent):
 def _exit_matches(ex, intent):
     return (ex is not BAD and ex.get("token") == intent["token"]
             and ex.get("argv_sha256") == intent["argv_sha256"]
-            and type(ex.get("rc")) is int and ex.get("signal") in (None,) + SIGNALS
-            and (ex.get("payload_signal") is None or isinstance(ex["payload_signal"], str)))
+            and type(ex.get("rc")) is int and ex.get("signal") in (None,) + SIGNALS)
+
+
+def _cancel_pending(cancel, intent):
+    return (isinstance(cancel, dict) and cancel.get("token") == intent["token"]
+            and isinstance(cancel.get("requested_at"), str) and "unidentified" not in cancel
+            and "confirmed_at" not in cancel)
 
 
 def _reconcile_launch(inv, intent, write):
@@ -206,10 +221,12 @@ def invocation_status(inv, write=False):
         return {"state": "NOT_LAUNCHED", "reason": "no intent.json"}
     if intent is BAD or not _valid_intent(intent, inv):
         return {"state": "UNCERTAIN", "reason": "intent.json is invalid"}
+    cancel = _load(os.path.join(inv, "cancel.json"))
+    if _cancel_pending(cancel, intent):  # an abort is outstanding: hold the slot until it confirms
+        return {"state": "CANCELLING"}
     ex = _load(os.path.join(inv, "exit.json"))
     if ex is not None and _exit_matches(ex, intent):
-        return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal"),
-                "payload_signal": ex.get("payload_signal")}
+        return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal")}
     stale = " (exit.json does not match this invocation)" if ex is not None else ""
     fail = _load(os.path.join(inv, "launch_error.json"))
     if isinstance(fail, dict) and fail.get("token") == intent["token"]:
@@ -227,7 +244,6 @@ def invocation_status(inv, write=False):
     s = probe(inv, intent, launch) if probe else "GONE"
     if s in ("RUNNING", "QUEUED"):
         return {"state": s, "pid": launch.get("pid")}
-    cancel = _load(os.path.join(inv, "cancel.json"))
     if isinstance(cancel, dict) and cancel.get("token") == intent["token"] \
             and isinstance(cancel.get("confirmed_at"), str):
         return {"state": "CANCELLED"}
@@ -357,7 +373,7 @@ def allocate_attempt(root, plan_id, unit_id, after_quota=False):
 
 # ---- launching -------------------------------------------------------------
 
-_REC = '''import json, os, signal, socket, sys, tempfile, time
+_REC = '''import json, os, socket, sys, tempfile, time
 def w(path, rec):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rec.", suffix=".tmp")
     with os.fdopen(fd, "w") as f:
@@ -368,14 +384,8 @@ now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 if a[1] == "start":
     w(a[2] + "/start.json", {"token": a[3], "pid": int(a[4]), "host": socket.gethostname(), "time": now})
 else:
-    rc, ps = int(a[5]), None
-    if 128 < rc < 192:
-        try:
-            ps = signal.Signals(rc - 128).name[3:]
-        except ValueError:
-            pass
-    w(a[2] + "/exit.json", {"token": a[3], "argv_sha256": a[4], "rc": rc, "signal": a[6] or None,
-                            "payload_signal": ps, "end_time": now})
+    w(a[2] + "/exit.json", {"token": a[3], "argv_sha256": a[4], "rc": int(a[5]), "signal": a[6] or None,
+                            "end_time": now})
 '''
 
 
@@ -386,16 +396,17 @@ PY=%s; REC=%s; INV=%s; TOKEN=%s; SHA=%s
 sig=; rc=1
 fin() { trap - EXIT; "$PY" -I "$REC" exit "$INV" "$TOKEN" "$SHA" "$rc" "$sig"; }
 trap fin EXIT
-trap 'sig=TERM; rc=$?; exit "$rc"' TERM
-trap 'sig=INT; rc=$?; exit "$rc"' INT
-trap 'sig=HUP; rc=$?; exit "$rc"' HUP
+trap 'rc=$?; [ "$rc" -eq 0 ] && rc=143; sig=TERM; exit "$rc"' TERM
+trap 'rc=$?; [ "$rc" -eq 0 ] && rc=130; sig=INT; exit "$rc"' INT
+trap 'rc=$?; [ "$rc" -eq 0 ] && rc=129; sig=HUP; exit "$rc"' HUP
 cd %s || { rc=126; exit 126; }
 "$PY" -I "$REC" start "$INV" "$TOKEN" "$$"
+%s=$TOKEN; export %s
 %s <%s >"$INV/stdout.log" 2>"$INV/stderr.log"
 rc=$?
 exit "$rc"
 """ % (SHELL, q(sys.executable), q(os.path.join(inv, "rec.py")), q(inv), q(intent["token"]), q(intent["argv_sha256"]),
-       q(intent["cwd"]), " ".join(q(a) for a in intent["argv"]), q(stdin_path))
+       q(intent["cwd"]), TOKEN_VAR, TOKEN_VAR, " ".join(q(a) for a in intent["argv"]), q(stdin_path))
 
 
 def _write_scripts(inv, intent, stdin_text):
@@ -476,6 +487,14 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
             launch["pgid"] = os.getpgid(pid)
         except OSError:
             launch["pgid"] = pid
+        if launch["start"] is None:  # an unidentifiable worker must not be left running
+            try:
+                os.killpg(launch["pgid"], signal.SIGKILL) if launch["pgid"] == pid else os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            err = "no start identity for pid %d; the spawned process was terminated" % pid
+            store.write_json_atomic(os.path.join(inv, "launch_error.json"), {"token": intent["token"], "error": err})
+            raise ExecutionError("launch failed: " + err)
     store.write_json_atomic(os.path.join(inv, "launch.json"), launch)
     return dict(intent, launch=launch, dir=inv, seq=seq)
 
@@ -506,21 +525,33 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
 
 # ---- abort -----------------------------------------------------------------
 
-def _signal(launch, sig):
-    try:
-        if launch["pgid"] == launch["pid"] and launch["pgid"] != os.getpgrp():
-            os.killpg(launch["pgid"], sig)
-        else:
-            os.kill(launch["pid"], sig)
-    except ProcessLookupError:
-        pass
+def _token_pids(token):
+    """Pids of processes carrying this invocation's token in their environment; None without /proc."""
+    if not os.path.isdir("/proc/self"):
+        return None
+    want = ("%s=%s" % (TOKEN_VAR, token)).encode()
+    out = []
+    for name in os.listdir("/proc"):
+        if name.isdigit() and int(name) != os.getpid():
+            try:
+                with open("/proc/%s/environ" % name, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if want in data.split(b"\0"):
+                out.append(int(name))
+    return out
 
 
 def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
-    """SIGTERM the process group, escalate to SIGKILL after `grace`, confirm only once it is gone.
+    """SIGTERM, escalate to SIGKILL after `grace`, confirm only once everything is gone.
 
-    cancel.json is written (requested_at) before any signal; confirmed_at is added only
-    when the identified process is gone. Returns the resulting state.
+    While the wrapper's start identity matches, its process group is signalled. After it
+    is gone, members are found by the invocation token in /proc/<pid>/environ and signalled
+    one by one (a group is never signalled on a bare pgid, which could have been reused).
+    Without /proc nothing else can be identified: a dead wrapper then yields
+    `cancel_unidentified`. cancel.json gets requested_at before any signal and
+    confirmed_at only when the wrapper is gone and no process carries the token.
     """
     st = invocation_status(inv, True)
     if st["state"] not in ACTIVE:
@@ -532,38 +563,48 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
     ref = {"plan_id": intent["plan_id"], "unit_id": intent["unit_id"], "attempt": intent["attempt"],
            "invocation": os.path.basename(inv)}
     cpath = os.path.join(inv, "cancel.json")
+    reason = None
     if launch is None or not _valid_launch(launch, intent):
         reason = "no identifiable launch (no launch.json and no matching process); a payload may still run"
+    else:
+        def wrapper():
+            return identified_alive(launch["pid"], launch["start"])
+        if not wrapper() and _token_pids(intent["token"]) is None:
+            reason = "the wrapper is gone and this host cannot list processes; a payload may still run"
+    if reason:
         store.write_json_atomic(cpath, {"token": intent["token"], "requested_at": store.utc_now(),
                                         "unidentified": reason})
         store.append_event(root, "cancel_unidentified", reason=reason, **ref)
         return "UNIDENTIFIED"
     cancel = _load(cpath)
-    if not (isinstance(cancel, dict) and cancel.get("token") == intent["token"]):
+    if not _cancel_pending(cancel, intent):
         cancel = {"token": intent["token"], "requested_at": store.utc_now()}
         store.write_json_atomic(cpath, cancel)
         store.append_event(root, "cancel_requested", **ref)
 
-    def alive():  # the identified wrapper OR any member of its process group
-        if identified_alive(launch["pid"], launch["start"]):
-            return True
-        if launch["pgid"] != launch["pid"] or launch["pgid"] == os.getpgrp():
-            return False
+    def alive():
+        return wrapper() or bool(_token_pids(intent["token"]))
+
+    def send(sig):
         try:
-            os.killpg(launch["pgid"], 0)
+            if wrapper():
+                if launch["pgid"] == launch["pid"] and launch["pgid"] != os.getpgrp():
+                    os.killpg(launch["pgid"], sig)
+                else:
+                    os.kill(launch["pid"], sig)
+            else:
+                for pid in _token_pids(intent["token"]) or []:
+                    os.kill(pid, sig)
         except ProcessLookupError:
-            return False
-        except PermissionError:
             pass
-        return True
 
     if alive():
-        _signal(launch, signal.SIGTERM)
+        send(signal.SIGTERM)
     deadline = time.monotonic() + grace
     while alive() and time.monotonic() < deadline:
         sleep(0.1)
     if alive():
-        _signal(launch, signal.SIGKILL)
+        send(signal.SIGKILL)
         end = time.monotonic() + confirm_wait
         while alive() and time.monotonic() < end:
             sleep(0.05)
@@ -591,21 +632,27 @@ def _snapshot(root):
 
 
 def wait_for_change(root, timeout=1800.0, poll=15.0, emit=None, sleep=time.sleep):
-    """Poll until an invocation that was active at the start changes state. 0 on change, 3 on timeout."""
+    """Poll until an invocation appears, changes state or leaves the active set. 0 on change, 3 on timeout.
+
+    The whole project is re-read on every poll. With nothing active at the start it returns 0 at once.
+    """
     emit = emit or (lambda line: print(line, flush=True))
-    watch = dict((k, v[1]["state"]) for k, v in _snapshot(root).items() if v[1]["state"] in ACTIVE)
-    if not watch:
+    base = _snapshot(root)
+    before = dict((k, v[1]["state"]) for k, v in base.items())
+    if not any(st in ACTIVE for st in before.values()):
         sys.stderr.write("no active invocations\n")
         return 0
     end = time.monotonic() + timeout
     while True:
         cur = _snapshot(root)
-        changed = [k for k in sorted(watch) if k in cur and cur[k][1]["state"] != watch[k]]
+        now = dict((k, v[1]["state"]) for k, v in cur.items())
+        changed = [k for k in sorted(set(before) | set(now))
+                   if before.get(k) != now.get(k) and (k not in before or before[k] in ACTIVE or now.get(k) in ACTIVE)]
         for k in changed:
-            i, s = cur[k]
+            i, st = cur[k] if k in cur else (base[k][0], {})
             emit(json.dumps({"plan": k[0], "unit": k[1], "attempt": k[2], "invocation": k[3], "kind": i["kind"],
-                             "from": watch[k], "to": s["state"], "rc": s.get("rc"), "signal": s.get("signal")},
-                            sort_keys=True))
+                             "from": before.get(k), "to": now.get(k), "rc": st.get("rc"),
+                             "signal": st.get("signal")}, sort_keys=True))
         if changed:
             return 0
         if time.monotonic() >= end:
