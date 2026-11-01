@@ -19,10 +19,10 @@ def job(uid, command="true"):
     return {"id": uid, "kind": "job", "title": uid, "command": command, "outputs": ["r.txt"], "needs": []}
 
 
-def make_plan(pid="demo", n=4):
+def make_plan(pid="demo", n=4, workers=3):
     p = plan_copy()
     p["plan_id"] = pid
-    p["caps"] = {"workers": 3, "attempts": 2}
+    p["caps"] = {"workers": workers, "attempts": 2}
     p["units"] = [job("j%d" % i) for i in range(1, n + 1)]
     return p
 
@@ -49,13 +49,13 @@ class Case(TmpCase):
         self.addCleanup(self.kill_all)
         self.approve("demo")
 
-    def approve(self, pid, n=4):
-        approval.approve_plan(self.root, make_plan(pid, n), "me")
+    def approve(self, pid, n=4, workers=3):
+        approval.approve_plan(self.root, make_plan(pid, n, workers), "me")
 
     def kill_all(self):
         for i in list(X.iter_invocations(self.root)):
             ln = X._load(os.path.join(i["path"], "launch.json"))
-            if isinstance(ln, dict) and isinstance(ln.get("pgid"), int):
+            if isinstance(ln, dict) and isinstance(ln.get("pgid"), int) and ln["pgid"] != os.getpgrp():
                 try:
                     os.killpg(ln["pgid"], signal.SIGKILL)
                 except OSError:
@@ -100,7 +100,9 @@ class AttemptTests(Case):
         with self.assertRaisesRegex(X.ExecutionError, "attempts cap"):
             X.allocate_attempt(self.root, "demo", "j1")
         stray = os.path.join(self.root, ".overseer", "plans", "demo", "units", "j2", "attempts", "a1")
-        os.makedirs(stray)  # an existing directory that is not a marked allocation is never reused
+        os.makedirs(stray)  # an unmarked directory with content is never adopted
+        with open(os.path.join(stray, "evidence.txt"), "w") as f:
+            f.write("x")
         with self.assertRaisesRegex(X.ExecutionError, "already exists"):
             X.allocate_attempt(self.root, "demo", "j2")
 
@@ -111,6 +113,28 @@ class AttemptTests(Case):
         self.assertEqual(approval.load_unit_state(self.root, "demo", "j1")["counters"]["attempts"], 0)
         self.assertEqual(X.allocate_attempt(self.root, "demo", "j1")[0], 1)
         self.assertEqual(approval.load_unit_state(self.root, "demo", "j1")["counters"]["attempts"], 1)
+
+    def test_empty_unmarked_attempt_dir_is_adopted(self):
+        adir = os.path.join(self.root, ".overseer", "plans", "demo", "units", "j1", "attempts", "a1")
+        os.makedirs(adir)  # crash between mkdir and the marker
+        self.assertEqual(X.allocate_attempt(self.root, "demo", "j1")[0], 1)
+        self.assertEqual(self.rec(adir, "allocated.json")["attempt"], 1)
+
+    def test_dispatch_reuse_still_runs_admission_checks(self):
+        with mock.patch.object(X, "launch_invocation", side_effect=Crash):
+            with self.assertRaises(Crash):
+                cli.main(["--root", self.root, "dispatch", "--unit", "j1"])
+        st = approval.load_unit_state(self.root, "demo", "j1")
+        st["closure"] = {"state": "abandoned"}
+        approval.save_unit_state(self.root, "demo", "j1", st)
+        unit = {"id": "j1", "command": "true"}
+        with self.assertRaisesRegex(X.ExecutionError, "abandoned"):
+            X.dispatch_job(self.root, "demo", unit)
+        st["closure"] = {"state": "open"}
+        approval.save_unit_state(self.root, "demo", "j1", st)
+        os.unlink(os.path.join(self.root, ".overseer", "plans", "demo", "approval.json"))
+        with self.assertRaisesRegex(approval.ApprovalError, "approval"):
+            X.dispatch_job(self.root, "demo", unit)
 
     def test_refused_while_active(self):
         self.launch("j1")
@@ -175,7 +199,14 @@ class RecordTests(Case):
     def test_payload_sigkill_is_failure_not_success(self):
         rec = self.launch("j1", [self.script("k9", "kill -9 $$")])
         st = self.wait_for(rec["dir"])
-        self.assertEqual(st["rc"], 137)
+        self.assertEqual((st["rc"], st["payload_signal"], st["signal"]), (137, "KILL", None))
+
+    def test_payload_signal_recorded_apart_from_wrapper_signal(self):
+        rec = self.launch("j1", [self.script("t", "kill -TERM $$")])
+        st = self.wait_for(rec["dir"])
+        self.assertEqual((st["rc"], st["payload_signal"], st["signal"]), (143, "TERM", None))
+        rec = self.launch("j2", [self.script("e", "exit 5")])
+        self.assertIsNone(self.wait_for(rec["dir"])["payload_signal"])
 
     def test_wrapper_sigkill_is_uncertain(self):
         rec = self.launch("j1")
@@ -289,6 +320,19 @@ class CrashTests(Case):
         self.assertFalse(os.path.exists(os.path.join(inv, "start.json")))
         self.assertFalse(os.path.exists(os.path.join(inv, "launch.json")))
 
+    def test_decoy_mentioning_run_sh_is_not_adopted(self):
+        with self.assertRaises(Crash):
+            self.launch("j1", spawn=mock.Mock(side_effect=Crash))
+        inv = next(X.iter_invocations(self.root))["path"]
+        run_sh = self.rec(inv, "intent.json")["run_sh"]
+        decoy = subprocess.Popen([shutil.which("cat"), run_sh, "-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        self.addCleanup(decoy.wait)
+        self.addCleanup(decoy.stdin.close)
+        time.sleep(0.1)
+        self.assertEqual(decoy.poll(), None)
+        self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
+        self.assertFalse(os.path.exists(os.path.join(inv, "launch.json")))
+
     def test_crash_after_spawn_is_reconciled_from_process_table(self):
         def spawn_then_crash(inv, run_sh, envd, cwd):
             X._spawn_local(inv, run_sh, envd, cwd)
@@ -330,6 +374,17 @@ class SlotTests(Case):
         with self.assertRaises(X.SlotsFull):
             self.launch("j3")
         self.assertEqual(len([i for i in X.iter_invocations(self.root)]), 3)
+
+    def test_plan_cap_and_project_limit_are_separate(self):
+        self.approve("solo", 2, workers=1)
+        self.launch("j1", plan="demo")
+        self.launch("j1", plan="solo")  # demo's work does not block the idle plan
+        with self.assertRaisesRegex(X.SlotsFull, "plan solo has 1 of its 1"):
+            self.launch("j2", plan="solo")
+        self.launch("j2", plan="demo")
+        with self.assertRaisesRegex(X.SlotsFull, "project-wide limit of 3"):
+            self.launch("j3", plan="demo")
+        self.assertEqual(X.slots_in_use(self.root, plan_id="demo"), 2)
 
     def test_finished_invocation_frees_slot(self):
         for u in ("j1", "j2", "j3"):
@@ -382,12 +437,13 @@ class CommandTests(Case):
         rc, out, _ = self.run_cli("status", "--json")
         data = json.loads(out)
         self.assertEqual((rc, data["slots_in_use"], data["plans"]["demo"]["workers_cap"]), (0, 1, 3))
+        self.assertEqual((data["project_limit"], data["plans"]["demo"]["slots_in_use"]), (3, 1))
         u = data["plans"]["demo"]["units"]["j1"]
         self.assertEqual(u["active"][0]["state"], "RUNNING")
         self.assertEqual((u["attempts"], u["authorization"]["state"]), (1, "approved"))
         self.assertEqual(data["plans"]["demo"]["units"]["j2"]["active"], [])
         rc, out, _ = self.run_cli("status")
-        self.assertIn("slots 1/3", out)
+        self.assertIn("slots 1/3 (project 1/3)", out)
         self.assertIn(rec["seq"], out)
 
     def test_wait_exit_codes(self):
@@ -434,6 +490,34 @@ class CommandTests(Case):
         kinds = [e["kind"] for e in store.read_events(self.root) if e["kind"].startswith("cancel_")]
         self.assertEqual(kinds, ["cancel_requested", "cancel_confirmed"])
         self.assertFalse(os.path.exists(os.path.join(rec["dir"], "exit.json")))  # SIGKILL skips the trap
+
+    def test_abort_waits_for_whole_process_group(self):
+        ready = os.path.join(self.tmp, "ready")
+        rec = self.launch("j1", [self.script("kid", "trap '' TERM; echo > %s; sleep 30" % ready)])
+        while not os.path.exists(ready):
+            time.sleep(0.02)
+        os.kill(rec["launch"]["pid"], signal.SIGKILL)  # the wrapper dies, its payload group lives on
+        self.assertEqual(self.wait_for(rec["dir"], ("UNCERTAIN",))["state"], "UNCERTAIN")
+        seen = []
+        res = X.abort_invocation(self.root, rec["dir"], grace=0.4,
+                                 sleep=lambda _: (seen.append(X.slots_in_use(self.root)), time.sleep(0.1)))
+        self.assertEqual(res, "CANCELLED")
+        self.assertTrue(seen and set(seen) == {1})
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(rec["launch"]["pgid"], 0)
+        self.assertEqual(X.slots_in_use(self.root), 0)
+
+    def test_abort_without_identifiable_launch_is_not_confirmed(self):
+        with self.assertRaises(Crash):
+            self.launch("j1", spawn=mock.Mock(side_effect=Crash))
+        inv = next(X.iter_invocations(self.root))["path"]
+        self.assertEqual(X.abort_invocation(self.root, inv, grace=0.1), "UNIDENTIFIED")
+        self.assertNotIn("confirmed_at", self.rec(inv, "cancel.json"))
+        self.assertEqual(X.invocation_status(inv)["state"], "UNCERTAIN")
+        self.assertEqual(X.slots_in_use(self.root), 1)
+        kinds = [e["kind"] for e in store.read_events(self.root) if e["kind"].startswith("cancel_")]
+        self.assertEqual(kinds, ["cancel_unidentified"])
+        self.assertEqual(self.run_cli("abort", "j1")[0], 1)
 
     def test_unconfirmed_abort_keeps_slot(self):
         rec = self.launch("j1")

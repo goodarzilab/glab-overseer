@@ -22,8 +22,10 @@ import sys
 import time
 import uuid
 
-from . import approval, env as E, paths, store
+from . import approval, env as E, paths, plan as P, store
 
+SHELL = "/bin/sh"  # run.sh interpreter; the process search matches exactly `SHELL run.sh`
+PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12)
 KINDS = ("author", "fixer", "job")
 ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN")
 BLOCKING_CLASSES = ("QUOTA", "AUTH")
@@ -116,7 +118,9 @@ def find_by_script(script):
                         args = f.read().decode("utf-8", "replace").split("\0")
                 except OSError:
                     continue
-                if script in args[:2]:
+                if args and args[-1] == "":
+                    args.pop()
+                if args == [SHELL, script]:
                     found.append(int(name))
         return sorted(found)
     ps = _ps_exe()
@@ -124,7 +128,7 @@ def find_by_script(script):
         r = E.run_tool([ps, "-axo", "pid=,command="], E.worker_env(), 15)
         for line in r["stdout"].splitlines():
             p = line.strip().split(None, 1)
-            if len(p) == 2 and p[0].isdigit() and script in p[1]:
+            if len(p) == 2 and p[0].isdigit() and p[1].strip() == "%s %s" % (SHELL, script):
                 found.append(int(p[0]))
     return sorted(found)
 
@@ -152,7 +156,8 @@ def _valid_launch(launch, intent):
 def _exit_matches(ex, intent):
     return (ex is not BAD and ex.get("token") == intent["token"]
             and ex.get("argv_sha256") == intent["argv_sha256"]
-            and type(ex.get("rc")) is int and ex.get("signal") in (None,) + SIGNALS)
+            and type(ex.get("rc")) is int and ex.get("signal") in (None,) + SIGNALS
+            and (ex.get("payload_signal") is None or isinstance(ex["payload_signal"], str)))
 
 
 def _reconcile_launch(inv, intent, write):
@@ -203,7 +208,8 @@ def invocation_status(inv, write=False):
         return {"state": "UNCERTAIN", "reason": "intent.json is invalid"}
     ex = _load(os.path.join(inv, "exit.json"))
     if ex is not None and _exit_matches(ex, intent):
-        return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal")}
+        return {"state": "EXITED", "rc": ex["rc"], "signal": ex.get("signal"),
+                "payload_signal": ex.get("payload_signal")}
     stale = " (exit.json does not match this invocation)" if ex is not None else ""
     fail = _load(os.path.join(inv, "launch_error.json"))
     if isinstance(fail, dict) and fail.get("token") == intent["token"]:
@@ -262,9 +268,19 @@ def active_invocations(root, plan_id=None, unit_id=None, write=False):
     return out
 
 
-def slots_in_use(root, write=False):
-    """Author, fixer and job invocations QUEUED, RUNNING or UNCERTAIN in every plan."""
-    return sum(1 for i in active_invocations(root, write=write) if i["kind"] in KINDS)
+def slots_in_use(root, write=False, plan_id=None):
+    """Author, fixer and job invocations QUEUED, RUNNING or UNCERTAIN (one plan, or all plans)."""
+    return sum(1 for i in active_invocations(root, plan_id, write=write) if i["kind"] in KINDS)
+
+
+def check_slots(root, plan_id, cap):
+    """Refuse when the plan's own cap or the project-wide limit is reached, naming which."""
+    mine = slots_in_use(root, True, plan_id)
+    if mine >= cap:
+        raise SlotsFull("plan %s has %d of its %d worker slots in use" % (plan_id, mine, cap))
+    total = slots_in_use(root, True)
+    if total >= PROJECT_SLOTS:
+        raise SlotsFull("the project-wide limit of %d worker slots is reached (%d in use)" % (PROJECT_SLOTS, total))
 
 
 # ---- attempts --------------------------------------------------------------
@@ -291,8 +307,8 @@ def _counter(st):
     return n
 
 
-def allocate_attempt(root, plan_id, unit_id, after_quota=False):
-    """Create attempts/a<N> exclusively; returns (N, directory)."""
+def _admit(root, plan_id, unit_id, after_quota):
+    """Admission checks shared by allocation and reuse; returns (plan, unit state, last attempt)."""
     approval.require_approval(root, plan_id)
     plan = approval.effective_plan(root, plan_id)
     _unit_of(plan, unit_id)
@@ -310,6 +326,12 @@ def allocate_attempt(root, plan_id, unit_id, after_quota=False):
         if (c is BAD or (c and c.get("class") in BLOCKING_CLASSES)) and not after_quota:
             raise ExecutionError("attempt a%d of %s ended with %s; pass --after-quota to try again"
                                  % (last, unit_id, "an unreadable classification" if c is BAD else c["class"]))
+    return plan, st, last
+
+
+def allocate_attempt(root, plan_id, unit_id, after_quota=False):
+    """Create attempts/a<N> exclusively; returns (N, directory)."""
+    plan, st, last = _admit(root, plan_id, unit_id, after_quota)
     n = last + 1
     if n > plan["caps"]["attempts"]:
         raise ExecutionError("unit %s would need attempt %d, above the attempts cap %d"
@@ -322,7 +344,9 @@ def allocate_attempt(root, plan_id, unit_id, after_quota=False):
         store.write_json_atomic(marker, {"attempt": n, "token": uuid.uuid4().hex, "time": store.utc_now()})
     except FileExistsError:
         m = _load(marker)  # a crash between mkdir and the counter bump leaves a marked directory: adopt it
-        if not (isinstance(m, dict) and m.get("attempt") == n):
+        if m is None and not os.listdir(adir):  # a crash before the marker leaves an empty one: no evidence in it
+            store.write_json_atomic(marker, {"attempt": n, "token": uuid.uuid4().hex, "time": store.utc_now()})
+        elif not (isinstance(m, dict) and m.get("attempt") == n):
             raise ExecutionError("attempt directory %s already exists and is not a crashed allocation" % adir)
     st["counters"]["attempts"] = n
     st["execution"] = {"state": "allocated", "attempt": n}
@@ -333,7 +357,7 @@ def allocate_attempt(root, plan_id, unit_id, after_quota=False):
 
 # ---- launching -------------------------------------------------------------
 
-_REC = '''import json, os, socket, sys, tempfile, time
+_REC = '''import json, os, signal, socket, sys, tempfile, time
 def w(path, rec):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rec.", suffix=".tmp")
     with os.fdopen(fd, "w") as f:
@@ -344,13 +368,20 @@ now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 if a[1] == "start":
     w(a[2] + "/start.json", {"token": a[3], "pid": int(a[4]), "host": socket.gethostname(), "time": now})
 else:
-    w(a[2] + "/exit.json", {"token": a[3], "argv_sha256": a[4], "rc": int(a[5]), "signal": a[6] or None, "end_time": now})
+    rc, ps = int(a[5]), None
+    if 128 < rc < 192:
+        try:
+            ps = signal.Signals(rc - 128).name[3:]
+        except ValueError:
+            pass
+    w(a[2] + "/exit.json", {"token": a[3], "argv_sha256": a[4], "rc": rc, "signal": a[6] or None,
+                            "payload_signal": ps, "end_time": now})
 '''
 
 
 def _run_sh(inv, intent, stdin_path):
     q = shlex.quote
-    return """#!/bin/sh
+    return """#!%s
 PY=%s; REC=%s; INV=%s; TOKEN=%s; SHA=%s
 sig=; rc=1
 fin() { trap - EXIT; "$PY" -I "$REC" exit "$INV" "$TOKEN" "$SHA" "$rc" "$sig"; }
@@ -363,7 +394,7 @@ cd %s || { rc=126; exit 126; }
 %s <%s >"$INV/stdout.log" 2>"$INV/stderr.log"
 rc=$?
 exit "$rc"
-""" % (q(sys.executable), q(os.path.join(inv, "rec.py")), q(inv), q(intent["token"]), q(intent["argv_sha256"]),
+""" % (SHELL, q(sys.executable), q(os.path.join(inv, "rec.py")), q(inv), q(intent["token"]), q(intent["argv_sha256"]),
        q(intent["cwd"]), " ".join(q(a) for a in intent["argv"]), q(stdin_path))
 
 
@@ -412,9 +443,7 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
     adir = paths.attempt_dir(root, plan_id, unit_id, attempt)
     if not os.path.isdir(adir):
         raise ExecutionError("attempt a%d of %s is not allocated" % (attempt, unit_id))
-    n = slots_in_use(root, True)
-    if n >= cap:
-        raise SlotsFull("%d of %d worker slots are in use" % (n, cap))
+    check_slots(root, plan_id, cap)
     envd = E.worker_env(base=env, extras=extras)
     exe = E.resolve_exe(argv[0], envd.get("PATH", ""), cwd)
     if exe is None:
@@ -455,9 +484,8 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     """Run a job unit's command through the local backend with OVERSEER_OUT set."""
     plan = approval.effective_plan(root, plan_id)
     uid = unit["id"]
-    if slots_in_use(root, True) >= plan["caps"]["workers"]:
-        raise SlotsFull("all %d worker slots are in use" % plan["caps"]["workers"])
-    last = _counter(approval.load_unit_state(root, plan_id, uid))
+    check_slots(root, plan_id, plan["caps"]["workers"])
+    last = _admit(root, plan_id, uid, after_quota)[2]
     reuse = False  # an allocated attempt that never launched anything is reused, not burned
     if last:
         reuse = all(invocation_status(i["path"], True)["state"] in ("NOT_LAUNCHED", "LAUNCH_FAILED")
@@ -501,19 +529,33 @@ def abort_invocation(root, inv, grace=10.0, sleep=time.sleep, confirm_wait=5.0):
     if intent["backend"] != "local":
         raise ExecutionError("abort is not supported for backend %r here" % intent["backend"])
     launch = _load(os.path.join(inv, "launch.json"))
-    if launch is None or not _valid_launch(launch, intent):
-        launch = None  # nothing identifiable to signal
     ref = {"plan_id": intent["plan_id"], "unit_id": intent["unit_id"], "attempt": intent["attempt"],
            "invocation": os.path.basename(inv)}
     cpath = os.path.join(inv, "cancel.json")
+    if launch is None or not _valid_launch(launch, intent):
+        reason = "no identifiable launch (no launch.json and no matching process); a payload may still run"
+        store.write_json_atomic(cpath, {"token": intent["token"], "requested_at": store.utc_now(),
+                                        "unidentified": reason})
+        store.append_event(root, "cancel_unidentified", reason=reason, **ref)
+        return "UNIDENTIFIED"
     cancel = _load(cpath)
     if not (isinstance(cancel, dict) and cancel.get("token") == intent["token"]):
         cancel = {"token": intent["token"], "requested_at": store.utc_now()}
         store.write_json_atomic(cpath, cancel)
         store.append_event(root, "cancel_requested", **ref)
 
-    def alive():
-        return launch is not None and identified_alive(launch["pid"], launch["start"])
+    def alive():  # the identified wrapper OR any member of its process group
+        if identified_alive(launch["pid"], launch["start"]):
+            return True
+        if launch["pgid"] != launch["pid"] or launch["pgid"] == os.getpgrp():
+            return False
+        try:
+            os.killpg(launch["pgid"], 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        return True
 
     if alive():
         _signal(launch, signal.SIGTERM)
@@ -623,7 +665,7 @@ def run_abort(args):
         for i in todo:
             res = abort_invocation(root, i["path"], args.grace)
             print("%s/a%d/%s: %s" % (args.unit, i["attempt"], i["seq"], res))
-            bad += res == "UNCONFIRMED"
+            bad += res in ("UNCONFIRMED", "UNIDENTIFIED")
     return 1 if bad else 0
 
 
@@ -647,8 +689,9 @@ def collect_status(root, write=False):
                 active=[{"attempt": i["attempt"], "invocation": i["seq"], "kind": i["kind"],
                          "state": i["status"]["state"], "pid": i["status"].get("pid")}
                         for i in act if i["unit_id"] == u["id"]])
-        plans[pid] = {"workers_cap": plan["caps"]["workers"], "units": units}
-    return {"slots_in_use": slots_in_use(root, write), "plans": plans}
+        plans[pid] = {"workers_cap": plan["caps"]["workers"], "slots_in_use": slots_in_use(root, write, pid),
+                      "units": units}
+    return {"slots_in_use": slots_in_use(root, write), "project_limit": PROJECT_SLOTS, "plans": plans}
 
 
 def run_status(args):
@@ -662,7 +705,8 @@ def run_status(args):
         print(json.dumps(data, indent=2, sort_keys=True))
         return 0
     for pid, p in data["plans"].items():
-        print("plan %s: slots %d/%d" % (pid, data["slots_in_use"], p["workers_cap"]))
+        print("plan %s: slots %d/%d (project %d/%d)" % (pid, p["slots_in_use"], p["workers_cap"],
+                                                          data["slots_in_use"], data["project_limit"]))
         for uid, u in p["units"].items():
             print("  %s (%s) auth=%s exec=%s closure=%s attempts=%d" % (
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
