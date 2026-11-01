@@ -164,6 +164,25 @@ class StoreTests(TmpCase):
         self.assertEqual(leftovers, [])
         lk.release()
 
+    def test_forced_unlocks_are_serialized(self):
+        from unittest import mock
+        self.make_dead_holder_lock()
+        real, nested = store.holder_alive, []
+        def probe(holder):
+            with self.assertRaises(store.UnlockBusy):
+                store.force_unlock(self.root, "second")
+            nested.append(1)
+            return real(holder)
+        with mock.patch.object(store, "holder_alive", side_effect=probe):
+            self.assertIsNotNone(store.force_unlock(self.root, "first"))
+        self.assertEqual(nested, [1])
+        self.assertFalse(os.path.exists(paths.lock_path(self.root) + ".unlock"))
+        store.ProjectLock(self.root, "new").acquire()
+        with self.assertRaises(store.LockAlive):
+            store.force_unlock(self.root, "late")
+        self.assertFalse(os.path.exists(paths.lock_path(self.root) + ".unlock"))
+        self.assertEqual(store.read_lock(self.root)["command"], "new")
+
     def test_release_only_removes_own_lock(self):
         a = store.ProjectLock(self.root, "a").acquire()
         os.unlink(paths.lock_path(self.root))  # forced away

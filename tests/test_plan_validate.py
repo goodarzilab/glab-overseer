@@ -182,6 +182,25 @@ class ValidateTests(unittest.TestCase):
             self.unit(p, "alpha")[bad] = "x"
             self.assertError(p, "field %r names a model, provider or family" % bad)
 
+    def test_duplicate_output_path_in_unit(self):
+        p = plan_copy()
+        self.unit(p, "alpha")["outputs"] = ["src/alpha.py", {"path": "src/alpha.py", "min_bytes": 1}]
+        self.assertError(p, "unit alpha: output path 'src/alpha.py' is declared more than once")
+
+    def test_model_prefix_keys_and_job_scope(self):
+        for bad in ("model_name", "provider_id", "family_hint"):
+            p = plan_copy()
+            self.unit(p, "alpha")[bad] = "x"
+            self.assertError(p, "field %r names a model" % bad)
+        for bad, needle in (("/abs/x", "must be repo-relative"), ("../x", "must be repo-relative"),
+                            ("other/x", "is not covered by the plan scope")):
+            p = plan_copy()
+            self.unit(p, "crunch")["scope"] = [bad]
+            self.assertError(p, needle)
+        p = plan_copy()
+        self.unit(p, "crunch")["scope"] = ["src/x.py"]
+        self.assertEqual(errs(p), [])
+
     def test_slurm_checked_for_code_units_too(self):
         p = plan_copy()
         del p["slurm"]

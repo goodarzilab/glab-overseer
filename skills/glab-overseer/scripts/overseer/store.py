@@ -185,21 +185,42 @@ def holder_alive(holder):
     return True
 
 
+class UnlockBusy(RuntimeError):
+    pass
+
+
 def force_unlock(root, reason, even_if_alive=False):
-    """Remove the lock and record an event. Returns the removed holder or None."""
+    """Remove the lock and record an event. Returns the removed holder or None.
+
+    Forced unlocks are serialized by `lock.unlock` (created atomically, removed
+    in a finally); the holder is read and judged only inside that section, so a
+    second unlocker sees any new live holder and refuses.
+    """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("unlock requires a non-blank --reason")
-    holder = read_lock(root)
-    if holder is None:
-        return None
-    alive = holder_alive(holder)
-    if alive and not even_if_alive:
-        raise LockAlive("lock holder '%s' (pid %s) is alive on this host; "
-                        "pass --even-if-alive to remove it anyway" % (holder.get("command"), holder.get("pid")))
+    paths.ensure_state_dir(root)
+    guard = paths.lock_path(root) + ".unlock"
     try:
-        os.unlink(paths.lock_path(root))
-    except FileNotFoundError:
-        return None
-    append_event(root, "unlock", reason=reason.strip(), previous_holder=holder,
-                 holder_alive=alive, even_if_alive=bool(even_if_alive))
-    return holder
+        os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        raise UnlockBusy("another unlock is in progress (%s)" % os.path.basename(guard))
+    try:
+        holder = read_lock(root)
+        if holder is None:
+            return None
+        alive = holder_alive(holder)
+        if alive and not even_if_alive:
+            raise LockAlive("lock holder '%s' (pid %s) is alive on this host; "
+                            "pass --even-if-alive to remove it anyway" % (holder.get("command"), holder.get("pid")))
+        try:
+            os.unlink(paths.lock_path(root))
+        except FileNotFoundError:
+            return None
+        append_event(root, "unlock", reason=reason.strip(), previous_holder=holder,
+                     holder_alive=alive, even_if_alive=bool(even_if_alive))
+        return holder
+    finally:
+        try:
+            os.unlink(guard)
+        except FileNotFoundError:
+            pass

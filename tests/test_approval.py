@@ -124,6 +124,18 @@ class ApproveTests(TmpCase):
         self.assertEqual(A.require_approval(self.root, "demo")["digest"], res["digest"])
         self.assertEqual(self.approve()["status"], "unchanged")
 
+    def test_unit_slurm_override_kept_for_code_units_and_in_digest(self):
+        p = plan_copy()
+        p["units"][0]["slurm"] = {"time": "02:00:00", "mem_per_cpu": "2G"}
+        self.approve(p)
+        stored = store.read_json(pfile(self.root))
+        self.assertEqual(stored["units"][0]["slurm"], {"time": "02:00:00", "mem_per_cpu": "2G"})
+        A.require_approval(self.root, "demo")
+        stored["units"][0]["slurm"]["time"] = "99:00:00"
+        store.write_json_atomic(pfile(self.root), stored)
+        with self.assertRaises(A.ApprovalError):
+            A.require_approval(self.root, "demo")
+
     def test_tampered_plan_refused(self):
         self.approve()
         plan = store.read_json(pfile(self.root))

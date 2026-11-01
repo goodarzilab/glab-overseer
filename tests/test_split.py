@@ -184,10 +184,30 @@ class SplitTests(TmpCase):
         arch = os.path.join(paths.plan_dir(self.root, "demo"), "archive")
         stamps = os.listdir(arch)
         self.assertEqual(len(stamps), 1)
-        self.assertEqual(sorted(os.listdir(os.path.join(arch, stamps[0]))), ["alpha-a", "alpha-b"])
+        self.assertEqual(sorted(os.listdir(os.path.join(arch, stamps[0]))), ["alpha-a", "alpha-b", "beta"])
         self.assertFalse(os.path.exists(os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")))
         self.assertEqual([u["id"] for u in A.effective_plan(self.root, "demo")["units"]],
                          ["alpha", "beta", "crunch"])
+
+    def test_job_children_keep_command(self):
+        kids = [{"id": "crunch-a", "outputs": ["result.txt"], "command": "python evil.py"}]
+        with self.assertRaisesRegex(A.OwnerStop, "changes command of crunch"):
+            self.split(kids, unit="crunch")
+        self.split([{"id": "crunch-a", "outputs": ["result.txt"]}], unit="crunch")
+
+    def test_reapprove_archives_changed_units_only(self):
+        for uid in ("alpha", "beta"):
+            st = A.load_unit_state(self.root, "demo", uid)
+            st["closure"] = {"state": "merged"}
+            A.save_unit_state(self.root, "demo", uid, st)
+        changed = plan_copy()
+        changed["units"][1]["outputs"] = ["src/beta.py", "src/beta2.py"]
+        A.approve_plan(self.root, changed, "tester")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "alpha")["closure"]["state"], "merged")
+        self.assertEqual(A.load_unit_state(self.root, "demo", "beta")["closure"]["state"], "open")
+        arch = os.path.join(paths.plan_dir(self.root, "demo"), "archive")
+        got = os.path.join(arch, os.listdir(arch)[0], "beta", "unit.json")
+        self.assertEqual(store.read_json(got)["closure"]["state"], "merged")
 
     def revisions_path(self):
         return os.path.join(paths.plan_dir(self.root, "demo"), "revisions.json")

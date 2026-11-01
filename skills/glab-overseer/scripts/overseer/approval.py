@@ -130,7 +130,7 @@ def approve_plan(root, plan, approver):
     store.write_json_atomic(_p(root, pid, "plan.json"), norm)
     store.write_json_atomic(_p(root, pid, "issues.json"), {"drafts": drafts, "filed": filed})
     if result["status"] == "updated":
-        _reset_after_reapproval(root, pid, set(u["id"] for u in norm["units"]), old_revs)
+        _reset_after_reapproval(root, pid, norm["units"], old_plan, old_revs)
         try:
             os.unlink(_p(root, pid, "revisions.json"))
         except FileNotFoundError:
@@ -147,27 +147,30 @@ def approve_plan(root, plan, approver):
     return result
 
 
-def _reset_after_reapproval(root, plan_id, new_ids, old_revs):
-    """Undo split closures for units that reappear; archive state of units that are gone."""
+def _reset_after_reapproval(root, plan_id, new_units, old_plan, old_revs):
+    """Archive state of units that are gone or whose content changed; undo split closures."""
+    new_ids = set(u["id"] for u in new_units)
+    old = dict((u["id"], u) for u in (old_plan or {}).get("units", []))
+    changed = set(u["id"] for u in new_units if u["id"] in old and old[u["id"]] != u)
+    udir = os.path.join(paths.plan_dir(root, plan_id), "units")
+    present = sorted(os.listdir(udir)) if os.path.isdir(udir) else []
+    stale = [n for n in present if n not in new_ids or n in changed]
+    if stale:
+        stamp = store.utc_now().replace(":", "").replace("-", "")
+        dest = os.path.join(paths.plan_dir(root, plan_id), "archive", stamp)
+        n = 1
+        while os.path.exists(dest):
+            n += 1
+            dest = os.path.join(paths.plan_dir(root, plan_id), "archive", "%s-%d" % (stamp, n))
+        os.makedirs(dest)
+        for name in stale:
+            os.rename(os.path.join(udir, name), os.path.join(dest, name))
     for rev in old_revs:
-        if rev["parent"] in new_ids:
+        if rev["parent"] in new_ids and rev["parent"] not in stale and rev["parent"] in present:
             st = load_unit_state(root, plan_id, rev["parent"])
             if st["closure"].get("state") == "split":
                 st["closure"] = rev.get("pre_split_closure") or {"state": "open"}
                 save_unit_state(root, plan_id, rev["parent"], st)
-    udir = os.path.join(paths.plan_dir(root, plan_id), "units")
-    gone = [n for n in (sorted(os.listdir(udir)) if os.path.isdir(udir) else []) if n not in new_ids]
-    if not gone:
-        return
-    stamp = store.utc_now().replace(":", "").replace("-", "")
-    dest = os.path.join(paths.plan_dir(root, plan_id), "archive", stamp)
-    n = 1
-    while os.path.exists(dest):
-        n += 1
-        dest = os.path.join(paths.plan_dir(root, plan_id), "archive", "%s-%d" % (stamp, n))
-    os.makedirs(dest)
-    for name in gone:
-        os.rename(os.path.join(udir, name), os.path.join(dest, name))
 
 
 def require_approval(root, plan_id):
@@ -301,6 +304,8 @@ def check_split(parent, kids):
             raise OwnerStop("child %s changes the unit kind of %s" % (kid, parent["id"]))
         if k.get("test_command") != parent.get("test_command"):
             raise OwnerStop("child %s changes test_command of %s" % (kid, parent["id"]))
+        if k.get("command") != parent.get("command"):
+            raise OwnerStop("child %s changes command of %s" % (kid, parent["id"]))
         dropped = sorted(set(parent["needs"]) - set(k["needs"]))
         if dropped:
             raise OwnerStop("child %s drops need(s) %s of %s" % (kid, ", ".join(dropped), parent["id"]))

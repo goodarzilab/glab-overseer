@@ -15,6 +15,7 @@ CODE_REQUIRED = ("title", "prompt", "claims", "test_command", "outputs", "scope"
 JOB_REQUIRED = ("title", "command", "outputs")
 FORBIDDEN_KEYS = ("model", "models", "provider", "family", "thinking", "effort")
 FORBIDDEN_SUFFIXES = ("_model", "_provider", "_family")
+FORBIDDEN_PREFIXES = ("model_", "provider_", "family_")
 OUTPUT_KEYS = ("path", "min_bytes", "sha256", "validate")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -130,6 +131,9 @@ def _check_outputs(label, outs, errors):
         if outs is not None:
             errors.append("%s: outputs must be a list, got %s" % (label, type(outs).__name__))
         return
+    paths_seen = [output_path(o) for o in outs if isinstance(output_path(o), str)]
+    for p in sorted(set(x for x in paths_seen if paths_seen.count(x) > 1)):
+        errors.append("%s: output path %r is declared more than once" % (label, p))
     for o in outs:
         if isinstance(o, dict):
             extra = sorted(set(o) - set(OUTPUT_KEYS))
@@ -251,7 +255,7 @@ def validate_plan(plan):
 
 def _forbidden_key(k):
     k = str(k).lower()
-    return k in FORBIDDEN_KEYS or k.endswith(FORBIDDEN_SUFFIXES)
+    return k in FORBIDDEN_KEYS or k.endswith(FORBIDDEN_SUFFIXES) or k.startswith(FORBIDDEN_PREFIXES)
 
 
 def _validate_unit(u, label, plan_scope, plan_slurm, errors):
@@ -276,12 +280,12 @@ def _validate_unit(u, label, plan_scope, plan_slurm, errors):
         claims = u.get("claims")
         if _present(claims) and not (isinstance(claims, list) and all(isinstance(c, str) and c.strip() for c in claims)):
             errors.append("%s: claims must be a list of non-empty strings" % label)
-        scope = u.get("scope")
-        if _present(scope) and _check_globs(label, "scope glob", scope, errors):
-            for g in scope:
-                if plan_scope and not scope_covers(plan_scope, g):
-                    errors.append("%s: scope glob %r is not covered by the plan scope; list the literal "
-                                  "paths, or widen the plan scope to a dir/** glob" % (label, g))
+    scope = u.get("scope")
+    if scope is not None and _check_globs(label, "scope glob", scope, errors):
+        for g in scope:
+            if plan_scope and not scope_covers(plan_scope, g):
+                errors.append("%s: scope glob %r is not covered by the plan scope; list the literal "
+                              "paths, or widen the plan scope to a dir/** glob" % (label, g))
     _check_outputs(label, u.get("outputs"), errors)
     block = u.get("slurm")
     if block is not None and not isinstance(block, dict):
@@ -360,11 +364,12 @@ def normalize_unit(u):
         out["prompt"] = u["prompt"]
         out["claims"] = list(u["claims"])
         out["test_command"] = u["test_command"]
-        out["scope"] = sorted(set(u["scope"]))
     else:
         out["command"] = u["command"]
-        if u.get("slurm"):
-            out["slurm"] = dict(u["slurm"])
+    if u.get("scope"):
+        out["scope"] = sorted(set(u["scope"]))
+    if u.get("slurm"):
+        out["slurm"] = dict(u["slurm"])
     return out
 
 

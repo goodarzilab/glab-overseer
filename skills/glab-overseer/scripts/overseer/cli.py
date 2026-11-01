@@ -181,7 +181,7 @@ def main(argv=None):
         ap.error("unrecognized arguments: %s" % " ".join(extra))
     try:
         return cmd["run"](args)
-    except (store.LockHeld, store.LockAlive) as e:
+    except (store.LockHeld, store.LockAlive, store.UnlockBusy) as e:
         _err("error: %s" % e)
     except (approval.ApprovalError, approval.PlanStateError, P.PlanError,
             paths.InvalidId, paths.UnsafePath, ValueError, OSError) as e:
