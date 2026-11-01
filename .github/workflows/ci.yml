@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Each version runs in the official image: setup-python has no 3.9 build
+    # for current runner images, and the floor must still be exercised.
+    container: python:${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git for tests
+        run: |
+          git config --global --add safe.directory '*'
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+      - name: Run tests
+        run: python -m unittest discover -s tests
