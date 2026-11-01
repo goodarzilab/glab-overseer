@@ -22,6 +22,8 @@ import time
 from . import approval, env as E, execution as X, judge as J, paths, plan as P, store, workspace as W
 
 LIST_LIMIT = 1000
+POLL_WINDOW = 120.0  # after an ambiguous write, poll this long for its marker before writing again
+POLL_INTERVAL = 10.0
 READ_TRIES = 3
 RETRY_DELAY = 2.0
 FETCH_TIMEOUT = 300
@@ -117,14 +119,14 @@ def _is_int(v):
 
 def list_issues(repo):
     """All issues (any state) as validated dicts; refuses a listing that may be truncated."""
-    data = _read(["issue", "list", "-R", repo, "--state", "all", "--limit", str(LIST_LIMIT),
+    data = _read(["issue", "list", "-R", repo, "--state", "all", "--limit", str(LIST_LIMIT + 1),
                   "--json", "number,title,body,state"], "issue list", list)
     for i in data:
         if not (isinstance(i, dict) and _is_int(i.get("number")) and isinstance(i.get("title"), str)
                 and isinstance(i.get("body"), str) and isinstance(i.get("state"), str)):
             raise GithubError("issue list returned a malformed entry: %.100r" % (i,))
-    if len(data) >= LIST_LIMIT:
-        raise GithubError("repository has %d or more issues; at most %d are scanned" % (LIST_LIMIT, LIST_LIMIT))
+    if len(data) > LIST_LIMIT:
+        raise GithubError("repository has more than %d issues; at most %d are scanned" % (LIST_LIMIT, LIST_LIMIT))
     return data
 
 
@@ -160,10 +162,44 @@ def _record_filed(root, plan_id, rec, uid, number, read_at):
     store.write_json_atomic(_issues_path(root, plan_id), rec)
 
 
+def _pending_path(root):
+    return os.path.join(paths.state_dir(root), "github_pending.json")
+
+
+def _pend(root, marker, op):
+    """Keep a write's intent as ambiguous until its read-back confirms it (survives a crash or timeout)."""
+    paths.ensure_state_dir(root)
+    d = store.read_json(_pending_path(root), {})
+    d.setdefault(marker, {"op": op, "time": time.time()})
+    store.write_json_atomic(_pending_path(root), d)
+
+
+def _unpend(root, marker):
+    d = store.read_json(_pending_path(root), {})
+    if d.pop(marker, None) is not None:
+        store.write_json_atomic(_pending_path(root), d)
+
+
+def _settle(root, marker, find):
+    """Matches of `marker`; when an earlier write is still ambiguous, poll until the window since it closes."""
+    rec = store.read_json(_pending_path(root), {}).get(marker)
+    deadline = rec["time"] + POLL_WINDOW if isinstance(rec, dict) and isinstance(rec.get("time"), (int, float)) else 0
+    while True:
+        found = find()
+        if found or time.time() >= deadline:
+            return found
+        time.sleep(max(0.0, min(POLL_INTERVAL, deadline - time.time())))
+
+
 def _create_issue(root, repo, uid, draft, marker):
-    with _bodyfile(root, draft["body"]) as bf:
-        r, amb = _write(root, "issue_create", ["issue", "create", "-R", repo, "--title", draft["title"],
-                                               "--body-file", bf], unit=uid, marker=marker)
+    _pend(root, marker, "issue_create")
+    try:
+        with _bodyfile(root, draft["body"]) as bf:
+            r, amb = _write(root, "issue_create", ["issue", "create", "-R", repo, "--title", draft["title"],
+                                                   "--body-file", bf], unit=uid, marker=marker)
+    except GithubError:
+        _unpend(root, marker)  # a definite failure: nothing was created
+        raise
     m = ISSUE_URL_RE.search(r["stdout"]) if not amb else None
     if m:
         return int(m.group(1))
@@ -200,6 +236,11 @@ def file_issues(root, plan_id, dry_run=False, out=print):
         if recorded is not None and (len(found) != 1 or found[0]["number"] != recorded):
             raise GithubError("issues.json records #%s for unit %s but the repository listing disagrees"
                               % (recorded, u["id"]))
+        if not found and not dry_run and recorded is None:
+            found = _settle(root, marker, lambda: find_by_marker(list_issues(repo), marker))
+            if len(found) > 1:
+                raise GithubError("ambiguous: issues %s all carry the marker of unit %s"
+                                  % (", ".join("#%d" % i["number"] for i in found), u["id"]))
         plan_matches[u["id"]] = found
     numbers = {}
     for u in units:
@@ -209,17 +250,23 @@ def file_issues(root, plan_id, dry_run=False, out=print):
             out("%s: #%d (found by marker)" % (uid, numbers[uid]))
             if not dry_run:
                 _record_filed(root, plan_id, rec, uid, numbers[uid], read_at)
+                _unpend(root, P.issue_marker(plan_id, uid))
             continue
         if dry_run:
             out("%s: would create %r" % (uid, drafts[uid]["title"]))
             continue
         marker = P.issue_marker(plan_id, uid)
         n = _create_issue(root, repo, uid, drafts[uid], marker)
+        dups = find_by_marker(list_issues(repo), marker)
+        if len(dups) > 1:  # report only; nothing is closed or edited
+            raise GithubError("DUPLICATE ISSUES for unit %s: %s all carry %s; the owner must close the extras"
+                              % (uid, ", ".join("#%d" % i["number"] for i in dups), marker))
         back = view_issue(repo, n)
         if back["title"] != drafts[uid]["title"] or not has_marker(back["body"], marker):
             raise GithubError("read-back of #%d does not match the draft of unit %s" % (n, uid))
         numbers[uid] = n
         _record_filed(root, plan_id, rec, uid, n, store.utc_now())
+        _unpend(root, marker)
         out("%s: #%d (created)" % (uid, n))
     if not dry_run:
         link_dependencies(root, plan_id, repo, units, rec, out)
@@ -246,13 +293,26 @@ def _comments(repo, number):
 def ensure_comment(root, repo, number, text, marker):
     """Post `text` with a hidden marker unless a comment with it exists; verified by read-back."""
     body = "%s\n\n%s\n" % (text, marker)
-    if any(has_marker(c["body"], marker) for c in _comments(repo, number)):
+    def marked():
+        return [c for c in _comments(repo, number) if has_marker(c["body"], marker)]
+    if marked() or _settle(root, marker, marked):
+        _unpend(root, marker)
         return False
-    with _bodyfile(root, body) as bf:
-        _write(root, "comment", ["issue", "comment", str(number), "-R", repo, "--body-file", bf],
-               issue=number, marker=marker)
-    if not any(has_marker(c["body"], marker) for c in _comments(repo, number)):
+    _pend(root, marker, "comment")
+    try:
+        with _bodyfile(root, body) as bf:
+            _write(root, "comment", ["issue", "comment", str(number), "-R", repo, "--body-file", bf],
+                   issue=number, marker=marker)
+    except GithubError:
+        _unpend(root, marker)
+        raise
+    seen = marked()
+    if not seen:
         raise Ambiguous("comment on #%d is not visible after writing; rerun to reconcile" % number)
+    if len(seen) > 1:
+        raise GithubError("DUPLICATE COMMENTS on #%d: %d carry %s; the owner must delete the extras"
+                          % (number, len(seen), marker))
+    _unpend(root, marker)
     return True
 
 
@@ -346,14 +406,16 @@ def readback_pr(number, repo):
 
 def _prs_for_branch(repo, branch):
     items = _read(["pr", "list", "-R", repo, "--head", branch, "--state", "all", "--limit", "100",
-                   "--json", "number,state,headRefName"], "pr list", list)
+                   "--json", "number,state,headRefName,baseRefName"], "pr list", list)
     return [i for i in items if isinstance(i, dict) and i.get("headRefName") == branch and _is_int(i.get("number"))]
 
 
-def push_argv(branch):
-    """The only push this program runs: a plain branch push, never a force form."""
+def push_argv(branch, sha):
+    """The only push this program runs: the judged commit to its branch, never a force form."""
     W.check_branch_name(branch)
-    return ["push", "origin", "%s:%s" % (branch, branch)]
+    if not SHA_RE.match(sha):
+        raise GithubError("push needs a full commit sha, got %r" % (sha,))
+    return ["push", "origin", "%s:refs/heads/%s" % (sha, branch)]
 
 
 def _remote_head(wt, branch):
@@ -377,7 +439,7 @@ def push_branch(root, wt, branch, candidate):
                               % (branch, remote[:12], candidate[:12]))
     store.append_event(root, "github_intent", op="push", branch=branch, candidate=candidate, remote=remote)
     try:
-        W.git(wt, *push_argv(branch), timeout=PUSH_TIMEOUT)
+        W.git(wt, *push_argv(branch, candidate), timeout=PUSH_TIMEOUT)
     except W.GitError as e:
         if _remote_head(wt, branch) != candidate:
             raise GithubError("push of %s failed or has an unknown outcome: %s" % (branch, e))
@@ -410,15 +472,19 @@ def open_pr(root, plan_id, unit):
     branch, wt, cand = ws["branch"], ws["worktree"], j["candidate"]
     issue = (store.read_json(_issues_path(root, plan_id)).get("filed") or {}).get(unit["id"])
     body = pr_body(unit, issue, j)
-    pushed = push_branch(root, wt, branch, cand)
-    existing = _prs_for_branch(repo, branch)
+    existing = _prs_for_branch(repo, branch)  # inspected before any write (push, edit or create)
     if len(existing) > 1:
         raise GithubError("ambiguous: pull requests %s share head %s" % (", ".join("#%d" % i["number"] for i in existing), branch))
+    for e in existing:
+        if e.get("baseRefName") != target:
+            raise GithubError("pull request #%d for %s has base %r, not %r; refusing to touch it"
+                              % (e["number"], branch, e.get("baseRefName"), target))
+        if e.get("state") != "OPEN":
+            raise GithubError("pull request #%d for %s is %s; not editing it" % (e["number"], branch, e.get("state")))
+    pushed = push_branch(root, wt, branch, cand)
     with _bodyfile(root, body) as bf:
         if existing:
             num = existing[0]["number"]
-            if existing[0].get("state") != "OPEN":
-                raise GithubError("pull request #%d for %s is %s; not editing it" % (num, branch, existing[0].get("state")))
             _write(root, "pr_edit", ["pr", "edit", str(num), "-R", repo, "--body-file", bf], pr=num, branch=branch)
         else:
             r, amb = _write(root, "pr_create", ["pr", "create", "-R", repo, "--base", target, "--head", branch,

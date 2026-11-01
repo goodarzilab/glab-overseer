@@ -46,6 +46,8 @@ if a[0] == "issue" and a[1] == "create":
     n = len(st["issues"]) + 1
     st["issues"].append({"number": n, "id": 1000 + n, "title": opt("--title"), "body": open(opt("--body-file")).read(),
                          "state": "OPEN", "comments": [], "blockers": []})
+    if faults.get("dup_after_create"):
+        st["issues"].append(dict(st["issues"][-1], number=n + 1, id=1001 + n))
     if fault("create_then_fail"):
         die("Post \"https://api.github.com/graphql\": dial tcp 1.2.3.4:443: i/o timeout")
     out("https://github.com/%%s/issues/%%d\n" %% (repo, n))
@@ -79,7 +81,7 @@ def pr_json(p):
         ["git", "--git-dir", st["origin"], "rev-parse", "refs/heads/" + p["headRefName"]]).decode().strip()
     return p
 if a[0] == "pr" and a[1] == "list":
-    out(json.dumps([{k: p[k] for k in ("number", "state", "headRefName")} for p in st["prs"] if p["headRefName"] == opt("--head")]))
+    out(json.dumps([{k: p[k] for k in ("number", "state", "headRefName", "baseRefName")} for p in st["prs"] if p["headRefName"] == opt("--head")]))
 if a[0] == "pr" and a[1] == "create":
     n = len(st["prs"]) + 1
     st["prs"].append({"number": n, "state": "OPEN", "headRefName": opt("--head"), "baseRefName": opt("--base"),
@@ -109,6 +111,7 @@ class GhCase(Case):
             mock.patch.dict(os.environ, {k: v}).start()
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(G, "RETRY_DELAY", 0).start()
+        mock.patch.object(G, "POLL_WINDOW", 0).start()
 
     def gh_state(self, st=None):
         if st is not None:
@@ -269,12 +272,61 @@ class Filing(GhCase):
         self.assertEqual(rc, 1)
         self.assertIn("disagrees", err)
 
-    def test_truncated_listing_is_refused(self):
-        self.approve()
+    def test_listing_limit_is_exactly_1000_issues(self):
         row = {"number": 1, "title": "t", "body": "", "state": "OPEN"}
-        with mock.patch.object(G, "_read", return_value=[dict(row, number=i + 1) for i in range(G.LIST_LIMIT)]):
+        rows = lambda k: [dict(row, number=i + 1) for i in range(k)]
+        with mock.patch.object(G, "_read", return_value=rows(1000)) as m:
+            self.assertEqual(len(G.list_issues("o/r")), 1000)
+        self.assertEqual(m.call_args[0][0][m.call_args[0][0].index("--limit") + 1], "1001")
+        with mock.patch.object(G, "_read", return_value=rows(1001)):
             with self.assertRaises(G.GithubError):
                 G.list_issues("o/r")
+
+    def test_ambiguous_create_that_completes_late_is_adopted_not_duplicated(self):
+        self.approve()
+        self.fault(create_timeout_before=True)
+        self.assertEqual(self.cli("issues", "file")[0], 3)
+        self.assertIn("<!-- overseer plan=demo unit=alpha -->", jload(os.path.join(self.root, ".overseer", "github_pending.json")))
+        st = self.gh_state()  # the timed-out create completes while the rerun polls
+        late = {"number": 1, "id": 1001, "title": "Add alpha", "state": "OPEN", "comments": [], "blockers": [],
+                "body": "<!-- overseer plan=demo unit=alpha -->\n"}
+
+        def sleeper(_):
+            cur = self.gh_state()
+            if not cur["issues"]:
+                cur["issues"].append(late)
+                self.gh_state(cur)
+        with mock.patch.object(G, "POLL_WINDOW", 5.0), mock.patch.object(G, "POLL_INTERVAL", 0.01), \
+                mock.patch.object(G, "time", mock.Mock(time=G.time.time, sleep=sleeper)):
+            rc, _, err = self.cli("issues", "file")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.gh_state()["issues"]), 2)
+        self.assertEqual(len(self.calls("issue", "create")), 2)  # alpha once (timed out), crunch once
+        self.assertEqual(jload(os.path.join(self.root, ".overseer", "github_pending.json")), {})
+
+    def test_ambiguous_comment_is_polled_before_posting_again(self):
+        self.approve()
+        self.cli("issues", "file")
+        marker = "<!-- overseer close=2 -->"
+        G._pend(self.root, marker, "comment")
+
+        def sleeper(_):
+            st = self.gh_state()
+            if not st["issues"][1]["comments"]:
+                st["issues"][1]["comments"].append({"body": "late\n\n%s\n" % marker})
+                self.gh_state(st)
+        with mock.patch.object(G, "POLL_WINDOW", 5.0), mock.patch.object(G, "POLL_INTERVAL", 0.01), \
+                mock.patch.object(G, "time", mock.Mock(time=G.time.time, sleep=sleeper)):
+            self.assertFalse(G.ensure_comment(self.root, "lab-org/demo-repo", 2, "late", marker))
+        self.assertEqual(self.calls("issue", "comment"), [])
+
+    def test_duplicate_after_create_stops_with_report_and_touches_nothing(self):
+        self.approve()
+        self.fault(dup_after_create=True)
+        rc, _, err = self.cli("issues", "file")
+        self.assertEqual(rc, 1)
+        self.assertIn("DUPLICATE ISSUES for unit alpha: #1, #2", err)
+        self.assertEqual((self.calls("issue", "close"), self.calls("issue", "edit")), ([], []))
 
 
 class Links(GhCase):
@@ -398,7 +450,7 @@ class PullRequest(GhCase):
         self.run_unit('mkdir -p src; echo hi > src/alpha_x.py', expect="FAILED")
         rc, _, err = self.cli("pr", "alpha")
         self.assertEqual((rc, "no valid DONE judgment" in err), (1, True))
-        self.assertEqual(self.calls("pr"), [])
+        self.assertEqual(self.calls("pr", "create") + self.calls("pr", "edit"), [])
         self.assertEqual(sh(self.origin, "branch", "--list", "overseer/*"), "")
 
     def test_refuses_non_ancestor_remote_branch_and_never_pushes(self):
@@ -415,13 +467,41 @@ class PullRequest(GhCase):
         self.assertIn("not an ancestor", err)
         self.assertEqual(sh(self.origin, "rev-parse", "refs/heads/overseer/demo/alpha/a1"), diverged)
         self.assertNotEqual(diverged, j["candidate"])
-        self.assertEqual(self.calls("pr"), [])
+        self.assertEqual(self.calls("pr", "create") + self.calls("pr", "edit"), [])
 
     def test_ancestor_remote_branch_is_fast_forwarded_by_plain_push(self):
         j = self.done_unit()
         sh(self.wt(), "push", "-q", "origin", "%s:refs/heads/overseer/demo/alpha/a1" % j["base"])
         self.assertEqual(self.cli("pr", "alpha")[0], 0)
         self.assertEqual(sh(self.origin, "rev-parse", "refs/heads/overseer/demo/alpha/a1"), j["candidate"])
+
+    def test_existing_pr_with_other_base_is_refused_before_any_write(self):
+        self.done_unit()
+        st = self.gh_state()
+        st["prs"].append({"number": 1, "state": "OPEN", "headRefName": "overseer/demo/alpha/a1", "baseRefName": "dev",
+                          "title": "t", "body": "orig", "mergeCommit": None})
+        self.gh_state(st)
+        rc, _, err = self.cli("pr", "alpha")
+        self.assertEqual(rc, 1)
+        self.assertIn("base 'dev'", err)
+        self.assertEqual(self.gh_state()["prs"][0]["body"], "orig")
+        self.assertEqual(self.calls("pr", "edit"), [])
+        self.assertEqual(sh(self.origin, "branch", "--list", "overseer/*"), "")
+
+    def test_push_sends_the_judged_sha_not_a_later_commit(self):
+        j = self.done_unit()
+        real = G._judgment
+
+        def judged_then_raced(root, pid, unit):
+            r = real(root, pid, unit)
+            self.put("late.txt", "unjudged\n", base=self.wt())
+            sh(self.wt(), *(ID + ["add", "-A"]))
+            sh(self.wt(), *(ID + ["commit", "-q", "-m", "late"]))
+            return r
+        with mock.patch.object(G, "_judgment", judged_then_raced):
+            self.cli("pr", "alpha")
+        self.assertEqual(sh(self.origin, "rev-parse", "refs/heads/overseer/demo/alpha/a1"), j["candidate"])
+        self.assertNotEqual(sh(self.wt(), "rev-parse", "HEAD"), j["candidate"])
 
     def test_head_mismatch_on_read_back_is_an_error(self):
         self.done_unit()
@@ -506,10 +586,10 @@ class SourceRules(unittest.TestCase):
         self.assertGreater(seen, 0)
 
     def test_push_argv_is_plain(self):
-        self.assertEqual(G.push_argv("overseer/p/u/a1"), ["push", "origin", "overseer/p/u/a1:overseer/p/u/a1"])
-        for bad in ("+x", "-f", "a b", "a..b"):
+        self.assertEqual(G.push_argv("overseer/p/u/a1", "a" * 40), ["push", "origin", "%s:refs/heads/overseer/p/u/a1" % ("a" * 40)])
+        for bad, sha in (("+x", "a" * 40), ("-f", "a" * 40), ("a b", "a" * 40), ("a..b", "a" * 40), ("ok", "main")):
             with self.assertRaises(Exception):
-                G.push_argv(bad)
+                G.push_argv(bad, sha)
 
     def test_worker_side_modules_do_not_import_github(self):
         for name in ("adapters", "execution", "slurm", "workspace"):
