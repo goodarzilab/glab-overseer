@@ -295,6 +295,36 @@ def classify_dirty(wt, scope, outputs):
     return add, staged, reasons, sorted(set(oos))
 
 
+def index_flags(wt):
+    """Tracked paths whose index entry is assume-unchanged (lowercase tag) or skip-worktree (S): git
+    status hides their modifications. Never cleared here; the caller fails the judgment."""
+    out = git(wt, "ls-files", "-v", "-z", raw=True)["stdout"]
+    return sorted(t[2:] for t in zsplit(out) if t[0].islower() or t[0] == "S")
+
+
+def ignored_outputs(wt, scope, outputs):
+    """(paths, reasons): declared in-scope outputs that .gitignore hides from status.
+
+    Only these are force-added, by explicit path; other ignored files are never staged.
+    """
+    found, reasons = [], []
+    for p in sorted(outputs):
+        if not in_scope(p, scope) or not os.path.lexists(os.path.join(wt, p)):
+            continue
+        ents = parse_status(git(wt, "--literal-pathspecs", "status", "--porcelain=v1", "-z", "--ignored",
+                                "--", p, raw=True)["stdout"])
+        if not any(xy == "!!" for xy, _, _ in ents):
+            continue
+        full = os.path.join(wt, p)
+        if os.path.islink(full) or not os.path.isfile(full):
+            reasons.append("symlink_or_not_file:" + p)
+        elif prohibited_name(p):
+            reasons.append("prohibited_or_oversize:" + p)
+        else:
+            found.append(p)
+    return found, reasons
+
+
 def normalize(root, plan_id, unit, adir, n):
     """Check the worktree and seal a candidate. Returns dict(ok, reasons, candidate, out_of_scope_dirty, commits)."""
     ws = load_workspace(adir)
@@ -316,6 +346,10 @@ def normalize(root, plan_id, unit, adir, n):
         res["reasons"].append("base_not_ancestor")
         return res
     outputs = declared_outputs(unit)
+    flagged = index_flags(wt)
+    if flagged:
+        res["reasons"].append("index_flags:" + ",".join(flagged))
+        return res
     if git(wt, "rev-list", "--min-parents=2", "%s..HEAD" % base)["stdout"].strip():
         res["reasons"].append("merge_commit_in_range")
         return res
@@ -324,7 +358,8 @@ def normalize(root, plan_id, unit, adir, n):
         res["reasons"] += check_commit(wt, c, scope, outputs)
     res["commits"] = list(commits)
     add, staged, reasons, oos = classify_dirty(wt, scope, outputs)
-    res["reasons"] += reasons
+    forced, freasons = ignored_outputs(wt, scope, outputs)
+    res["reasons"] += reasons + freasons
     res["out_of_scope_dirty"] = oos
     res["reasons"] += ["out_of_scope_dirty:" + p for p in oos]
     if res["reasons"]:
@@ -332,6 +367,9 @@ def normalize(root, plan_id, unit, adir, n):
     if add:
         git(wt, "--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul",
             stdin="".join(p + "\0" for p in add))
+    if forced:
+        git(wt, "--literal-pathspecs", "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul",
+            stdin="".join(p + "\0" for p in forced))
     if git(wt, "diff", "--cached", "--quiet", ok=(0, 1))["rc"] == 1:
         git(wt, *(SUPERVISOR + ("commit", "--no-verify", "--no-gpg-sign", "-m",
                                 "overseer: %s/%s attempt %d changes" % (plan_id, unit["id"], n))))

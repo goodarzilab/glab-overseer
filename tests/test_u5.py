@@ -293,6 +293,43 @@ class CodeJudgment(Case):
         self.assertEqual((rc, json.loads(out)["status"]), (4, "UNCERTAIN"))
 
 
+class Hardening(Case):
+    def test_assume_unchanged_edit_fails_before_and_after_the_test(self):
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py; echo tampered >> README.md; '
+                          'git update-index --assume-unchanged README.md')
+        self.assertEqual((j["status"], j["reasons"]), ("FAILED", ["index_flags:README.md"]))
+        self.assertIsNone(j["test_rc"])  # caught before the (possibly altered) test ran
+
+    def test_test_command_that_hides_its_edit_with_a_flag_fails(self):
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py',
+                          unit={"test_command": "git update-index --skip-worktree src/alpha.py; echo x >> src/alpha.py"})
+        self.assertEqual(j["status"], "FAILED")
+        self.assertIn("index_flags:src/alpha.py", j["reasons"])
+
+    def test_validator_runs_on_the_committed_blob_outside_the_worktree(self):
+        wt, head = Predicates.repo(self)
+        self.put("ok.txt", "changed\n", base=wt)  # the live file differs from the candidate
+        v = 'test "$(cat "$OVERSEER_OUTPUT")" = hello && test "$(pwd)" != "%s" && ! test -e "$(pwd)/.git"' % wt
+        res = J.code_outputs(wt, head, {"outputs": [{"path": "ok.txt", "validate": v}]})
+        self.assertEqual(res[0]["problems"], [])
+        with open(os.path.join(wt, "ok.txt")) as f:
+            self.assertEqual(f.read(), "changed\n")
+
+    def test_validator_that_modifies_the_worktree_fails_judgment(self):
+        target = os.path.join(self.attempt_dir(), "worktree", "src", "alpha.py")
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py',
+                          unit={"outputs": [{"path": "src/alpha.py", "validate": "echo x >> %s" % target}]})
+        self.assertEqual(j["status"], "FAILED")
+        self.assertTrue(any(r.startswith("validator_modified_tracked:") for r in j["reasons"]), j["reasons"])
+
+    def test_gitignored_declared_output_is_force_added_but_other_ignored_files_are_not(self):
+        j = self.run_unit('mkdir -p src; echo a > src/alpha.py; echo j > src/alpha_junk.log; '
+                          'printf "src/alpha.py\\nsrc/alpha_junk*\\n" >> "$(git rev-parse --git-path info/exclude)"',
+                          expect="DONE")
+        self.assertEqual(sh(self.wt(), "ls-files", "src"), "src/alpha.py\nsrc/alpha_old.py")
+        self.assertTrue(os.path.exists(os.path.join(self.wt(), "src", "alpha_junk.log")))
+
+
 class Dispatch(Case):
     def test_dispatch_refuses_without_models_cache_or_for_unavailable_host(self):
         self.approve()

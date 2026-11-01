@@ -11,6 +11,8 @@ environment: they are plan content, approved with the plan.
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 
 from . import approval, env as E, execution as X, paths, store, workspace as W
 
@@ -110,9 +112,19 @@ def code_outputs(wt, candidate, unit):
         else:
             sha = meta[2]
             size = int(W.git(wt, "cat-file", "-s", sha)["stdout"].strip())
-            full = os.path.join(wt, p)
-            problems = _predicate(o, 0, size, lambda: W.git(wt, "cat-file", "blob", sha, raw=True)["stdout"],
-                                  _validate_runner(wt, full))
+            def blob(sha=sha):
+                return W.git(wt, "cat-file", "blob", sha, raw=True)["stdout"]
+
+            def run_v(cmd, p=p, blob=blob):  # the committed blob in a scratch directory, never the worktree
+                tmp = tempfile.mkdtemp(prefix="ovr-validate-")
+                try:
+                    f = os.path.join(tmp, os.path.basename(p))
+                    with open(f, "wb") as fh:
+                        fh.write(blob())
+                    return _validate_runner(tmp, f)(cmd)
+                finally:
+                    shutil.rmtree(tmp, True)
+            problems = _predicate(o, 0, size, blob, run_v)
         results.append({"path": p, "ok": not problems, "problems": problems})
     return results
 
@@ -163,6 +175,21 @@ def _tracked_changes(wt):
                                                   "--ignore-submodules=none", raw=True)["stdout"])]
 
 
+def _worktree_problems(wt, cand, who):
+    """HEAD must still be the candidate, no index flag may hide a change, and no tracked file may differ."""
+    out = []
+    if W.rev(wt, "HEAD") != cand:
+        out.append("head_moved_by_%s" % who)
+    flagged = W.index_flags(wt)
+    if flagged:
+        out.append("index_flags:" + ",".join(flagged))
+    else:
+        changed = _tracked_changes(wt)
+        if changed or W.git(wt, "diff", "--no-ext-diff", "--quiet", "HEAD", "--", ok=(0, 1))["rc"] == 1:
+            out.append("%s_modified_tracked:%s" % (who, ",".join(sorted(changed))))
+    return out
+
+
 def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
     j = {"status": "FAILED", "base": None, "candidate": None, "test_rc": None, "outputs": [], "reasons": [],
          "execution": ev, "out_of_scope_dirty": [], "invocation_token": None}
@@ -188,14 +215,11 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
         j["reasons"].append("test_timeout:%gs" % timeout)
     elif r["rc"] != 0:
         j["reasons"].append("test_failed:rc=%s" % r["rc"])
-    if W.rev(wt, "HEAD") != cand:
-        j["reasons"].append("head_moved_by_test")
-    changed = _tracked_changes(wt)
-    if changed:
-        j["reasons"].append("test_modified_tracked:" + ",".join(sorted(changed)))
+    j["reasons"] += _worktree_problems(wt, cand, "test")
     if not j["reasons"]:
         j["outputs"] = code_outputs(wt, cand, unit)
         j["reasons"] += ["output_failed:%s: %s" % (o["path"], "; ".join(o["problems"])) for o in j["outputs"] if not o["ok"]]
+        j["reasons"] += _worktree_problems(wt, cand, "validator")
     if not j["reasons"]:
         j["status"] = "DONE"
     return j
