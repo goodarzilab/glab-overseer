@@ -1,0 +1,7 @@
+# Host-specific survey, planning and run state. Never committed: this repo is
+# public and carries no cluster names, accounts, paths or credentials.
+.swarm/
+.hanig/
+.overseer/
+__pycache__/
+*.pyc
