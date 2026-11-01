@@ -1,0 +1,76 @@
+"""Worker and supervisor environments, plus a timeout-safe subprocess runner.
+
+`worker_env` is built from an allowlist, then a denylist removes LLM keys,
+routing variables and GitHub tokens from the result (including explicit
+extras). `supervisor_env` keeps everything except LLM entries, so `gh` still
+authenticates.
+"""
+import fnmatch
+import os
+import shutil
+import signal
+import subprocess
+
+ALLOW = [
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TZ", "TMPDIR",
+    "XDG_*_HOME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS", "SLURM_*",
+]
+LLM_DENY = [
+    "*_API_KEY", "ANTHROPIC_*", "CLAUDE_CODE_USE_*", "OPENAI_*", "OPENROUTER_*",
+    "GEMINI_*", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "*_BASE_URL",
+]
+WORKER_DENY = LLM_DENY + ["*_TOKEN", "GH_*", "GITHUB_*", "AWS_*"]
+
+
+def _match(name, patterns):
+    up = name.upper()
+    return any(fnmatch.fnmatchcase(up, p.upper()) for p in patterns)
+
+
+def worker_env(base=None, extras=None):
+    base = os.environ if base is None else base
+    out = {k: v for k, v in base.items() if _match(k, ALLOW)}
+    out.update(extras or {})
+    return {k: v for k, v in out.items() if not _match(k, WORKER_DENY)}
+
+
+def supervisor_env(base=None):
+    base = os.environ if base is None else base
+    return {k: v for k, v in base.items() if not _match(k, LLM_DENY)}
+
+
+def llm_key_names(base=None):
+    """Names (never values) of LLM credential or routing variables present."""
+    base = os.environ if base is None else base
+    return sorted(k for k in base if _match(k, LLM_DENY))
+
+
+def run_tool(argv, env, timeout, cwd=None, stdin=None):
+    """Run argv with a timeout; returns dict(rc, stdout, stderr, timed_out).
+
+    A timeout yields rc None and timed_out True (the whole process group is
+    killed). A missing binary yields rc 127. Output is decoded leniently.
+    """
+    exe = argv[0]
+    if os.sep not in exe:
+        exe = shutil.which(exe, path=env.get("PATH", "")) or exe
+    try:
+        p = subprocess.Popen([exe] + list(argv[1:]), env=env, cwd=cwd, start_new_session=True,
+                             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        return {"rc": 127, "stdout": "", "stderr": "command not found or not executable: %s" % e,
+                "timed_out": False}
+    timed_out = False
+    try:
+        out, err = p.communicate(stdin.encode("utf-8") if stdin is not None else None, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        out, err = p.communicate()
+    return {"rc": None if timed_out else p.returncode, "timed_out": timed_out,
+            "stdout": out.decode("utf-8", "replace"), "stderr": err.decode("utf-8", "replace")}

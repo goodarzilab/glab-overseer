@@ -1,0 +1,12 @@
+[
+  {"type": "system", "subtype": "init", "cwd": "/work/dir", "session_id": "00000000-0000-0000-0000-000000000001",
+   "tools": ["Bash", "Edit", "Read", "Write"], "mcp_servers": [], "model": "claude-haiku-5-5",
+   "permissionMode": "auto", "apiKeySource": "none", "claude_code_version": "0.0.0"},
+  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}]}},
+  {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}},
+  {"type": "user", "message": {"role": "user", "content": []}},
+  {"type": "result", "subtype": "success", "is_error": false, "api_error_status": null, "num_turns": 2,
+   "session_id": "00000000-0000-0000-0000-000000000001", "total_cost_usd": 0.01,
+   "usage": {"input_tokens": 4, "output_tokens": 264}, "terminal_reason": "completed",
+   "result": "Committed `hello.txt` as `abc1234` on `main`."}
+]
