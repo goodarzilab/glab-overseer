@@ -274,6 +274,8 @@ class ChoiceAndRefusals(SlurmCase):
                         self.launch("j1", argv, kind="author", plan="sl")
         inv = os.path.join(self.root, ".overseer", "plans", "sl", "units", "j1", "attempts", "a1", "inv")
         self.assertFalse(os.path.exists(inv))
+        with self.assertRaisesRegex(X.ExecutionError, "login node"):  # the payload env cannot hide sbatch
+            self.launch("j1", argv, kind="author", plan="sl", env={"PATH": self.sysbin})
         self.launch("j1", argv, kind="job", plan="sl")  # a job unit may run locally
         with mock.patch.dict(os.environ, {"SLURM_JOB_ID": "7"}):  # inside an allocation
             self.launch("j2", argv, kind="author", plan="sl")
@@ -660,6 +662,10 @@ class Evidence(SlurmCase):
             f.write("x\n" * 300 + "y\n" * 20 + "DUE TO TIME LIMIT\n")  # inside the last edge
         with mock.patch.object(S, "LOG_FULL_MAX", 400), mock.patch.object(S, "LOG_EDGE", 50):
             self.assertEqual(S.scan_logs(adir, "9")[0], ["time_limit@slurm-9.out"])
+        with open(out, "w") as f:  # the failure line straddles the start of the last edge
+            f.write("x\n" * 300 + "z" * 20 + "DUE TO TIME LIMIT" + "q" * 20 + "\n")
+        with mock.patch.object(S, "LOG_FULL_MAX", 400), mock.patch.object(S, "LOG_EDGE", 50):
+            self.assertEqual(S.scan_logs(adir, "9")[0], ["time_limit@slurm-9.out"])
         ok0 = {"rc": 0, "signal": None}
         sq = {"outcome": "absent"}
         done = {"outcome": "known", "state": "COMPLETED", "exit": "0:0"}
@@ -685,6 +691,31 @@ class Evidence(SlurmCase):
         with mock.patch.object(S, "LOG_FULL_MAX", 100), mock.patch.object(S, "LOG_EDGE", 20):
             self.assertEqual(self.status(rec)["state"], "UNCERTAIN")
         self.assertEqual(self.evidence(rec)["sources"]["logs"]["files"]["slurm-4242.out"], "partial")
+
+    def test_comment_less_sites_keep_active_jobs_active(self):
+        rec = self.dispatch()
+        self.exit_rec(rec, 0)
+        self.shim("squeue", 'echo "4242|n|(null)|RUNNING|None"')  # the site shows no comments
+        self.assertEqual(self.status(rec)["state"], "RUNNING")
+        self.shim("squeue", "true")
+        self.shim("scontrol", 'echo "JobId=4242 JobName=n"; echo "   JobState=RUNNING ExitCode=0:0"')
+        self.assertEqual(self.status(rec)["state"], "RUNNING")
+        self.shim("scontrol", 'echo "JobId=4242 JobName=n"; echo "   JobState=COMPLETED ExitCode=0:0"')
+        self.assertEqual(self.status(rec)["state"], "UNCERTAIN")  # terminal with unknown identity is no evidence
+
+    def test_current_mismatch_never_falls_back_to_the_cache(self):
+        rec = self.dispatch()
+        self.fake("scontrol.state", "FAILED 3:0")
+        self.assertEqual(self.status(rec)["verdict"], "FAILED")
+        self.unfake("scontrol.state")
+        self.exit_rec(rec, 0)
+        self.shim("scontrol", 'echo "JobId=4242 JobName=n"; echo "   JobState=COMPLETED ExitCode=0:0"; '
+                              'echo "   Comment=someone-else"')  # the id now belongs to another job
+        self.assertEqual(self.status(rec)["state"], "UNCERTAIN")
+        ok0 = {"rc": 0, "signal": None}
+        self.assertEqual(S.judge({"outcome": "absent"}, {"outcome": "mismatch"}, None, ok0, [])[0], "UNCERTAIN")
+        unk = {"outcome": "listed", "state": "RUNNING", "identity": "unknown"}
+        self.assertEqual(S.judge(unk, None, None, ok0, [])[0], "RUNNING")
 
     def test_scheduler_terminal_state_survives_scontrol_forgetting(self):
         rec = self.dispatch()
@@ -774,6 +805,58 @@ class Abort(SlurmCase):
         X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None)
         self.assertEqual(self.calls("scancel"), ["4242"])
 
+    def test_unidentified_abort_adopts_a_job_that_shows_up_later(self):
+        with mock.patch.object(S, "submit", side_effect=Crash):
+            with self.assertRaises(Crash):
+                self.dispatch()
+        inv = next(X.iter_invocations(self.root, "sl", "j1"))["path"]
+        self.assertEqual(X.abort_invocation(self.root, inv), "UNIDENTIFIED")
+        self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
+        tok = self.rec(inv, "intent.json")["token"]
+        store.write_json_atomic(os.path.join(inv, "start.json"), {"token": tok, "pid": 1, "job_id": "4242"})
+        self.fake("squeue.state", "RUNNING")
+        self.fake("sbatch.calls", "x --comment %s --job-name n\n" % tok)
+        self.assertEqual(X.invocation_status(inv, True)["state"], "CANCELLING")  # identified, cancel outstanding
+        self.assertNotIn("unidentified", self.rec(inv, "cancel.json"))
+        X.abort_invocation(self.root, inv, grace=0, sleep=lambda s: None)  # now verified and cancelled
+        self.assertEqual(self.calls("scancel"), ["4242"])
+
+    def test_cancel_is_not_confirmed_while_scontrol_says_the_job_is_active(self):
+        rec = self.dispatch()
+        self.fake("squeue.state", "RUNNING")
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "UNCONFIRMED")
+        self.unfake("squeue.state")  # gone from squeue, wrapper exited, but scontrol still shows COMPLETING
+        self.exit_rec(rec, 143, "TERM")
+        self.fake("scontrol.state", "COMPLETING 0:0")
+        self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "CANCELLING")
+        self.fake("scontrol.state", "CANCELLED 0:15")
+        self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "CANCELLED")
+
+    def test_events_and_root_for_slurm_abort(self):
+        rec = self.dispatch()
+        self.exit_rec(rec, 143, "TERM")
+        self.fake("squeue.state", "RUNNING")
+        X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None)
+        self.unfake("squeue.state")
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=0, sleep=lambda s: None), "CANCELLED")
+        kinds = [e["kind"] for e in store.read_events(self.root) if e["kind"].startswith("cancel_")]
+        self.assertEqual(kinds, ["cancel_requested", "cancel_confirmed"])
+        intent = self.rec(rec["dir"], "intent.json")
+        self.assertEqual(S._root_of(rec["dir"], intent), self.root)
+        self.assertIsNone(S._root_of(rec["dir"], dict(intent, unit_id="other")))
+
+    def test_status_command_prints_job_id_for_active_slurm_invocation(self):
+        self.dispatch()
+        self.fake("squeue.state", "RUNNING")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--root", self.root, "status"]), 0)
+        self.assertIn("RUNNING job=4242", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--root", self.root, "status", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["plans"]["sl"]["units"]["j1"]["active"][0]["job_id"], "4242")
+
     def test_abort_without_job_id_is_unidentified(self):
         with mock.patch.object(S, "submit", side_effect=Crash):
             with self.assertRaises(Crash):
@@ -808,12 +891,20 @@ class Handshake(SlurmCase):
         os.unlink(os.path.join(self.root, ".overseer", "handshake.json"))
         self.fake("sbatch.run")
         self.fake("sbatch.blind")
+        self.fake("squeue.state", "RUNNING")  # listed with the handshake token as its comment
         with self.assertRaisesRegex(S.SlurmError, "does not see"):
             self.hs(timeout=1)
         self.assertFalse(os.path.exists(os.path.join(self.root, ".overseer", "handshake.json")))
         self.assertEqual(self.calls("scancel"), ["4242"])
         with self.assertRaises(S.SlurmError):
             self.dispatch()
+
+    def test_handshake_timeout_never_scancels_a_job_that_is_not_ours(self):
+        os.unlink(os.path.join(self.root, ".overseer", "handshake.json"))
+        self.shim("squeue", 'echo "4242|reused|someone-elses-token|RUNNING|None"')
+        with self.assertRaisesRegex(S.SlurmError, "scancel skipped"):
+            self.hs(timeout=0.3)
+        self.assertEqual(self.calls("scancel"), [])
 
     def test_wrong_nonce_fails_and_missing_resources_refuse_before_sbatch(self):
         os.unlink(os.path.join(self.root, ".overseer", "handshake.json"))

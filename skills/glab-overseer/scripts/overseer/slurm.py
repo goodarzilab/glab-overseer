@@ -37,6 +37,8 @@ REJECTION_RE = re.compile("|".join((
     "invalid partition", "invalid account", "invalid qos", "requested node configuration is not available",
     "requested time limit", "memory specification", "job violates accounting/qos policy",
     "access/permission denied", "invalid feature specification", "invalid generic resource")), re.I)
+NO_COMMENT = ("", "(null)")
+CACHE_OK = ("not_known", "timed_out", "error")  # never after a mismatch: the id may belong to another job
 LOG_FULL_MAX = 256 * 1024 * 1024
 LOG_EDGE = 16 * 1024 * 1024
 
@@ -228,11 +230,24 @@ def job_name(intent):
     return "overseer-%s-a%d-%s" % (intent["unit_id"], intent["attempt"], intent["token"][:8])
 
 
+def _verified(s):
+    """A scheduler record that is bound to our token (a comment-less record is identity unknown)."""
+    return bool(s) and s.get("outcome") in ("listed", "known") and s.get("identity") != "unknown"
+
+
+def _owned(job_id, token):
+    """(job carries our full token per squeue or scontrol, squeue view); used before any scancel."""
+    sq = squeue_view(query_squeue(), job_id, token)
+    return _verified(sq) or _verified(query_scontrol(job_id, token)), sq
+
+
 def squeue_view(sq, job_id, token):
     if sq["outcome"] != "ok":
         return dict((k, v) for k, v in sq.items() if k != "rows")
     for row in sq["rows"]:
         if row["id"] == job_id:
+            if row["comment"].strip() in NO_COMMENT:  # a site that hides comments: identity unknown, not a mismatch
+                return {"outcome": "listed", "state": row["state"], "identity": "unknown"}
             if row["comment"] != token:
                 return {"outcome": "mismatch", "comment": row["comment"]}
             return {"outcome": "listed", "state": row["state"]}
@@ -251,9 +266,11 @@ def query_scontrol(job_id, token):
     state = (kv.get("JobState") or "").split("+")[0]
     if kv.get("JobId") != job_id or not state or not EXIT_RE.match(kv.get("ExitCode", "")):
         return dict(_raw(r), outcome="unparseable")
-    if kv.get("Comment") != token:
-        return dict(_raw(r), outcome="mismatch", comment=kv.get("Comment"))
-    return dict(_raw(r), outcome="known", state=state, exit=kv["ExitCode"])
+    comment = kv.get("Comment")
+    if comment is not None and comment not in NO_COMMENT and comment != token:
+        return dict(_raw(r), outcome="mismatch", comment=comment)
+    ident = {} if comment == token else {"identity": "unknown"}
+    return dict(_raw(r), outcome="known", state=state, exit=kv["ExitCode"], **ident)
 
 
 def query_sacct(job_id, name):
@@ -314,8 +331,7 @@ def scan_logs(adir, job_id):
                     seen[name] = "read"
                 else:
                     _scan_lines(f, LOG_EDGE, found)
-                    f.seek(size - LOG_EDGE)
-                    f.readline()  # drop the partial line the seek landed in
+                    f.seek(size - LOG_EDGE)  # scan the edge from its first byte
                     _scan_lines(f, LOG_EDGE, found)
                     seen[name] = "partial"
         except OSError:
@@ -350,11 +366,15 @@ def judge(squeue, scontrol, sacct, exit_rec, log_hits, logs_partial=False):
         out = s.get("outcome") if s else "not_consulted"
         state = s.get("state") if s and out in ("listed", "known") else None
         ev.append("%s:%s%s" % (name, out, ":" + state if state else ""))
+        if out == "mismatch":
+            unsure.append("%s record belongs to another job" % name)
         if state is None:
             continue
         c = _cls(state)
         if c in ("QUEUED", "RUNNING"):
-            active = active or c
+            active = active or c  # an active record of unknown identity keeps the invocation active
+        elif s.get("identity") == "unknown":
+            unsure.append("%s state %r has unknown identity" % (name, state))
         elif c is None:
             unsure.append("%s state %r not recognised" % (name, state))
         elif name == "squeue":
@@ -398,11 +418,11 @@ def gather(inv, intent, launch):
     src = {"squeue": squeue_view(query_squeue(), jid, tok), "scontrol": None, "sacct": None}
     if src["squeue"]["outcome"] != "listed" or _cls(src["squeue"].get("state")) == "terminal":
         sc = src["scontrol"] = query_scontrol(jid, tok)
-        if sc["outcome"] != "known" and (prev.get("scontrol") or {}).get("outcome") == "known":
+        if sc["outcome"] in CACHE_OK and _verified(prev.get("scontrol")):
             sc = src["scontrol"] = dict(prev["scontrol"], cached=True)  # scontrol forgets finished jobs
         if sc["outcome"] != "known":
             sa = src["sacct"] = query_sacct(jid, job_name(intent))
-            if sa["outcome"] != "known" and (prev.get("sacct") or {}).get("outcome") == "known":
+            if sa["outcome"] in CACHE_OK and _verified(prev.get("sacct")):
                 src["sacct"] = dict(prev["sacct"], cached=True)
     ex = X._load(os.path.join(inv, "exit.json"))
     exit_rec = ex if ex is not None and X._exit_matches(ex, intent) else None
@@ -560,11 +580,14 @@ def launch(root, plan_id, unit_id, attempt, kind, argv, cwd, stdin_text=None, ex
 
 # ---- abort -----------------------------------------------------------------------
 
-def _root_of(inv):
-    d = os.path.abspath(inv)
-    for _ in range(8):
-        d = os.path.dirname(d)
-    return os.path.dirname(d) if os.path.basename(d) == paths.STATE_DIRNAME else None
+def _root_of(inv, intent):
+    """Project root from the invocation path, checked against the known layout; None if it differs."""
+    tail = [paths.STATE_DIRNAME, "plans", intent["plan_id"], "units", intent["unit_id"], "attempts",
+            "a%d" % intent["attempt"], "inv", os.path.basename(inv)]
+    parts = os.path.abspath(inv).split(os.sep)
+    if parts[-len(tail):] != tail:
+        return None
+    return os.sep.join(parts[:-len(tail)]) or os.sep
 
 
 def cancel_check(inv, intent, cancel):
@@ -573,13 +596,14 @@ def cancel_check(inv, intent, cancel):
     if not (launch is not None and X._valid_launch(launch, intent)):
         return False
     _, _, src, exit_rec = gather(inv, intent, launch)
-    cancelled = any(s and s.get("outcome") == "known" and s.get("state", "").startswith("CANCELLED")
-                    for s in (src["scontrol"], src["sacct"]))
-    if not (src["squeue"]["outcome"] == "absent" and (cancelled or exit_rec is not None)):
+    cancelled = any(_verified(s) and s["state"].startswith("CANCELLED") for s in (src["scontrol"], src["sacct"]))
+    sc = src["scontrol"]
+    active = bool(sc) and sc.get("outcome") == "known" and _cls(sc["state"]) in ("QUEUED", "RUNNING")
+    if not (src["squeue"]["outcome"] == "absent" and not active and (cancelled or exit_rec is not None)):
         return False
     cancel["confirmed_at"] = store.utc_now()
     store.write_json_atomic(os.path.join(inv, "cancel.json"), cancel)
-    root = _root_of(inv)
+    root = _root_of(inv, intent)
     if root:
         store.append_event(root, "cancel_confirmed", plan_id=intent["plan_id"], unit_id=intent["unit_id"],
                            attempt=intent["attempt"], invocation=os.path.basename(inv))
@@ -604,8 +628,7 @@ def abort(root, inv, intent, confirm_wait=30.0, sleep=time.sleep):
         store.append_event(root, "cancel_requested", **ref)
     prev = cancel.get("scancel")
     if prev is None or prev.get("retryable") is True:  # a timed-out scancel is ambiguous: never repeated
-        sq = squeue_view(query_squeue(), launch["job_id"], intent["token"])
-        mine = sq["outcome"] == "listed" or query_scontrol(launch["job_id"], intent["token"])["outcome"] == "known"
+        mine, sq = _owned(launch["job_id"], intent["token"])
         if not mine:  # the recorded id may belong to another job now: never scancel on a bare id
             reason = "job %s cannot be shown to carry this invocation's token; not cancelled" % launch["job_id"]
             store.write_json_atomic(cpath, dict(cancel, unidentified=reason))
@@ -685,7 +708,10 @@ def handshake(root, plan_id=None, timeout=600.0, poll=5.0, sleep=time.sleep):
                             and isinstance(reply.get("host"), str) and reply["host"]):
         why = "reply from job %s does not carry the nonce and a hostname" % jid
     if why:
-        _tool(["scancel", jid], QUERY_TIMEOUT)
+        if _owned(jid, token)[0]:  # the same identity check as abort: never scancel a bare id
+            _tool(["scancel", jid], QUERY_TIMEOUT)
+        else:
+            why += " (scancel skipped: the job cannot be shown to carry the handshake token)"
         store.write_json_atomic(os.path.join(d, "result.json"), {"ok": False, "reason": why, "time": store.utc_now()})
         raise SlurmError("handshake failed: " + why)
     rec = {"root": root, "time": store.utc_now(), "token": token, "job_id": jid, "host": reply["host"]}

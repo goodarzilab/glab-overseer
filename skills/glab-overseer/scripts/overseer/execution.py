@@ -242,8 +242,14 @@ def invocation_status(inv, write=False):
         return {"state": "UNCERTAIN", "reason": "intent.json is invalid"}
     cancel = _load(os.path.join(inv, "cancel.json"))
     if isinstance(cancel, dict) and cancel.get("token") == intent["token"] and "unidentified" in cancel:
-        # an unidentifiable payload may still run: exit.json cannot clear it, only an orchestrator resolve
-        return {"state": "UNCERTAIN", "reason": "cancel unidentified: %s" % cancel["unidentified"]}
+        # an unidentifiable payload may still run: exit.json cannot clear it, only an orchestrator resolve.
+        # A batch job whose id turns up later (squeue token, own start.json) is identified again and the
+        # cancel request stays outstanding, so a later abort verifies and cancels it.
+        if not (write and intent["backend"] != "local" and _load(os.path.join(inv, "launch.json")) is None
+                and _reconcile_launch(inv, intent, True)):
+            return {"state": "UNCERTAIN", "reason": "cancel unidentified: %s" % cancel["unidentified"]}
+        cancel = {"token": intent["token"], "requested_at": cancel.get("requested_at") or store.utc_now()}
+        store.write_json_atomic(os.path.join(inv, "cancel.json"), cancel)
     if _cancel_pending(cancel, intent):  # an abort is outstanding: hold the slot until it confirms
         check = CANCEL_CHECK.get(intent["backend"])
         if not (write and check and check(inv, intent, cancel)):
@@ -497,7 +503,7 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
             raise ExecutionError("invalid environment variable %r: names must be shell identifiers, must not "
                                  "start with %s or equal %s, and values must be strings" % (k, RESERVED_PREFIX, TOKEN_VAR))
     if backend == "local" and kind != "job":
-        problem = slurm.local_agent_problem(root, env)
+        problem = slurm.local_agent_problem(root)  # the supervisor's own environment, not the payload's
         if problem:
             raise ExecutionError(problem)
     approval.require_approval(root, plan_id)
@@ -850,7 +856,8 @@ def collect_status(root, write=False):
             units[u["id"]] = dict(
                 dict((f, st[f]) for f in approval.FACETS), kind=u["kind"], attempts=st["counters"]["attempts"],
                 active=[{"attempt": i["attempt"], "invocation": i["seq"], "kind": i["kind"],
-                         "state": i["status"]["state"], "pid": i["status"].get("pid")}
+                         "state": i["status"]["state"], "pid": i["status"].get("pid"),
+                         "job_id": i["status"].get("job_id")}
                         for i in act if i["unit_id"] == u["id"]])
         plans[pid] = {"workers_cap": plan["caps"]["workers"], "slots_in_use": slots_in_use(root, write, pid),
                       "units": units}
@@ -875,7 +882,8 @@ def run_status(args):
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
                 u["closure"].get("state"), u["attempts"]))
             for a in u["active"]:
-                print("    a%d/%s %s pid=%s" % (a["attempt"], a["invocation"], a["state"], a["pid"]))
+                print("    a%d/%s %s %s" % (a["attempt"], a["invocation"], a["state"],
+                                   "job=%s" % a["job_id"] if a.get("job_id") else "pid=%s" % a.get("pid")))
     return 0
 
 from . import slurm  # noqa: E402  registers the slurm hooks; slurm imports this module
