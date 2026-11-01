@@ -229,6 +229,19 @@ CANCEL_CHECK = {}  # backend -> fn(inv, intent, cancel) -> True once a pending c
 
 
 def invocation_status(inv, write=False):
+    """`_invocation_status`, except that an orchestrator resolution (resolved.json bound to the
+    invocation token, written by `resolve`) turns UNCERTAIN or CANCELLING into RESOLVED, which
+    is not active and so releases the slot."""
+    st = _invocation_status(inv, write)
+    if st["state"] in ("UNCERTAIN", "CANCELLING"):
+        intent, res = _load(os.path.join(inv, "intent.json")), _load(os.path.join(inv, "resolved.json"))
+        if (isinstance(intent, dict) and isinstance(res, dict) and isinstance(intent.get("token"), str)
+                and res.get("token") == intent["token"] and res.get("as") in ("done", "failed")):
+            return {"state": "RESOLVED", "as": res["as"]}
+    return st
+
+
+def _invocation_status(inv, write=False):
     """State of one invocation directory: dict with `state` and details.
 
     States: NOT_LAUNCHED (no intent, nothing started), LAUNCH_FAILED, QUEUED, RUNNING,
@@ -479,18 +492,18 @@ def _spawn_local(inv, run_sh, envd, cwd):
 
 
 def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend="local",
-                      stdin_text=None, env=None, extras=None, spawn=None, extra_intent=None):
+                      stdin_text=None, env=None, extras=None, spawn=None, extra_intent=None, prepare=None):
     """Launch one author, fixer or job invocation; returns its record (intent plus launch plus `dir`).
 
     The caller holds the project lock and has allocated the attempt. `argv[0]` is
     resolved to an absolute path on the scrubbed worker PATH. `spawn(inv, run_sh, env, cwd)`
     returns launch fields (including `pid` for the local backend); the default is the
     detached local spawn, which other backends replace together with a PROBES entry.
+    `prepare(inv)` (with `argv` None) runs once the invocation directory exists and returns
+    (argv, stdin_text), so a task file can be written inside that directory.
     """
     if kind not in KINDS:
         raise ExecutionError("kind must be one of %s" % ", ".join(KINDS))
-    if not (isinstance(argv, list) and argv and all(isinstance(a, str) and "\0" not in a for a in argv)):
-        raise ExecutionError("argv must be a non-empty list of strings")
     if not (isinstance(cwd, str) and os.path.isabs(cwd) and os.path.isdir(cwd)):
         raise ExecutionError("cwd must be an existing absolute directory")
     if not (isinstance(backend, str) and backend):
@@ -513,16 +526,27 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
         raise ExecutionError("attempt a%d of %s is not allocated" % (attempt, unit_id))
     check_slots(root, plan_id, cap)
     envd = E.worker_env(base=env, extras=extras)
-    exe = E.resolve_exe(argv[0], envd.get("PATH", ""), cwd)
-    if exe is None:
-        raise ExecutionError("command %r not found (only absolute PATH entries are searched)" % argv[0])
-    argv = [exe] + argv[1:]
+
+    def resolved(argv, stdin_text):
+        if not (isinstance(argv, list) and argv and all(isinstance(a, str) and "\0" not in a for a in argv)):
+            raise ExecutionError("argv must be a non-empty list of strings")
+        if stdin_text is not None and not isinstance(stdin_text, str):
+            raise ExecutionError("stdin_text must be a string")
+        exe = E.resolve_exe(argv[0], envd.get("PATH", ""), cwd)
+        if exe is None:
+            raise ExecutionError("command %r not found (only absolute PATH entries are searched)" % argv[0])
+        return [exe] + argv[1:]
+    if prepare is None:
+        argv = resolved(argv, stdin_text)
     invroot = os.path.join(adir, "inv")
     os.makedirs(invroot, exist_ok=True)
     names = _sorted_dirs(invroot, INV_RE)
     seq = "%02d-%s" % ((int(names[-1].split("-")[0]) + 1) if names else 1, kind)
     inv = os.path.join(invroot, seq)
     os.mkdir(inv)
+    if prepare is not None:
+        argv, stdin_text = prepare(inv)
+        argv = resolved(argv, stdin_text)
     intent = {"token": uuid.uuid4().hex, "kind": kind, "argv": argv, "argv_sha256": argv_digest(argv),
               "backend": backend, "cwd": cwd, "time": store.utc_now(), "run_sh": os.path.join(inv, "run.sh"),
               "plan_id": plan_id, "unit_id": unit_id, "attempt": attempt}
@@ -560,6 +584,16 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
     return dict(intent, launch=launch, dir=inv, seq=seq)
 
 
+def acquire_attempt(root, plan_id, uid, after_quota=False):
+    """The attempt to launch into: an allocated one that never launched anything is reused, not burned."""
+    last = _admit(root, plan_id, uid, after_quota)[2]
+    if last and all(invocation_status(i["path"], True)["state"] in ("NOT_LAUNCHED", "LAUNCH_FAILED")
+                    for i in iter_invocations(root, plan_id, uid) if i["attempt"] == last) \
+            and not os.path.exists(os.path.join(paths.attempt_dir(root, plan_id, uid, last), "classification.json")):
+        return last, paths.attempt_dir(root, plan_id, uid, last)
+    return allocate_attempt(root, plan_id, uid, after_quota)
+
+
 def dispatch_job(root, plan_id, unit, after_quota=False):
     """Run a job unit's command through the local backend with OVERSEER_OUT set."""
     plan = approval.effective_plan(root, plan_id)
@@ -568,16 +602,7 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     if backend == "slurm":
         slurm.preflight(root, plan, unit)  # refuses before any attempt is allocated or sbatch runs
     check_slots(root, plan_id, plan["caps"]["workers"])
-    last = _admit(root, plan_id, uid, after_quota)[2]
-    reuse = False  # an allocated attempt that never launched anything is reused, not burned
-    if last:
-        reuse = all(invocation_status(i["path"], True)["state"] in ("NOT_LAUNCHED", "LAUNCH_FAILED")
-                    for i in iter_invocations(root, plan_id, uid) if i["attempt"] == last) \
-            and not os.path.exists(os.path.join(paths.attempt_dir(root, plan_id, uid, last), "classification.json"))
-    if reuse:
-        n, adir = last, paths.attempt_dir(root, plan_id, uid, last)
-    else:
-        n, adir = allocate_attempt(root, plan_id, uid, after_quota)
+    n, adir = acquire_attempt(root, plan_id, uid, after_quota)
     out = os.path.join(adir, "outputs")
     os.makedirs(out, exist_ok=True)
     sh = E.resolve_exe("sh", E.worker_env().get("PATH", ""))
@@ -797,9 +822,11 @@ def run_dispatch(args):
         pid = args.plan or approval.find_plan_for_unit(root, args.unit)
         approval.require_approval(root, pid)
         unit = _unit_of(approval.effective_plan(root, pid), args.unit)
-        if unit["kind"] != "job":
-            raise ExecutionError("unit %s is a code unit; code workers are launched by the worker flow" % unit["id"])
-        rec = dispatch_job(root, pid, unit, args.after_quota)
+        if unit["kind"] == "code":
+            from . import workspace
+            rec = workspace.dispatch_code(root, pid, unit, args.after_quota)
+        else:
+            rec = dispatch_job(root, pid, unit, args.after_quota)
     print(json.dumps({"plan": pid, "unit": unit["id"], "attempt": rec["attempt"], "invocation": rec["seq"],
                       "pid": rec["launch"].get("pid"), "job_id": rec["launch"].get("job_id")}, sort_keys=True))
     return 0

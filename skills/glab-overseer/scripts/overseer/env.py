@@ -76,13 +76,14 @@ def resolve_exe(name, path, cwd=None):
     return None
 
 
-def run_tool(argv, env, timeout, cwd=None, stdin=None):
+def run_tool(argv, env, timeout, cwd=None, stdin=None, raw=False):
     """Run argv with a timeout; returns dict(rc, stdout, stderr, timed_out).
 
     A timeout yields rc None and timed_out True (the whole process group is
     killed). A missing binary yields rc 127. Output goes through temporary
     files, so a detached grandchild holding the descriptors never delays the
     return. argv[0] is resolved with `resolve_exe` and spawned by absolute path.
+    `raw` returns stdout as bytes (for binary blobs); stderr stays text.
     """
     exe = resolve_exe(argv[0], env.get("PATH", ""), cwd)
     if exe is None:
@@ -90,7 +91,7 @@ def run_tool(argv, env, timeout, cwd=None, stdin=None):
                 "stderr": "command not found: %s (only absolute PATH entries are searched)" % argv[0]}
     with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
         if stdin is not None:
-            fin.write(stdin.encode("utf-8"))
+            fin.write(stdin if isinstance(stdin, bytes) else stdin.encode("utf-8"))
             fin.flush()
             fin.seek(0)
         try:
@@ -113,5 +114,5 @@ def run_tool(argv, env, timeout, cwd=None, stdin=None):
         fout.seek(0)
         ferr.seek(0)
         return {"rc": None if timed_out else p.returncode, "timed_out": timed_out,
-                "stdout": fout.read().decode("utf-8", "replace"),
+                "stdout": fout.read() if raw else fout.read().decode("utf-8", "replace"),
                 "stderr": ferr.read().decode("utf-8", "replace")}

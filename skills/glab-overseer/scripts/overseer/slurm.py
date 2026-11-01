@@ -569,12 +569,12 @@ def make_spawn():
     return spawn
 
 
-def launch(root, plan_id, unit_id, attempt, kind, argv, cwd, stdin_text=None, extras=None):
+def launch(root, plan_id, unit_id, attempt, kind, argv, cwd, stdin_text=None, extras=None, prepare=None):
     """Submit an author, fixer or job invocation as a batch job (preflight, then U3's launch)."""
     plan = approval.effective_plan(root, plan_id)
     res = preflight(root, plan, X._unit_of(plan, unit_id))
     return X.launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend="slurm",
-                               stdin_text=stdin_text, extras=extras, spawn=make_spawn(),
+                               stdin_text=stdin_text, extras=extras, spawn=make_spawn(), prepare=prepare,
                                extra_intent={"slurm": res, "env_extras": dict(extras or {})})
 
 
