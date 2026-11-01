@@ -460,7 +460,7 @@ class CommandTests(Case):
         with open(os.path.join(out, "o.txt")) as f:
             self.assertEqual(f.read().strip(), out)
 
-    def test_dispatch_refuses_second_while_running_and_code_units(self):
+    def test_dispatch_refuses_second_while_running_and_code_without_models(self):
         p = make_plan()
         p["units"][0]["command"] = "sleep 30"
         approval.approve_plan(self.root, p, "me")
@@ -473,7 +473,7 @@ class CommandTests(Case):
         approval.approve_plan(self.root, code, "me")
         rc, _, err = self.run_cli("dispatch", "--unit", "alpha")
         self.assertEqual(rc, 1)
-        self.assertIn("code unit", err)
+        self.assertIn("models.json", err)  # code units dispatch through U5 and need the model cache
 
     def test_status_json_reports_slots_and_active(self):
         rec = self.launch("j1")

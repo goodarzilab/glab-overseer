@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, execution, models, paths, plan as P, slurm, store, survey
+from . import approval, execution, judge, models, paths, plan as P, slurm, store, survey
 
 COMMANDS = {}  # name -> dict(help, configure, run), in registration order
 
@@ -131,17 +131,18 @@ register("survey", "probe the host and repository", survey.configure_survey, sur
 register("probe-transport", "probe stdin and --json-schema support of each CLI", None, survey.run_probe_transport)
 register("models", "resolve model roles for a host", models.configure, models.run)
 register("slurm-handshake", "verify that batch jobs see this project root", slurm.configure_handshake, slurm.run_handshake)
-register("dispatch", "launch a job unit attempt on the chosen backend",
+register("dispatch", "launch a unit attempt (code: worktree and author; job: command) on the chosen backend",
          execution.configure_dispatch, execution.run_dispatch)
 register("status", "show unit facets, active invocations and slots",
          execution.configure_status, execution.run_status)
 register("wait", "wait until an active invocation changes state (exit 3 on timeout)",
          execution.configure_wait, execution.run_wait)
 register("abort", "abort a unit's active invocations", execution.configure_abort, execution.run_abort)
+register("judge", "judge an attempt against its evidence", judge.configure_judge, judge.run_judge)
+register("resolve", "resolve an UNCERTAIN attempt as done or failed (orchestrator decision)",
+         judge.configure_resolve, judge.run_resolve)
 for _name, _help in [
     ("issues", "file issues from an approved plan (U7)"),
-    ("resolve", "record an orchestrator resolution (U5)"),
-    ("judge", "judge an attempt against its evidence (U5)"),
     ("review", "run a cross-family review (U6)"),
     ("reproduce", "reproduce a review finding (U6)"),
     ("dispositions", "record finding dispositions (U6)"),
