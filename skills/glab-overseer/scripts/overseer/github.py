@@ -15,13 +15,13 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 import time
 
 from . import approval, env as E, execution as X, judge as J, paths, plan as P, store, workspace as W
 
-LIST_LIMIT = 1000
 POLL_WINDOW = 120.0  # after an ambiguous write, poll this long for its marker before writing again
 POLL_INTERVAL = 10.0
 READ_TRIES = 3
@@ -61,6 +61,15 @@ def transient(r):
     return bool(r["timed_out"] or (r["rc"] not in (0, 127) and TRANSIENT_RE.search(r["stderr"] or "")))
 
 
+DEFINITE_RE = re.compile(r"Validation Failed|HTTP (?!408\b|429\b)4\d\d|Resource not accessible|Not Found|Bad credentials"
+                         r"|could not resolve to a|not permitted", re.I)
+
+
+def definite_rejection(r):
+    """A write is known not to have happened only when it never ran or stderr shows a definite rejection."""
+    return r["rc"] == 127 or bool(not r["timed_out"] and r["rc"] is not None and DEFINITE_RE.search(r["stderr"] or ""))
+
+
 def _fail(what, r):
     return GithubError("gh %s failed (rc %s): %s" % (what, r["rc"], ((r["stderr"] or "").strip()[:300] or "no output")),
                        http404="HTTP 404" in (r["stderr"] or ""))
@@ -83,13 +92,24 @@ def _read(argv, what, want=None):
         time.sleep(RETRY_DELAY)
 
 
+def _read_text(argv, what):
+    """stdout of a read, retried on transient failure."""
+    for attempt in range(READ_TRIES):
+        r = gh(argv)
+        if r["rc"] == 0:
+            return r["stdout"]
+        if not transient(r) or attempt == READ_TRIES - 1:
+            raise _fail(what, r)
+        time.sleep(RETRY_DELAY)
+
+
 def _write(root, op, argv, **fields):
     """Record the intent, then run the write. Returns (result, ambiguous); a definite failure raises."""
     store.append_event(root, "github_intent", op=op, **fields)
     r = gh(argv)
     if r["rc"] == 0:
         return r, False
-    if transient(r):
+    if not definite_rejection(r):  # inverted like sbatch: any other non-zero exit may have been applied
         store.append_event(root, "github_ambiguous", op=op, error=(r["stderr"] or "").strip()[:200], **fields)
         return r, True
     raise _fail(op, r)
@@ -118,24 +138,58 @@ def _is_int(v):
 # ---- issues ------------------------------------------------------------------
 
 def list_issues(repo):
-    """All issues (any state) as validated dicts; refuses a listing that may be truncated."""
-    data = _read(["issue", "list", "-R", repo, "--state", "all", "--limit", str(LIST_LIMIT + 1),
-                  "--json", "number,title,body,state"], "issue list", list)
-    for i in data:
-        if not (isinstance(i, dict) and _is_int(i.get("number")) and isinstance(i.get("title"), str)
-                and isinstance(i.get("body"), str) and isinstance(i.get("state"), str)):
-            raise GithubError("issue list returned a malformed entry: %.100r" % (i,))
-    if len(data) > LIST_LIMIT:
-        raise GithubError("repository has more than %d issues; at most %d are scanned" % (LIST_LIMIT, LIST_LIMIT))
-    return data
+    """Every issue (any state, no cap) through the paginated REST API; pull requests are skipped."""
+    text = _read_text(["api", "--paginate", "repos/%s/issues?state=all&per_page=100" % repo], "issue list")
+    dec, pos, out = json.JSONDecoder(), 0, []
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        try:
+            page, pos = dec.raw_decode(text, pos)
+        except ValueError:
+            raise GithubError("issue list returned output that is not JSON pages")
+        if not isinstance(page, list):
+            raise GithubError("issue list page is %s, expected a list" % type(page).__name__)
+        for i in page:
+            if not (isinstance(i, dict) and _is_int(i.get("number")) and isinstance(i.get("title"), str)
+                    and (i.get("body") is None or isinstance(i["body"], str)) and i.get("state") in ("open", "closed")):
+                raise GithubError("issue list returned a malformed entry: %.100r" % (i,))
+            if "pull_request" not in i:
+                out.append({"number": i["number"], "title": i["title"], "body": i["body"] or "",
+                            "state": i["state"].upper()})
+    return out
 
 
 def has_marker(body, marker):
     return any(line.strip() == marker for line in body.splitlines())
 
 
-def find_by_marker(issues, marker):
-    return [i for i in issues if has_marker(i["body"], marker)]
+def find_by_marker(issues, marker, title=None):
+    return [i for i in issues if has_marker(i["body"], marker) and (title is None or i["title"] == title)]
+
+
+def project_id(root):
+    """Random 12-hex id of this project root, created once (atomically) and never regenerated."""
+    path = os.path.join(paths.ensure_state_dir(root), "project.json")
+    for _ in range(2):
+        rec = store.read_json(path, None)
+        if rec is not None:
+            if not (isinstance(rec, dict) and isinstance(rec.get("project_id"), str)
+                    and re.fullmatch(r"[0-9a-f]{12}", rec["project_id"])):
+                raise GithubError("%s is malformed; refusing to regenerate the project id" % path)
+            return rec["project_id"]
+        pid = secrets.token_hex(6)
+        try:
+            store.publish_record(path, {"token": pid, "project_id": pid})
+        except FileExistsError:
+            pass
+    raise GithubError("could not read or create %s" % path)
+
+
+def marker_for(root, plan_id, unit_id):
+    return "<!-- overseer project=%s plan=%s unit=%s -->" % (project_id(root), plan_id, unit_id)
 
 
 def view_issue(repo, number, fields="number,title,body,state"):
@@ -203,7 +257,7 @@ def _create_issue(root, repo, uid, draft, marker):
     m = ISSUE_URL_RE.search(r["stdout"]) if not amb else None
     if m:
         return int(m.group(1))
-    found = find_by_marker(list_issues(repo), marker)  # reconcile by read-back, never by repeating the create
+    found = find_by_marker(list_issues(repo), marker, draft["title"])  # reconcile by read-back, never by repeating the create
     if len(found) == 1:
         return found[0]["number"]
     if found:
@@ -220,15 +274,19 @@ def file_issues(root, plan_id, dry_run=False, out=print):
     rec = store.read_json(_issues_path(root, plan_id))
     drafts = _drafts(root, plan_id, rec)
     listed = list_issues(repo)
+    markers = {}
     read_at = store.utc_now()
     plan_matches = {}
     for u in units:
         d = drafts.get(u["id"])
-        marker = P.issue_marker(plan_id, u["id"])
+        old = P.issue_marker(plan_id, u["id"])
         if not (isinstance(d, dict) and isinstance(d.get("title"), str) and isinstance(d.get("body"), str)
-                and has_marker(d["body"], marker)):
+                and has_marker(d["body"], old)):
             raise GithubError("unit %s has no usable issue draft with its marker" % u["id"])
-        found = find_by_marker(listed, marker)
+        marker = markers[u["id"]] = marker_for(root, plan_id, u["id"])
+        drafts[u["id"]] = {"title": d["title"], "body": "\n".join(marker if ln.strip() == old else ln
+                                                                    for ln in d["body"].split("\n"))}
+        found = find_by_marker(listed, marker, d["title"])
         if len(found) > 1:
             raise GithubError("ambiguous: issues %s all carry the marker of unit %s"
                               % (", ".join("#%d" % i["number"] for i in found), u["id"]))
@@ -237,7 +295,7 @@ def file_issues(root, plan_id, dry_run=False, out=print):
             raise GithubError("issues.json records #%s for unit %s but the repository listing disagrees"
                               % (recorded, u["id"]))
         if not found and not dry_run and recorded is None:
-            found = _settle(root, marker, lambda: find_by_marker(list_issues(repo), marker))
+            found = _settle(root, marker, lambda: find_by_marker(list_issues(repo), marker, d["title"]))
             if len(found) > 1:
                 raise GithubError("ambiguous: issues %s all carry the marker of unit %s"
                                   % (", ".join("#%d" % i["number"] for i in found), u["id"]))
@@ -250,14 +308,14 @@ def file_issues(root, plan_id, dry_run=False, out=print):
             out("%s: #%d (found by marker)" % (uid, numbers[uid]))
             if not dry_run:
                 _record_filed(root, plan_id, rec, uid, numbers[uid], read_at)
-                _unpend(root, P.issue_marker(plan_id, uid))
+                _unpend(root, markers[uid])
             continue
         if dry_run:
             out("%s: would create %r" % (uid, drafts[uid]["title"]))
             continue
-        marker = P.issue_marker(plan_id, uid)
+        marker = markers[uid]
         n = _create_issue(root, repo, uid, drafts[uid], marker)
-        dups = find_by_marker(list_issues(repo), marker)
+        dups = find_by_marker(list_issues(repo), marker, drafts[uid]["title"])
         if len(dups) > 1:  # report only; nothing is closed or edited
             raise GithubError("DUPLICATE ISSUES for unit %s: %s all carry %s; the owner must close the extras"
                               % (uid, ", ".join("#%d" % i["number"] for i in dups), marker))

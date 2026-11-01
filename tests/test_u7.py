@@ -38,9 +38,16 @@ def issue(n):
     return next(i for i in st["issues"] if i["number"] == n)
 def pick(d, fields):
     return {k: d[k] for k in fields.split(",") if k in d}
-if a[0] == "issue" and a[1] == "list":
-    out(json.dumps([pick(i, "number,title,body,state") for i in st["issues"]]))
+if a[0] == "api" and "--paginate" in a:
+    rows = [{"number": i["number"], "title": i["title"], "body": i["body"] or None, "state": i["state"].lower()}
+            for i in st["issues"]]
+    if faults.get("with_pr"):
+        rows.append({"number": 5000, "title": "a pr", "body": st["issues"][0]["body"] if st["issues"] else "x",
+                     "state": "open", "pull_request": {}})
+    out("".join(json.dumps(rows[k:k + 2]) for k in range(0, max(len(rows), 1), 2)))
 if a[0] == "issue" and a[1] == "create":
+    if faults.get("create_error_before"):
+        die(faults["create_error_before"])
     if fault("create_timeout_before"):
         die("error connecting to api.github.com")
     n = len(st["issues"]) + 1
@@ -49,7 +56,7 @@ if a[0] == "issue" and a[1] == "create":
     if faults.get("dup_after_create"):
         st["issues"].append(dict(st["issues"][-1], number=n + 1, id=1001 + n))
     if fault("create_then_fail"):
-        die("Post \"https://api.github.com/graphql\": dial tcp 1.2.3.4:443: i/o timeout")
+        die(faults.get("fail_msg") or "Post \"https://api.github.com/graphql\": dial tcp 1.2.3.4:443: i/o timeout")
     out("https://github.com/%%s/issues/%%d\n" %% (repo, n))
 if a[0] == "issue" and a[1] == "view":
     n = int(a[2])
@@ -127,6 +134,9 @@ class GhCase(Case):
     def calls(self, *prefix):
         return [c for c in self.gh_state()["calls"] if tuple(c[:len(prefix)]) == prefix]
 
+    def mk(self, unit):
+        return G.marker_for(self.root, "demo", unit)
+
     def issues_json(self):
         return jload(os.path.join(paths.plan_dir(self.root, "demo"), "issues.json"))
 
@@ -139,7 +149,7 @@ class GhCase(Case):
 
 class Transport(GhCase):
     def test_gh_runs_with_supervisor_env_and_reports_rc_stdout_stderr(self):
-        r = G.gh(["issue", "list", "-R", "o/r", "--state", "all", "--limit", "1000", "--json", "number"])
+        r = G.gh(["api", "--paginate", "repos/o/r/issues?state=all&per_page=100"])
         self.assertEqual((r["rc"], json.loads(r["stdout"])), (0, []))
         r = G.gh(["nothing"])
         self.assertEqual((r["rc"], "unhandled" in r["stderr"]), (2, True))
@@ -172,13 +182,14 @@ class Filing(GhCase):
         rec = self.issues_json()
         self.assertEqual(rec["filed"], {"alpha": 1, "crunch": 2})
         self.assertTrue(re.match(r"\d{4}-\d\d-\d\dT", rec["filed_at"]["alpha"]))
-        self.assertEqual(self.calls("issue", "list")[0][-2:], ["--json", "number,title,body,state"])
-        self.assertIn("--state", self.calls("issue", "list")[0])
+        lst = [c for c in self.calls("api") if "--paginate" in c][0]
+        self.assertEqual(lst[-1], "repos/lab-org/demo-repo/issues?state=all&per_page=100")
+        self.assertEqual(self.calls("issue", "list"), [])
         self.assertFalse([c for c in self.calls("issue", "create") if "--body-file" not in c])
         self.assertEqual(self.cli("issues", "file")[0], 0)
         self.assertEqual(len(self.calls("issue", "create")), 2)
         self.assertEqual(len(self.gh_state()["issues"]), 2)
-        self.assertIn("overseer plan=demo unit=alpha", self.gh_state()["issues"][0]["body"])
+        self.assertIn(self.mk("alpha"), self.gh_state()["issues"][0]["body"].splitlines())
 
     def test_create_that_succeeds_then_fails_is_adopted_by_marker_not_duplicated(self):
         self.approve()
@@ -214,9 +225,9 @@ class Filing(GhCase):
 
     def test_two_marker_matches_stop_before_any_create(self):
         self.approve()
-        marker = "<!-- overseer plan=demo unit=crunch -->"
+        marker = self.mk("crunch")
         st = self.gh_state()
-        st["issues"] = [{"number": n, "id": 1000 + n, "title": "dup", "body": marker + "\n", "state": "OPEN",
+        st["issues"] = [{"number": n, "id": 1000 + n, "title": "Crunch", "body": marker + "\n", "state": "OPEN",
                          "comments": [], "blockers": []} for n in (1, 2)]
         self.gh_state(st)
         rc, _, err = self.cli("issues", "file")
@@ -227,10 +238,10 @@ class Filing(GhCase):
     def test_closed_issue_is_matched_and_marker_must_be_a_whole_line(self):
         self.approve()
         st = self.gh_state()
-        st["issues"] = [{"number": 7, "id": 1007, "title": "old", "state": "CLOSED", "comments": [], "blockers": [],
-                         "body": "x\n<!-- overseer plan=demo unit=alpha -->\n"},
+        st["issues"] = [{"number": 7, "id": 1007, "title": "Add alpha", "state": "CLOSED", "comments": [], "blockers": [],
+                         "body": "x\n%s\n" % self.mk("alpha")},
                         {"number": 8, "id": 1008, "title": "quote", "state": "OPEN", "comments": [], "blockers": [],
-                         "body": "see > <!-- overseer plan=demo unit=crunch --> here"}]
+                         "body": "see > %s here" % self.mk("crunch")}]
         self.gh_state(st)
         self.assertEqual(self.cli("issues", "file")[0], 0)
         self.assertEqual(self.issues_json()["filed"], {"alpha": 7, "crunch": 3})
@@ -272,24 +283,75 @@ class Filing(GhCase):
         self.assertEqual(rc, 1)
         self.assertIn("disagrees", err)
 
-    def test_listing_limit_is_exactly_1000_issues(self):
-        row = {"number": 1, "title": "t", "body": "", "state": "OPEN"}
-        rows = lambda k: [dict(row, number=i + 1) for i in range(k)]
-        with mock.patch.object(G, "_read", return_value=rows(1000)) as m:
-            self.assertEqual(len(G.list_issues("o/r")), 1000)
-        self.assertEqual(m.call_args[0][0][m.call_args[0][0].index("--limit") + 1], "1001")
-        with mock.patch.object(G, "_read", return_value=rows(1001)):
-            with self.assertRaises(G.GithubError):
-                G.list_issues("o/r")
+    def test_listing_is_uncapped_paginated_and_skips_pull_requests(self):
+        self.approve()
+        st = self.gh_state()
+        st["faults"]["with_pr"] = True
+        st["issues"] = [{"number": n, "id": 1000 + n, "title": "t%d" % n, "body": "", "state": "OPEN", "comments": [],
+                         "blockers": []} for n in range(1, 1003)]
+        self.gh_state(st)
+        got = G.list_issues("lab-org/demo-repo")
+        self.assertEqual((len(got), got[-1]["state"], 5000 in [i["number"] for i in got]), (1002, "OPEN", False))
+        self.assertEqual(self.cli("issues", "file")[0], 0)  # more than 1000 issues no longer breaks filing
+        self.assertEqual(self.issues_json()["filed"], {"alpha": 1003, "crunch": 1004})
+        good = '[{"number": 1, "title": "t", "body": "", "state": "open"}]'
+        for bad in ('{"a": 1}', "[1]", good.replace("open", "OPEN"), good + " x"):
+            with mock.patch.object(G, "_read_text", return_value=bad):
+                with self.assertRaises(G.GithubError, msg=bad):
+                    G.list_issues("o/r")
+
+    def test_project_id_is_created_once_and_in_the_marker_and_isolates_roots(self):
+        self.approve()
+        pid = G.project_id(self.root)
+        self.assertRegex(pid, r"^[0-9a-f]{12}$")
+        self.assertEqual(G.project_id(self.root), pid)
+        self.assertEqual(self.mk("alpha"), "<!-- overseer project=%s plan=demo unit=alpha -->" % pid)
+        other = os.path.join(self.tmp, "other-root")
+        os.makedirs(other)
+        self.assertNotEqual(G.project_id(other), pid)
+        with open(os.path.join(self.root, ".overseer", "project.json"), "w") as f:
+            f.write("{")
+        with self.assertRaises(ValueError):
+            G.project_id(self.root)  # never regenerated
+        with open(os.path.join(self.root, ".overseer", "project.json"), "w") as f:
+            f.write("{}")
+        with self.assertRaises(G.GithubError):
+            G.project_id(self.root)
+
+    def test_other_projects_marker_or_other_title_is_not_adopted(self):
+        self.approve()
+        mine = self.mk("alpha")
+        st = self.gh_state()
+        base = {"state": "OPEN", "comments": [], "blockers": []}
+        st["issues"] = [dict(base, number=1, id=1001, title="Add alpha",
+                             body=mine.replace(G.project_id(self.root), "0" * 12) + "\n"),
+                        dict(base, number=2, id=1002, title="Other title", body=mine + "\n")]
+        self.gh_state(st)
+        self.assertEqual(self.cli("issues", "file")[0], 0)
+        self.assertEqual(self.issues_json()["filed"]["alpha"], 3)
+
+    def test_unlisted_error_is_ambiguous_and_definite_rejection_clears_the_intent(self):
+        self.approve()
+        pend = os.path.join(self.root, ".overseer", "github_pending.json")
+        self.fault(create_error_before='Post "https://api.github.com/graphql": EOF')
+        self.assertEqual(self.cli("issues", "file")[0], 3)
+        self.assertIn(self.mk("alpha"), jload(pend))
+        self.fault(create_error_before="HTTP 422: Validation Failed")
+        self.assertEqual(self.cli("issues", "file")[0], 1)
+        self.assertNotIn(self.mk("alpha"), jload(pend))
+        for msg, definite in (("gh: Not Found (HTTP 404)", True), ("HTTP 408 timeout", False), ("HTTP 429 slow", False),
+                              ("Bad credentials", True), ("EOF", False), ("could not resolve to a Repository", True)):
+            self.assertEqual(G.definite_rejection({"rc": 1, "stderr": msg, "timed_out": False}), definite, msg)
+        self.assertFalse(G.definite_rejection({"rc": None, "stderr": "", "timed_out": True}))
 
     def test_ambiguous_create_that_completes_late_is_adopted_not_duplicated(self):
         self.approve()
         self.fault(create_timeout_before=True)
         self.assertEqual(self.cli("issues", "file")[0], 3)
-        self.assertIn("<!-- overseer plan=demo unit=alpha -->", jload(os.path.join(self.root, ".overseer", "github_pending.json")))
+        self.assertIn(self.mk("alpha"), jload(os.path.join(self.root, ".overseer", "github_pending.json")))
         st = self.gh_state()  # the timed-out create completes while the rerun polls
         late = {"number": 1, "id": 1001, "title": "Add alpha", "state": "OPEN", "comments": [], "blockers": [],
-                "body": "<!-- overseer plan=demo unit=alpha -->\n"}
+                "body": self.mk("alpha") + "\n"}
 
         def sleeper(_):
             cur = self.gh_state()
