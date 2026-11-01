@@ -1,4 +1,4 @@
-"""Model roles per host family, recorded in `.overseer/models.json`."""
+"""Model roles for both families, resolved from one host, in `.overseer/models.json`."""
 import datetime
 import os
 import re
@@ -7,6 +7,7 @@ import sys
 from . import env as E, paths, store
 
 CLAUDE_ROLES = {"plan": "opus", "code": "sonnet", "review": "haiku"}
+FAMILIES = ("claude", "google")
 MAX_AGE_DAYS = 30
 LIST_TIMEOUT = 60
 _PRO = re.compile(r"^gemini-(\d+(?:\.\d+)*)-(argon|carbon|pro)-high$")
@@ -32,9 +33,7 @@ def parse_listing(text):
 
 
 def _vkey(version):
-    parts = [int(x) for x in version.split(".")]
-    while parts and parts[-1] == 0:
-        parts.pop()
+    parts = [int(x) for x in version.split(".")]  # exact tuples: (3,) sorts below (3, 0)
     return tuple(parts)
 
 
@@ -60,15 +59,23 @@ def resolve_google(entries):
     return {"plan": top, "code": top, "review": review}
 
 
+def _roles_ok(d):
+    return isinstance(d, dict) and all(isinstance(d.get(r), str) and d[r] for r in CLAUDE_ROLES)
+
+
 def _valid_cache(c):
-    if not (isinstance(c, dict) and isinstance(c.get("date"), str) and isinstance(c.get("host_family"), str)
+    """Shape: {date, host, raw, choices: {claude: roles, google: roles+available or unavailable}}."""
+    if not (isinstance(c, dict) and isinstance(c.get("date"), str) and c.get("host") in FAMILIES
             and isinstance(c.get("choices"), dict) and isinstance(c.get("raw"), str)):
         return False
     try:
         datetime.date.fromisoformat(c["date"])
     except ValueError:
         return False
-    return all(isinstance(c["choices"].get(r), str) for r in CLAUDE_ROLES)
+    g = c["choices"].get("google")
+    google_ok = isinstance(g, dict) and ((g.get("available") is True and _roles_ok(g))
+                                         or (g.get("available") is False and isinstance(g.get("reason"), str)))
+    return _roles_ok(c["choices"].get("claude")) and google_ok
 
 
 def cache_age_days(cache, today=None):
@@ -83,43 +90,61 @@ def read_cache(root):
         return "unparseable"
 
 
+def load_valid(root):
+    """The cached record when it is well formed, else None."""
+    c = read_cache(root)
+    return c if _valid_cache(c) else None
+
+
+def roles_for(record, family):
+    """Role map for a family, or None when the family is unavailable on this host."""
+    c = record["choices"][family]
+    return None if c.get("available") is False else c
+
+
+def _resolve_google(base, strict):
+    """Return (roles-or-unavailable dict, raw). Errors raise only when `strict`."""
+    env = E.worker_env(base)
+    r = E.run_tool(["agy", "models"], env, LIST_TIMEOUT)
+    try:
+        if r["timed_out"]:
+            raise ModelError("`agy models` timed out")
+        if r["rc"] != 0:
+            raise ModelError("`agy models` failed (rc %s): %s" % (r["rc"], r["stderr"].strip()[:200]))
+        return dict(resolve_google(parse_listing(r["stdout"])), available=True), r["stdout"]
+    except ModelError as e:
+        if strict:
+            raise
+        return {"available": False, "reason": str(e)}, ""
+
+
 def resolve(root, host, refresh=False, base=None, today=None):
-    """Return (record, warnings). Writes models.json only when it resolves anew."""
-    if host not in ("claude", "google"):
+    """Return (record, warnings). Resolves both families; writes models.json only when it resolves anew."""
+    if host not in FAMILIES:
         raise ModelError("host must be claude or google")
     warnings = []
     cache = read_cache(root)
     if cache is not None and not _valid_cache(cache):
         warnings.append("ignoring malformed models.json")
         cache = None
-    if cache and cache["host_family"] == host and not refresh:
+    if cache and cache["host"] == host and not refresh:
         age = cache_age_days(cache, today)
         if age > MAX_AGE_DAYS:
             warnings.append("models.json is %d days old; run `models --host %s --refresh`" % (age, host))
         return cache, warnings
-    raw = ""
-    if host == "claude":
-        choices = dict(CLAUDE_ROLES)
-    else:
-        env = E.worker_env(base)
-        r = E.run_tool(["agy", "models"], env, LIST_TIMEOUT)
-        if r["timed_out"]:
-            raise ModelError("`agy models` timed out")
-        if r["rc"] != 0:
-            raise ModelError("`agy models` failed (rc %s): %s" % (r["rc"], r["stderr"].strip()[:200]))
-        raw = r["stdout"]
-        choices = resolve_google(parse_listing(raw))
+    google, raw = _resolve_google(base, strict=(host == "google"))
+    choices = {"claude": dict(CLAUDE_ROLES), "google": google}
     day = (today or datetime.datetime.now(datetime.timezone.utc).date()).isoformat()
-    record = {"date": day, "host_family": host, "raw": raw, "choices": choices}
+    record = {"date": day, "host": host, "raw": raw, "choices": choices}
     # Event first: the record is the cache, so a crash between the two writes must leave
     # the record missing (retry rewrites it) rather than the event missing (retry would hit the cache).
-    store.append_event(root, "models-resolved", host_family=host, choices=choices)
+    store.append_event(root, "models-resolved", host=host, choices=choices)
     store.write_json_atomic(os.path.join(paths.state_dir(root), "models.json"), record)
     return record, warnings
 
 
 def configure(p):
-    p.add_argument("--host", required=True, choices=["claude", "google"])
+    p.add_argument("--host", required=True, choices=list(FAMILIES))
     p.add_argument("--refresh", action="store_true", help="re-resolve even if models.json is current")
 
 
@@ -129,7 +154,11 @@ def run(args):
         rec, warnings = resolve(root, args.host, args.refresh)
     for w in warnings:
         sys.stderr.write("warning: %s\n" % w)
-    print("host: %s (resolved %s)" % (rec["host_family"], rec["date"]))
-    for role in ("plan", "code", "review"):
-        print("%s: %s" % (role, rec["choices"][role]))
+    print("host: %s (resolved %s)" % (rec["host"], rec["date"]))
+    for fam in FAMILIES:
+        roles = roles_for(rec, fam)
+        if roles is None:
+            print("%s: unavailable (%s)" % (fam, rec["choices"][fam]["reason"]))
+        else:
+            print("%s: %s" % (fam, ", ".join("%s=%s" % (r, roles[r]) for r in CLAUDE_ROLES)))
     return 0

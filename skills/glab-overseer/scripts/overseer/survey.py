@@ -64,11 +64,15 @@ def _slurm(found, env, base, timeout):
     return info
 
 
-def _auth_probe(family, found, base, timeout, root_models):
+def _auth_probe(family, found, base, timeout, record):
     if adapters.BINARY[family] not in found:
         return {"status": "skipped"}
+    roles = models.roles_for(record, family) if record else (
+        models.CLAUDE_ROLES if family == "claude" else None)
+    if roles is None:
+        return {"status": "skipped", "reason": "no review model for %s (run models first)" % family}
     with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd:
-        model = "haiku" if family == "claude" else (root_models or {}).get("review")
+        model = roles["review"]
         inv = adapters.prepare(family, "author", model, "Reply with the single word ok.", cwd,
                                transport="file")
         r = E.run_tool(inv["argv"], E.worker_env(base), timeout, cwd=cwd)
@@ -89,7 +93,7 @@ def collect(root, base=None, probe_auth=False, timeout=QUERY_TIMEOUT):
     for t in TOOLS:
         p = shutil.which(t, path=base.get("PATH", ""))
         if p:
-            found[t] = p
+            found[t] = os.path.abspath(p)
     tools = {}
     for t in TOOLS:
         if t not in found:
@@ -123,8 +127,7 @@ def collect(root, base=None, probe_auth=False, timeout=QUERY_TIMEOUT):
         "warnings": [KEY_WARNING] if keys else [],
     }
     if probe_auth:
-        rm = models.read_cache(root)
-        rm = rm.get("choices") if isinstance(rm, dict) and isinstance(rm.get("choices"), dict) else None
+        rm = models.load_valid(root)
         survey["auth_probe"] = {f: _auth_probe(f, found, base, PROBE_TIMEOUT, rm) for f in adapters.FAMILIES}
     return survey
 
@@ -175,17 +178,20 @@ def run_probe_transport(args):
     base = dict(os.environ)
     with store.ProjectLock(root, "probe-transport"):
         survey = _existing(root)
-        rm = models.read_cache(root)
-        rm = rm.get("choices") if isinstance(rm, dict) and isinstance(rm.get("choices"), dict) else {}
+        rm = models.load_valid(root)
+        if rm is None:
+            raise ValueError("no usable models.json: run `overseer.py models --host claude|google` first")
         transport = {}
         for family in adapters.FAMILIES:
+            roles = models.roles_for(rm, family)
             if not shutil.which(adapters.BINARY[family], path=base.get("PATH", "")):
                 transport[family] = {"stdin": None, "schema": None, "note": "cli not found"}
-                continue
-            with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd:
-                model = "haiku" if family == "claude" else rm.get("review")
-                transport[family] = adapters.probe_transport(family, cwd, E.worker_env(base), model,
-                                                             PROBE_TIMEOUT)
+            elif roles is None:
+                transport[family] = {"stdin": "unavailable", "schema": "unavailable"}
+            else:
+                with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd:
+                    transport[family] = adapters.probe_transport(family, cwd, E.worker_env(base),
+                                                                 roles["review"], PROBE_TIMEOUT)
         survey["transport"] = transport
         _write(root, survey, "probe-transport")
     for family, t in transport.items():

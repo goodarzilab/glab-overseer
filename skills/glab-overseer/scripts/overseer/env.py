@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 
 ALLOW = [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TZ", "TMPDIR",
@@ -50,27 +51,38 @@ def run_tool(argv, env, timeout, cwd=None, stdin=None):
     """Run argv with a timeout; returns dict(rc, stdout, stderr, timed_out).
 
     A timeout yields rc None and timed_out True (the whole process group is
-    killed). A missing binary yields rc 127. Output is decoded leniently.
+    killed). A missing binary yields rc 127. Output goes through temporary
+    files, so a detached grandchild holding the descriptors never delays the
+    return. argv[0] is resolved to an absolute path against env's PATH first.
     """
     exe = argv[0]
     if os.sep not in exe:
-        exe = shutil.which(exe, path=env.get("PATH", "")) or exe
-    try:
-        p = subprocess.Popen([exe] + list(argv[1:]), env=env, cwd=cwd, start_new_session=True,
-                             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as e:
-        return {"rc": 127, "stdout": "", "stderr": "command not found or not executable: %s" % e,
-                "timed_out": False}
-    timed_out = False
-    try:
-        out, err = p.communicate(stdin.encode("utf-8") if stdin is not None else None, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        found = shutil.which(exe, path=env.get("PATH", ""))
+        exe = os.path.abspath(found) if found else exe
+    with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
+        if stdin is not None:
+            fin.write(stdin.encode("utf-8"))
+            fin.flush()
+            fin.seek(0)
         try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        out, err = p.communicate()
-    return {"rc": None if timed_out else p.returncode, "timed_out": timed_out,
-            "stdout": out.decode("utf-8", "replace"), "stderr": err.decode("utf-8", "replace")}
+            p = subprocess.Popen([exe] + list(argv[1:]), env=env, cwd=cwd, start_new_session=True,
+                                 stdin=fin if stdin is not None else subprocess.DEVNULL,
+                                 stdout=fout, stderr=ferr)
+        except OSError as e:
+            return {"rc": 127, "stdout": "", "stderr": "command not found or not executable: %s" % e,
+                    "timed_out": False}
+        timed_out = False
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+        fout.seek(0)
+        ferr.seek(0)
+        return {"rc": None if timed_out else p.returncode, "timed_out": timed_out,
+                "stdout": fout.read().decode("utf-8", "replace"),
+                "stderr": ferr.read().decode("utf-8", "replace")}

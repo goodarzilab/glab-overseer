@@ -138,7 +138,10 @@ def parse_agy(rc, stdout, stderr):
                      classify_text="%s %s" % (data.get("status"), text if isinstance(text, str) else ""),
                      text=_str_or_none(text), session_id=_str_or_none(data.get("conversation_id")))
     native = isinstance(data.get("structured_output"), dict)
-    structured = data["structured_output"] if native else extract_json(text)
+    if "structured_output" in data:
+        structured = data["structured_output"] if native else None
+    else:
+        structured = extract_json(text)
     return _result(True, "google", rc, text=text, structured=structured, structured_native=native,
                    session_id=_str_or_none(data.get("conversation_id")),
                    num_turns=_int_or_none(data.get("num_turns")),
@@ -162,16 +165,16 @@ def build_argv(family, model, prompt=None, schema=None):
     right after it and no flag may follow `-p` directly. `--json-schema` takes
     inline compact JSON for both families.
     """
+    if not isinstance(model, str) or not model:
+        raise ValueError("a model is required for %s invocations" % (family,))
     if family == "claude":
-        argv = ["claude", "-p", "--permission-mode", "auto"]
-        argv += ["--model", model] if model else []
-        argv += ["--output-format", "json"]
+        argv = ["claude", "-p", "--permission-mode", "auto", "--model", model, "--output-format", "json"]
         argv += ["--json-schema", schema_arg(schema)] if schema is not None else []
         return argv + ([prompt] if prompt is not None else [])
     if family == "google":
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("agy needs the prompt as the value of -p")
-        argv = ["agy", "-p", prompt] + (["--model", model] if model else [])
+        argv = ["agy", "-p", prompt, "--model", model]
         argv += ["--dangerously-skip-permissions", "--sandbox", "--output-format", "json"]
         return argv + (["--json-schema", schema_arg(schema)] if schema is not None else [])
     raise ValueError("unknown family %r" % (family,))
@@ -183,7 +186,24 @@ def _probe_flag(survey, family, key):
     return isinstance(entry, dict) and entry.get(key) is True
 
 
-POINTER = "Read the file task.md in the current directory and follow it exactly."
+TASK_FILE = ".overseer-task.md"
+TASK_MARKER = "<!-- overseer task -->"
+POINTER = "Read the file %s in the current directory and follow it exactly." % TASK_FILE
+
+
+def _write_task(cwd, text):
+    path = os.path.join(cwd, TASK_FILE)
+    if os.path.lexists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                first = f.readline().rstrip("\n")
+        except (OSError, UnicodeDecodeError):
+            first = None
+        if first != TASK_MARKER:
+            raise ValueError("%s exists and was not written by overseer; refusing to overwrite" % path)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(TASK_MARKER + "\n" + text)
+    return path
 
 
 def prepare(family, role, model, task_text, cwd, survey=None, schema=None,
@@ -211,9 +231,7 @@ def prepare(family, role, model, task_text, cwd, survey=None, schema=None,
             text += "\n\nReply with one JSON object matching this JSON schema:\n" + schema_arg(schema)
     prompt_file = None
     if transport == "file":
-        prompt_file = os.path.join(cwd, "task.md")
-        with open(prompt_file, "w", encoding="utf-8") as f:
-            f.write(text)
+        prompt_file = _write_task(cwd, text)
     argv = build_argv(family, model, POINTER if transport == "file" else None,
                       schema if use_flag else None)
     return {"argv": argv, "stdin": text if transport == "stdin" else None, "transport": transport,

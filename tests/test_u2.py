@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -74,6 +75,14 @@ class Case(unittest.TestCase):
             rc = cli.main(["--root", self.root] + list(args))
         return rc, out.getvalue(), err.getvalue()
 
+    def write_models(self, google=True, date=None):
+        g = ({"available": True, "plan": "gemini-9-argon-high", "code": "gemini-9-argon-high",
+              "review": "gemini-9-flash-high"} if google else {"available": False, "reason": "agy not found"})
+        rec = {"date": date or datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "host": "claude",
+               "raw": "", "choices": {"claude": dict(models.CLAUDE_ROLES), "google": g}}
+        store.write_json_atomic(os.path.join(self.root, ".overseer", "models.json"), rec)
+        return rec
+
     def state(self, name):
         with open(os.path.join(self.root, ".overseer", name)) as f:
             return json.load(f)
@@ -103,6 +112,30 @@ class EnvTests(Case):
             self.assertIn(kept, e)
         for dropped in ("FAKE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK"):
             self.assertNotIn(dropped, e)
+
+    def test_detached_grandchild_holding_output_does_not_delay_return(self):
+        path = self.data_file("hold", "#!%s\nimport subprocess, sys, time\n"
+                              "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(8)'], start_new_session=True)\n"
+                              "print('hi', flush=True)\ntime.sleep(float(sys.argv[1]))\n" % sys.executable)
+        os.chmod(path, 0o755)
+        t = time.time()
+        r = E.run_tool([path, "30"], self.host_env(), 0.3)
+        self.assertTrue(r["timed_out"])
+        r2 = E.run_tool([path, "0"], self.host_env(), 20)
+        self.assertEqual((r2["rc"], r2["stdout"].strip()), (0, "hi"))
+        self.assertLess(time.time() - t, 6)
+
+    def test_relative_path_entry_is_resolved_before_cwd_changes(self):
+        os.makedirs(os.path.join(self.tmp, "rel"))
+        p = os.path.join(self.tmp, "rel", "tool")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\necho ran\n")
+        os.chmod(p, 0o755)
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        r = E.run_tool(["tool"], dict(self.host_env(), PATH="rel:" + self.host_env()["PATH"]), 10, cwd=self.root)
+        self.assertEqual((r["rc"], r["stdout"].strip()), (0, "ran"))
 
     def test_timeout_kills_process_group(self):
         self.shim("slow", "sleep 30")
@@ -137,25 +170,42 @@ class ModelTests(Case):
         self.assertEqual(pick(["gemini-5-pro-high", "gemini-5-carbon-high", "gemini-5-argon-high"]),
                          "gemini-5-argon-high")
         self.assertEqual(pick(["gemini-5-pro-high", "gemini-5-carbon-high"]), "gemini-5-carbon-high")
-        self.assertEqual(pick(["gemini-3.0-pro-high", "gemini-3-argon-high"]), "gemini-3-argon-high")
+        self.assertEqual(pick(["gemini-3.0-pro-high", "gemini-3-argon-high"]), "gemini-3.0-pro-high")
+        self.assertLess(models._vkey("3"), models._vkey("3.0"))
 
     def test_claude_roles_and_event(self):
         rc, out, _ = self.run_cli("models", "--host", "claude")
         self.assertEqual(rc, 0)
         rec = self.state("models.json")
-        self.assertEqual(rec["choices"], {"plan": "opus", "code": "sonnet", "review": "haiku"})
-        self.assertEqual(rec["host_family"], "claude")
+        self.assertEqual(rec["choices"]["claude"], {"plan": "opus", "code": "sonnet", "review": "haiku"})
+        self.assertIs(rec["choices"]["google"]["available"], False)  # no agy on this host: recorded, not an error
+        self.assertIn("agy", rec["choices"]["google"]["reason"])
+        self.assertIn("google: unavailable", out)
+        self.assertEqual(rec["host"], "claude")
         self.assertEqual(rec["date"], datetime.datetime.now(datetime.timezone.utc).date().isoformat())
 
     def test_google_via_shim_and_cache(self):
         self.shim("agy", "cat '%s'" % os.path.join(FIX, "agy_models.txt"))
         rc, out, _ = self.run_cli("models", "--host", "google")
         self.assertEqual((rc, self.state("models.json")["raw"]), (0, AGY_MODELS))
-        self.assertIn("review: gemini-3.8-flash-high", out)
+        self.assertIn("review=gemini-3.8-flash-high", out)
         self.run_cli("models", "--host", "google")
         self.assertEqual(self.calls(), ["agy models"])  # second call served from cache
         self.run_cli("models", "--host", "google", "--refresh")
         self.assertEqual(len(self.calls()), 2)
+
+    def test_claude_host_also_resolves_google(self):
+        self.shim("agy", "cat '%s'" % os.path.join(FIX, "agy_models.txt"))
+        self.run_cli("models", "--host", "claude")
+        c = self.state("models.json")["choices"]
+        self.assertEqual((c["google"]["review"], c["google"]["available"]), ("gemini-3.8-flash-high", True))
+        self.assertEqual(c["claude"]["review"], "haiku")
+        self.shim("agy", "echo boom >&2; exit 3")  # a failing listing is not fatal on a claude host
+        rc, _, _ = self.run_cli("models", "--host", "claude", "--refresh")
+        c = self.state("models.json")["choices"]
+        self.assertEqual(rc, 0)
+        self.assertIs(c["google"]["available"], False)
+        self.assertIn("boom", c["google"]["reason"])
 
     def test_agy_failure_and_empty_listing_are_errors(self):
         self.shim("agy", "echo boom >&2; exit 3")
@@ -170,16 +220,18 @@ class ModelTests(Case):
 
     def test_old_cache_warns_and_malformed_cache_is_ignored(self):
         old = (datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=31)).isoformat()
-        rec = {"date": old, "host_family": "claude", "raw": "", "choices": dict(models.CLAUDE_ROLES)}
-        store.write_json_atomic(os.path.join(self.root, ".overseer", "models.json"), rec)
+        rec = self.write_models(date=old)
         rc, _, err = self.run_cli("models", "--host", "claude")
         self.assertIn("31 days old", err)
         self.assertEqual(self.state("models.json")["date"], old)
-        for bad in (dict(rec, choices={"plan": 1}), dict(rec, date="yesterday"), dict(rec, raw=None)):
+        g = rec["choices"]["google"]
+        for bad in (dict(rec, choices={"claude": {"plan": 1}, "google": g}), dict(rec, date="yesterday"),
+                    dict(rec, raw=None), dict(rec, choices={"claude": rec["choices"]["claude"], "google": {"available": True}}),
+                    dict(rec, host="other")):
             store.write_json_atomic(os.path.join(self.root, ".overseer", "models.json"), bad)
             _, _, err = self.run_cli("models", "--host", "claude")
             self.assertIn("malformed", err)
-            self.assertEqual(self.state("models.json")["choices"]["plan"], "opus")
+            self.assertEqual(self.state("models.json")["choices"]["claude"]["plan"], "opus")
 
     def test_crash_between_event_and_record_converges(self):
         with mock.patch.object(store, "write_json_atomic", side_effect=OSError("disk")):
@@ -188,7 +240,7 @@ class ModelTests(Case):
         self.assertFalse(os.path.exists(os.path.join(self.root, ".overseer", "models.json")))
         self.assertEqual(len(store.read_events(self.root)), 1)
         rc, _, _ = self.run_cli("models", "--host", "claude")
-        self.assertEqual((rc, self.state("models.json")["choices"]["plan"]), (0, "opus"))
+        self.assertEqual((rc, self.state("models.json")["choices"]["claude"]["plan"]), (0, "opus"))
         self.assertEqual(len(store.read_events(self.root)), 2)
 
 
@@ -269,6 +321,11 @@ class ParserTests(unittest.TestCase):
                 ("garbage", 0, "{")):
             self.assertFalse(adapters.parse_agy(rc, out, "")["ok"], label)
 
+    def test_agy_wrong_type_structured_output_is_not_replaced_by_text(self):
+        out = json.dumps(dict(AGY_RESULT, structured_output=[1], response='{"a": 2}'))
+        r = adapters.parse_agy(0, out, "")
+        self.assertEqual((r["ok"], r["structured"], r["structured_native"]), (True, None, False))
+
     def test_agy_structured_from_fenced_response(self):
         out = json.dumps(dict(AGY_RESULT, response='```json\n{"verdict": "ok"}\n```'))
         self.assertEqual(adapters.parse_agy(0, out, "")["structured"], {"verdict": "ok"})
@@ -319,6 +376,12 @@ class PrepareTests(Case):
                           "--output-format", "json", "--json-schema", '{"a":1}'])
         with self.assertRaises(ValueError):
             adapters.build_argv("google", "m", None)
+        for fam in adapters.FAMILIES:
+            for bad in (None, ""):
+                with self.assertRaises(ValueError):
+                    adapters.build_argv(fam, bad, "P")
+                with self.assertRaises(ValueError):
+                    adapters.prepare(fam, "author", bad, "T", self.root)
 
     def agy_strict_shim(self):
         # Like the real agy: exits 2 when the value after -p looks like a flag.
@@ -358,11 +421,31 @@ class PrepareTests(Case):
         task = "x" * 500000
         inv = adapters.prepare("claude", "author", "sonnet", task, self.root)
         self.assertEqual((inv["transport"], inv["stdin"]), ("file", None))
-        with open(os.path.join(self.root, "task.md")) as f:
-            self.assertEqual(f.read(), task)
+        with open(os.path.join(self.root, ".overseer-task.md")) as f:
+            self.assertEqual(f.read(), adapters.TASK_MARKER + "\n" + task)
         self.assertLess(len(inv["argv"][-1]), 200)
         self.assertNotIn("\n", inv["argv"][-1])
-        self.assertIn("task.md", inv["argv"][-1])
+        self.assertIn(".overseer-task.md", inv["argv"][-1])
+
+    def test_task_file_never_overwrites_a_foreign_file(self):
+        for name in ("task.md", ".overseer-task.md"):
+            path = os.path.join(self.root, name)
+            with open(path, "w") as f:
+                f.write("project notes\n")
+            try:
+                adapters.prepare("claude", "author", "m", "T", self.root)
+            except ValueError as e:
+                self.assertEqual(name, ".overseer-task.md")
+                self.assertIn("refusing", str(e))
+            else:
+                self.assertEqual(name, "task.md")
+            with open(path) as f:
+                self.assertEqual(f.read(), "project notes\n")
+        os.unlink(os.path.join(self.root, ".overseer-task.md"))
+        adapters.prepare("claude", "author", "m", "A", self.root)
+        adapters.prepare("claude", "author", "m", "B", self.root)  # our own file is replaced
+        with open(os.path.join(self.root, ".overseer-task.md")) as f:
+            self.assertTrue(f.read().endswith("\nB"))
 
     def test_stdin_requires_recorded_true_probe(self):
         for t in ({}, {"claude": {"stdin": False}}, {"claude": {"stdin": "true"}}, {"claude": {"stdin": None}}):
@@ -378,12 +461,12 @@ class PrepareTests(Case):
     def test_reviewer_schema_flag_only_after_passing_probe(self):
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, schema=self.SCHEMA, survey={})
         self.assertNotIn("--json-schema", inv["argv"])
-        with open(os.path.join(self.root, "task.md")) as f:
+        with open(os.path.join(self.root, ".overseer-task.md")) as f:
             self.assertIn('{"type":"object"}', f.read())
         ok = {"transport": {"google": {"schema": True}}}
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, schema=self.SCHEMA, survey=ok)
         self.assertIn("--json-schema", inv["argv"])
-        with open(os.path.join(self.root, "task.md")) as f:
+        with open(os.path.join(self.root, ".overseer-task.md")) as f:
             self.assertNotIn("JSON schema", f.read())
         inv = adapters.prepare("google", "author", "m", "T", self.root, schema=self.SCHEMA, survey=ok)
         self.assertNotIn("--json-schema", inv["argv"])
@@ -463,6 +546,10 @@ class SurveyTests(Case):
                   % (self.log, self.data_file("c.json", json.dumps(ev))))
         self.shim("agy", 'case "$1" in --version) echo a;; *) cat \'%s\';; esac' % self.data_file("a.json", json.dumps(AGY_RESULT)))
         rc, _, _ = self.run_cli("survey", "--probe-auth", ANTHROPIC_API_KEY="sekrit")
+        p = self.state("survey.json")["auth_probe"]
+        self.assertEqual(p["google"]["status"], "skipped")  # no models cache: no agy model to use
+        self.write_models()
+        rc, _, _ = self.run_cli("survey", "--probe-auth", ANTHROPIC_API_KEY="sekrit")
         self.assertEqual(rc, 0)
         p = self.state("survey.json")["auth_probe"]
         self.assertEqual(p["claude"], {"status": "failed", "classification": "CONFIG", "api_key_source": "ANTHROPIC_API_KEY"})
@@ -485,6 +572,7 @@ class ProbeTransportTests(Case):
         self.shim("claude", 'case "$*" in *--json-schema*) cat \'%s\';; *) cat > \'%s\'; cat \'%s\';; esac'
                   % (self.data_file("s.json", nested), stdin_log, self.data_file("p.json", ok("PROBE-OK"))))
         self.shim("agy", "echo broken >&2; exit 1")
+        self.write_models()
         rc, out, _ = self.run_cli("probe-transport")
         self.assertEqual(rc, 0, out)
         t = self.state("survey.json")["transport"]
@@ -492,21 +580,41 @@ class ProbeTransportTests(Case):
         self.assertEqual(t["google"], {"stdin": "unsupported", "schema": False})
         with open(stdin_log) as f:
             self.assertIn("PROBE-OK", f.read())
+        calls = self.calls()  # each family is probed with its own review model
+        self.assertTrue(all("--model haiku" in c for c in calls if c.startswith("claude")), calls)
+        self.assertTrue(all("--model gemini-9-flash-high" in c for c in calls if c.startswith("agy")), calls)
+        self.assertTrue(any(c.startswith("agy") for c in calls))
         survey_doc = self.state("survey.json")
         inv = adapters.prepare("claude", "reviewer", "haiku", "T", self.root, survey=survey_doc, schema={"type": "object"})
         self.assertEqual((inv["transport"], inv["schema_flag"]), ("stdin", True))
         inv = adapters.prepare("google", "reviewer", "m", "T", self.root, survey=survey_doc, schema={"type": "object"})
         self.assertEqual((inv["transport"], inv["schema_flag"]), ("file", False))
 
+    def test_probe_requires_models_cache(self):
+        self.shim("claude", "echo x")
+        rc, _, err = self.run_cli("probe-transport")
+        self.assertEqual(rc, 1)
+        self.assertIn("models --host", err)
+        self.assertEqual(self.calls(), [])
+
+    def test_probe_skips_unavailable_family(self):
+        self.shim("agy", "exit 1")
+        self.write_models(google=False)
+        self.run_cli("probe-transport")
+        self.assertEqual(self.state("survey.json")["transport"]["google"], {"stdin": "unavailable", "schema": "unavailable"})
+        self.assertEqual(self.calls(), [])
+
     def test_schema_needs_native_structured_output(self):
         # JSON in the reply text alone does not show the CLI enforced the schema.
         text_only = json.dumps(CLAUDE_EVENTS[:-1] + [dict(CLAUDE_EVENTS[-1], result='{"answer": "ok"}')])
         self.shim("claude", 'case "$*" in *--json-schema*) cat \'%s\';; *) cat > /dev/null; echo x;; esac'
                   % self.data_file("t.json", text_only))
+        self.write_models()
         self.run_cli("probe-transport")
         self.assertIs(self.state("survey.json")["transport"]["claude"]["schema"], False)
 
     def test_missing_cli_is_recorded_as_not_run(self):
+        self.write_models()
         self.run_cli("probe-transport")
         t = self.state("survey.json")["transport"]
         self.assertEqual((t["claude"]["stdin"], t["claude"]["schema"]), (None, None))
@@ -514,6 +622,7 @@ class ProbeTransportTests(Case):
 
     def test_probe_timeout_is_unknown(self):
         self.shim("claude", "sleep 30")
+        self.write_models()
         with mock.patch.object(survey, "PROBE_TIMEOUT", 1):
             self.run_cli("probe-transport")
         self.assertEqual(self.state("survey.json")["transport"]["claude"], {"stdin": "unknown", "schema": "unknown"})
