@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, execution, judge, models, paths, plan as P, review, slurm, store, survey
+from . import approval, controller, execution, judge, models, paths, plan as P, review, slurm, store, survey
 
 from . import github as _github  # noqa: E402
 
@@ -151,12 +151,10 @@ register("dispositions", "record finding dispositions, an orchestrator decision,
 register("fix", "launch a fixer in the unit's worktree", review.configure_fix, review.run_fix)
 register("nonvacuous", "check that the tests fail without the non-test changes",
          review.configure_nonvacuous, review.run_nonvacuous)
-for _name, _help in [
-    ("merge", "merge an approved pull request (U8)"),
-    ("next", "print the next action (U8)"),
-    ("report", "write the evidence report (U9)"),
-]:
-    register(_name, _help)
+register("merge", "integrate the target, push, squash-merge the pull request and close the unit",
+         controller.configure_merge, controller.run_merge)
+register("next", "print the eligible actions derived from disk (no network)", controller.configure_next, controller.run_next)
+register("report", "write the evidence report (U9)")
 _github.register_commands(register)
 
 
@@ -196,4 +194,9 @@ def main(argv=None):
         _err("error: %s" % e)
     except approval.OwnerStop as e:
         _err(str(e))
+        try:
+            store.append_event(paths.find_root(args.root), "OWNER_STOP", command=args.command,
+                               reason=str(e).split("OWNER_STOP: ", 1)[-1])
+        except OSError:
+            pass
     return 1

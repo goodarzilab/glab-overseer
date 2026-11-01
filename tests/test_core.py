@@ -15,7 +15,7 @@ SUBCOMMANDS = (
 ).split()
 STUBS = [c for c in SUBCOMMANDS if c not in ("plan", "unlock", "survey", "probe-transport", "models", "dispatch", "status", "wait", "abort", "slurm-handshake", "judge", "resolve", "review", "reproduce", "dispositions", "fix", "nonvacuous")]
 
-STUBS = [c for c in STUBS if c not in ("issues", "pr")]
+STUBS = [c for c in STUBS if c not in ("issues", "pr", "merge", "next")]
 
 
 class PathsTests(TmpCase):

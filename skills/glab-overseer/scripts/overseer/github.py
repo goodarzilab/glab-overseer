@@ -9,7 +9,7 @@ State: `issues.json` of the plan holds `filed` {unit: number}, `filed_at` {unit:
 and `links` {"<unit><-<need>": {...}} next to U1's `drafts`; `units/<unit>/pr.json` holds the
 pull request record. Writers expect the caller to hold `store.ProjectLock`.
 
-Nothing here merges (U8). Worker-side modules must not import this module.
+Nothing here merges (`controller`). Worker-side modules must not import this module.
 """
 import contextlib
 import json
@@ -426,6 +426,21 @@ def close_issue(number, comment, repo, root):
     return "CLOSED"
 
 
+def set_tracker(root, plan_id, unit_id, **fields):
+    """Replace the unit's tracker facet (visible in `status`); the caller holds the project lock."""
+    st = approval.load_unit_state(root, plan_id, unit_id)
+    st["tracker"] = dict(fields)
+    approval.save_unit_state(root, plan_id, unit_id, st)
+
+
+def default_branch(repo):
+    d = _read(["repo", "view", "-R", repo, "--json", "defaultBranchRef"], "repo view", dict)
+    ref = d.get("defaultBranchRef")
+    if not (isinstance(ref, dict) and isinstance(ref.get("name"), str) and ref["name"]):
+        raise GithubError("repo view returned no default branch")
+    return ref["name"]
+
+
 def _judgment(root, plan_id, unit):
     n = approval.load_unit_state(root, plan_id, unit["id"])["counters"]["attempts"]
     return J.valid_judgment(root, plan_id, unit, n) if X._int(n) else None
@@ -645,6 +660,7 @@ def run_issues(args):
         with store.ProjectLock(root, "issues close"):
             pid, unit = _unit(root, args)
             number, state = close_unit_issue(root, pid, unit, args.comment)
+            set_tracker(root, pid, unit["id"], issue=number, state="closed", via="issues close")
         print("#%d %s" % (number, state))
         return 0
     return _guard(go)
