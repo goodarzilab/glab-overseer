@@ -97,7 +97,8 @@ class MergeCase(GhCase):
     def fake_review(self, uid, round_=1):
         rdir = os.path.join(paths.attempt_dir(self.root, "demo", uid, 1), "reviews", "r%d" % round_)
         store.write_json_atomic(os.path.join(rdir, "round.json"), {
-            "round": round_, "candidate": self.head(uid), "state": "complete", "verdict": "PASS", "retried": False, "calls": []})
+            "round": round_, "candidate": self.head(uid), "state": "complete", "verdict": "PASS", "retried": False,
+            "host": "claude", "calls": [{"state": "ok", "session_id": "reviewer-%s-%d" % (uid, round_)}]})
         store.write_json_atomic(os.path.join(rdir, "review.json"), {"verdict": "PASS", "findings": []})
 
     def ready(self, uid, round_=1):
