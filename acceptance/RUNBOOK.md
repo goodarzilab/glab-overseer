@@ -58,10 +58,11 @@ A job-only plan in its own project and repository, in an allocation:
 
 ```
 python3 $ACC/make_fixture.py $PROJ2 --job-only --plan-id accept-d3 --target d3 --repo $REPO --partition $PART [--account $ACCT] --time 00:10:00 --mem 4G --cpus 1
+cd $PROJ2 && PLAN=accept-d3 && git remote add origin https://github.com/$REPO.git && git push -u origin d3   # the repository already exists
 ```
 
-1. Run 1 steps 1, 4 and 6 with `PLAN=accept-d3` (survey on the full PATH, so `survey.json` records Slurm usable).
-2. `$OV dispatch --plan accept-d3`; `$OV wait` until both jobs exit.
+1. In `$PROJ2` with `PLAN=accept-d3`, Run 1 steps 1, 4 and 6 (survey on the full PATH, so `survey.json` records Slurm usable).
+2. `$OV dispatch --plan accept-d3`. Then do not run `wait`, `status`, `next` or `judge` for this plan until both jobs have been finished for longer than the cluster's `MinJobAge` (`scontrol show config | grep MinJobAge`); watch them only with `squeue -u $USER`. The supervisor caches a terminal scontrol answer and queries sacct only when scontrol has no record, so an earlier poll would let scontrol answer forever and the fallback would never run.
 3. A PATH without `sacct`:
 
 ```
@@ -70,7 +71,7 @@ for t in sbatch squeue scontrol sinfo scancel srun python3 git gh bash env sh da
   p=$(command -v $t) && ln -sf "$p" $PROJ2/.nosacct/$t; done
 ```
 
-4. `PATH=$PROJ2/.nosacct $OV judge summarize` (do not rerun `survey` in this shell). Expected DONE from scontrol, the wrapper `exit.json` and the outputs. Evidence: `inv/01-job/evidence.json` (sacct outcome not answered, `sacct_ever_answered` false), `judgment.json`.
+4. `PATH=$PROJ2/.nosacct $OV judge summarize` (do not rerun `survey` in this shell). Expected: scontrol no longer knows the job, the sacct query is made and fails because the tool is missing, and the judgment is DONE from the wrapper `exit.json` and the outputs. The claim `sacct` passes only when `evidence.json` has a `sacct` entry showing the query was made and did not answer; if scontrol still answered (the job was polled or judged before `MinJobAge` passed), the entry is null and the claim is INCOMPLETE (report it as printed). Evidence: `inv/01-job/evidence.json` (sacct outcome not answered, `sacct_ever_answered` false), `judgment.json`.
 5. Lost terminal evidence (a simulation; say so in the report): move the second job's wrapper receipt aside and hide the Slurm query tools.
 
 ```
@@ -87,7 +88,14 @@ Evidence: `judgment.json` UNCERTAIN; `$OV status` shows the slot held. If a fini
 
 ## 3. Run 2: Slurm hidden, local backend
 
-Inside an allocation, with `python3 $ACC/make_fixture.py $PROJ3 --no-slurm --plan-id accept-run2 --target run2 --repo $REPO ...`.
+Inside an allocation:
+
+```
+python3 $ACC/make_fixture.py $PROJ3 --no-slurm --plan-id accept-run2 --target run2 --repo $REPO ...
+cd $PROJ3 && PLAN=accept-run2 && git remote add origin https://github.com/$REPO.git && git push -u origin run2   # the repository already exists
+```
+
+Every project-relative command below runs in `$PROJ3` with `PLAN=accept-run2`.
 
 The login-node guard refuses a local agent launch only when `sbatch` resolves on `PATH` and `SLURM_JOB_ID` is unset. Inside an allocation `SLURM_JOB_ID` is set, so the guard allows the launch whatever `PATH` holds; with Slurm tools removed from `PATH`, `sbatch` does not resolve and there is nothing to refuse. `OVERSEER_DISABLE_SLURM=1` makes the backend local even when a cached `survey.json` said Slurm was usable.
 
@@ -95,11 +103,12 @@ The login-node guard refuses a local agent launch only when `sbatch` resolves on
 
 ```
 BIN=$PROJ3/.bin; SH=$PROJ3/.shims; export SHIM_LOG=$PROJ3/slurm-calls.log; mkdir -p $BIN $SH; : > $SHIM_LOG
-for t in python3 git gh claude agy bash env sh date hostname uname cat head wc test grep sed mv rm mkdir dirname basename sleep ps kill; do
+for t in python3 git gh claude agy node bash env sh date hostname uname cat head wc test grep sed awk tr tee mv cp rm mkdir ls find mktemp readlink dirname basename sleep ps kill id stat xargs; do
   p=$(command -v $t) && ln -sf "$p" $BIN/$t; done
 for t in sbatch squeue scontrol sacct sinfo scancel srun salloc; do
   printf '#!/bin/sh\necho "$(date -u +%%FT%%TZ) %s $*" >> "$SHIM_LOG"\nexit 127\n' $t > $SH/$t; chmod +x $SH/$t; done
 export OVERSEER_DISABLE_SLURM=1 PATH=$BIN:$SH
+PATH=$BIN:$SH claude --version && PATH=$BIN:$SH agy --version   # must both succeed before continuing; add any missing tool (for example a node binary) to $BIN
 ```
 
 Any Slurm call by the supervisor or a worker lands in `slurm-calls.log`.
@@ -109,7 +118,12 @@ Any Slurm call by the supervisor or a worker lands in `slurm-calls.log`.
 
 ## 4. Run 3: Antigravity host
 
-1. `make_fixture.py $PROJ4 --plan-id accept-run3 --target run3 --repo $REPO ...` as in Section 0 (`--no-slurm` off-cluster).
+1. As in Section 0 (`--no-slurm` off-cluster):
+
+```
+python3 $ACC/make_fixture.py $PROJ4 --plan-id accept-run3 --target run3 --repo $REPO ...
+cd $PROJ4 && PLAN=accept-run3 && git remote add origin https://github.com/$REPO.git && git push -u origin run3   # the repository already exists
+```
 2. `$OV models --host google`. Evidence: `models.json` (argon-tier author at high, Claude `haiku` reviewer, dated).
 3. Start the orchestrator as an `agy -p` session given SKILL.md and the Run 1 step list. The prompt must directly follow `-p` (P13):
 

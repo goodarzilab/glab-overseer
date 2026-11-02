@@ -254,7 +254,8 @@ class CheckRunTests(unittest.TestCase):
         wj(p, {"integration_base": B, "integrated_candidate": D})
         self.upd(self.a1("count", "judgment.json"), integrated=False)
         self.assertEqual(self.chk()[1]["count.integration"], "FAIL")
-        self.upd(self.p("slug", "merge.json"), merged_at="2026-11-01T11:00:00Z")  # now slug merged last
+        with open(os.path.join(self.root, ".overseer", "events.jsonl"), "w") as f:  # now slug merged last
+            f.write("".join(json.dumps({"kind": "merged", "unit_id": u}) + "\n" for u in ("count", "slug")))
         self.assertEqual(self.chk()[1]["slug.integration"], "FAIL")
         os.unlink(self.p("slug", "merge.json"))
         self.assertEqual(self.chk()[1]["integration"], "INCOMPLETE")
@@ -474,6 +475,110 @@ class ReviewRound1Tests(unittest.TestCase):
         wj(self.u("count", "attempts/a1/inv/01-author/intent.json"), {"argv": [5]})
         wj(self.u("summarize", "attempts/a1/inv/01-job/evidence.json"), {"sources": [1], "sacct_ever_answered": "x"})
         self.assertTrue(self.claims({"overlap": [1, 2], "recovery": {"unit": "slug", "merge_log": 4}, "integration_units": [9]})[1]["claims"])
+
+
+class ReviewRound2Tests(unittest.TestCase):
+    """One test per round-2 review finding (F1 to F7); see .swarm/u10-review-r2.txt."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, True))
+        build_tree(self.root)
+        with open(os.path.join(ACC, "RUNBOOK.md")) as f:
+            self.book = f.read()
+
+    def u(self, u, *rest):
+        return os.path.join(self.root, ".overseer", UNITS, u, *rest)
+
+    def claims(self, expect=None):
+        s = C.evaluate(self.root, PID, {"backend": "slurm"} if expect is None else expect)
+        return dict((c["id"], c) for c in s["claims"]), s
+
+    def section(self, start, end):
+        return self.book[self.book.index(start):self.book.index(end)]
+
+    def test_F1_missing_plan_json_is_incomplete(self):
+        pj = os.path.join(self.root, ".overseer", "plans", PID, "plan.json")
+        os.unlink(pj)
+        cl, s = self.claims()
+        self.assertEqual(cl["plan"]["status"], "INCOMPLETE")
+        self.assertGreater(s["counts"]["INCOMPLETE"], 0)
+        with open(pj, "w") as f:
+            f.write("[1")
+        self.assertEqual(self.claims()[0]["plan"]["status"], "INCOMPLETE")
+        ex = os.path.join(self.root, "expect.json")
+        wj(ex, {"backend": "slurm"})
+        r = subprocess.run([sys.executable, os.path.join(ACC, "check_run.py"), self.root, PID, "--expect", ex],
+                           stdout=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(r.returncode, 3)
+
+    def test_F2_review_must_cover_current_attempt(self):
+        base = self.u("slug", "attempts")
+        shutil.copytree(os.path.join(base, "a1"), os.path.join(base, "a2"))
+        shutil.rmtree(os.path.join(base, "a2", "reviews"))
+        c = self.claims({"run": "run1"})[0]["slug.review"]
+        self.assertEqual(c["status"], "INCOMPLETE")
+        self.assertIn("a2", c["detail"])
+        wj(os.path.join(base, "a2", "reviews", "r1", "round.json"), {"state": "complete", "reviewer_family": "google",
+                                                                    "same_family_fallback": False, "calls": [{"state": "ok", "family": "google"}]})
+        self.assertEqual(self.claims({"run": "run1"})[0]["slug.review"]["status"], "PASS")
+        # an earlier-attempt fallback still fails
+        wj(os.path.join(base, "a1", "reviews", "r2", "round.json"), {"state": "complete", "reviewer_family": "claude",
+                                                                    "same_family_fallback": True, "calls": [{"state": "ok", "family": "claude"}]})
+        self.assertEqual(self.claims({"run": "run1"})[0]["slug.review"]["status"], "FAIL")
+
+    def test_F2_merged_attempt_is_the_reviewed_one(self):
+        base = self.u("slug", "attempts")
+        shutil.copytree(os.path.join(base, "a1"), os.path.join(base, "a2"))
+        shutil.rmtree(os.path.join(base, "a2", "reviews"))
+        wj(os.path.join(base, "a1", "judgment.json"), {"status": "DONE", "candidate": "c1", "outputs": [{"path": "x", "ok": True}]})
+        wj(os.path.join(base, "a2", "judgment.json"), {"status": "DONE", "candidate": "c2", "outputs": [{"path": "x", "ok": True}]})
+        m = rj(self.u("slug", "merge.json"))
+        wj(self.u("slug", "merge.json"), dict(m, candidate="c1"))
+        self.assertEqual(self.claims({"run": "run1"})[0]["slug.review"]["status"], "PASS")  # a1 was merged and reviewed
+
+    def test_F3_sacct_needs_an_entry(self):
+        ev = self.u("summarize", "attempts/a1/inv/01-job/evidence.json")
+        for srcs in ({"scontrol": {"outcome": "known"}}, {"scontrol": {"outcome": "known"}, "sacct": None}):
+            wj(ev, {"sources": srcs, "sacct_ever_answered": False})
+            self.assertEqual(self.claims({"sacct": "unavailable"})[0]["summarize.sacct"]["status"], "INCOMPLETE")
+        wj(ev, {"sources": {"scontrol": {"outcome": "known"}, "sacct": {"outcome": "error"}}, "sacct_ever_answered": False})
+        self.assertEqual(self.claims({"sacct": "unavailable"})[0]["summarize.sacct"]["status"], "PASS")
+
+    def test_F4_merge_order_is_event_order(self):
+        for u in ("slug", "count"):
+            p = self.u(u, "merge.json")
+            wj(p, dict(rj(p), merged_at="2026-11-01T10:20:00Z"))
+        cl = self.claims({})[0]
+        self.assertEqual(cl["count.integration"]["status"], "PASS")
+        self.assertNotIn("slug.integration", cl)
+        with open(os.path.join(self.root, ".overseer", "events.jsonl"), "w") as f:  # count first, slug second, equal timestamps
+            f.write("".join(json.dumps({"kind": "merged", "unit_id": u}) + "\n" for u in ("count", "slug")))
+        self.assertEqual(self.claims({})[0]["slug.integration"]["status"], "FAIL")
+        os.unlink(os.path.join(self.root, ".overseer", "events.jsonl"))
+        self.assertEqual(self.claims({})[0]["integration"]["status"], "INCOMPLETE")
+
+    def test_F5_sections_change_directory(self):
+        d3 = self.section("## 2. ", "## 3. ")
+        r2 = self.section("## 3. ", "## 4. ")
+        r3 = self.section("## 4. ", "## 5. ")
+        for text, proj, plan in ((d3, "$PROJ2", "accept-d3"), (r2, "$PROJ3", "accept-run2"), (r3, "$PROJ4", "accept-run3")):
+            self.assertIn("cd %s && PLAN=%s" % (proj, plan), text)
+
+    def test_F6_each_run_pushes_its_target(self):
+        for sec in (self.section("## 2. ", "## 3. "), self.section("## 3. ", "## 4. "), self.section("## 4. ", "## 5. ")):
+            self.assertIn("git remote add origin https://github.com/$REPO.git", sec)
+        self.assertIn("git push -u origin d3", self.section("## 2. ", "## 3. "))
+        self.assertIn("git push -u origin run2", self.section("## 3. ", "## 4. "))
+        self.assertIn("git push -u origin run3", self.section("## 4. ", "## 5. "))
+        self.assertEqual(self.book.count("gh repo create"), 1)
+
+    def test_F7_run2_path_has_tools(self):
+        sec = self.section("## 3. ", "## 4. ")
+        loop = [l for l in sec.splitlines() if l.startswith("for t in python3")][0].split()
+        for tool in ("tee", "node", "readlink", "tr", "awk"):
+            self.assertIn(tool, loop)
+        self.assertIn("PATH=$BIN:$SH claude --version && PATH=$BIN:$SH agy --version", sec)
 
 
 if __name__ == "__main__":

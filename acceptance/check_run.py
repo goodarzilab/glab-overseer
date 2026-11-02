@@ -204,12 +204,28 @@ def check_judgment(run, uid, kind):
     return j
 
 
+def current_attempt(run, uid):
+    """The attempt whose judgment is current: the one holding merge.json's candidate when merged, else the
+    latest attempt that has a judgment, else the latest attempt."""
+    atts = run.attempts(uid)
+    if not atts:
+        return run.adir(uid)
+    m = run.load(run.udir(uid), "merge.json") or {}
+    if m.get("state") == "merged" and isinstance(m.get("candidate"), str):
+        hit = [a for a in atts if (run.load(a, "judgment.json") or {}).get("candidate") == m["candidate"]]
+        if hit:
+            return hit[-1]
+    judged = [a for a in atts if run.load(a, "judgment.json")]
+    return (judged or atts)[-1]
+
+
 def check_review(run, uid):
     cid, base_ev = "%s.review" % uid, os.path.join(run.adir(uid), "reviews")
     want_a, want_r = run.expect.get("author_family"), run.expect.get("reviewer_family")
     if not (want_a and want_r) and run.expect.get("run") in RUN_FAMILIES:
         da, dr = RUN_FAMILIES[run.expect["run"]]
         want_a, want_r = want_a or da, want_r or dr
+    cur = current_attempt(run, uid)
     rounds, fams = [], [author_family(run, a) for a in run.attempts(uid)]
     unit_fam = next((f for f in fams if f), None)
     for adir, afam in zip(run.attempts(uid), fams):
@@ -224,7 +240,7 @@ def check_review(run, uid):
                 calls = rd.get("calls") if isinstance(rd.get("calls"), list) else []
                 ok = [c for c in calls if isinstance(c, dict) and c.get("state") == "ok"]
                 rounds.append({"name": "%s/%s" % (os.path.basename(adir), n), "family": (ok[-1] if ok else {}).get("family") or rd.get("reviewer_family"),
-                               "fallback": rd.get("same_family_fallback") is True, "author": afam or unit_fam,
+                               "fallback": rd.get("same_family_fallback") is True, "author": afam or unit_fam, "current": adir == cur,
                                "path": os.path.join(base, n, "round.json")})
     if not rounds or unit_fam is None:
         return run.add(cid, INCOMPLETE, base_ev, "no completed review round" if not rounds else "author family not in inv/*/intent.json")
@@ -237,12 +253,15 @@ def check_review(run, uid):
     for r in rounds:
         if want_r and r["family"] and r["family"] != want_r:
             return run.add(cid, FAIL, r["path"], "round %s reviewer family %s, run requires %s" % (r["name"], r["family"], want_r))
-    good = [r for r in rounds if r["family"] and r["family"] != r["author"]]
+    now = [r for r in rounds if r["current"]]
+    if not now:
+        return run.add(cid, INCOMPLETE, os.path.join(cur, "reviews"), "no completed review round on the current attempt %s" % os.path.basename(cur))
+    good = [r for r in now if r["family"] and r["family"] != r["author"]]
     if good:
         run.add(cid, PASS, good[-1]["path"], "%d round(s), none a fallback; %s by %s reviewed a %s author" % (
             len(rounds), good[-1]["name"], good[-1]["family"], good[-1]["author"]))
     else:
-        run.add(cid, INCOMPLETE, rounds[-1]["path"], "no review round records a reviewer family")
+        run.add(cid, INCOMPLETE, now[-1]["path"], "no review round records a reviewer family")
 
 
 def check_nonvacuity(run, uid):
@@ -291,12 +310,17 @@ def check_tracker(run, uid):
 def check_integration(run, code, merges):
     ids = run.expect.get("integration_units")
     if not isinstance(ids, list):
-        merged = sorted((m.get("merged_at") or "", u) for u, m in merges.items() if m and m.get("state") == "merged")
         if len(code) < 2:
             return
-        if len(merged) < 2:
-            return run.add("integration", INCOMPLETE, run.pdir, "fewer than two merged code units")
-        ids = [merged[1][1]]
+        order = []  # merge order is the line order of the `merged` events, never a timestamp
+        for e in run.events():
+            u = e.get("unit_id")
+            if e.get("kind") == "merged" and u in code and (merges.get(u) or {}).get("state") == "merged" and u not in order:
+                order.append(u)
+        if len(order) < 2:
+            return run.add("integration", INCOMPLETE, os.path.join(run.state, "events.jsonl"),
+                           "fewer than two merged code units with a merged event in events.jsonl")
+        ids = [order[1]]
     for uid in ids:
         adir = run.adir(uid)
         if run.load(adir, "integration.json") is None and merges.get(uid):
@@ -329,7 +353,9 @@ def job_sources(run, adir):
     if ex.get("rc") == 0:
         ans.append("wrapper")
     ever = bool(ev) and ev.get("sacct_ever_answered") is True
-    silent = bool(ev) and ev.get("sacct_ever_answered") is False and sub(srcs, "sacct").get("outcome") not in ("known", "listed", "not_known")
+    sa = sub(srcs, "sacct")  # null or absent when sacct was never consulted
+    silent = bool(ev) and ev.get("sacct_ever_answered") is False and isinstance(sa.get("outcome"), str) \
+        and sa["outcome"] not in ("known", "listed", "not_known")
     return sorted(set(ans)), ever, inv, silent
 
 
@@ -452,6 +478,8 @@ def evaluate(root, plan_id, expect):
     if not os.path.isdir(run.pdir):
         run.add("plan", INCOMPLETE, run.pdir, "no state for plan %s" % plan_id)
         return summary(run)
+    if run.load(run.pdir, "plan.json") in (None, False):
+        run.add("plan", INCOMPLETE, os.path.join(run.pdir, "plan.json"), "plan.json missing or unreadable: units not known from the plan")
     code = guarded(run, "units", Run.unit_ids, "code_units", "code") or []
     jobs = guarded(run, "units", Run.unit_ids, "job_units", "job") or []
     guarded(run, "overlap", check_overlap, code)
