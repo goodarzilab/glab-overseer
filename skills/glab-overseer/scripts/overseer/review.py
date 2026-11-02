@@ -453,11 +453,45 @@ def record_decision(root, plan_id, unit, text):
     done = len(_rounds(adir))
     if done < _cap(plan):
         raise ReviewError("%d of %d review rounds used; an orchestrator decision is accepted only at the cap" % (done, _cap(plan)))
+    try:  # binds the decision to the non-vacuity record that exists now (null when none does)
+        with open(os.path.join(adir, "nonvacuous.json"), "rb") as f:
+            nv_digest = hashlib.sha256(f.read()).hexdigest()
+    except FileNotFoundError:
+        nv_digest = None
     store.write_json_atomic(os.path.join(adir, "reviews", "orchestrator_decision.json"),
                             {"orchestrator_decision": True, "text": text.strip(), "candidate": j["candidate"],
-                             "rounds": done, "time": store.utc_now()})
+                             "rounds": done, "nonvacuous_sha256": nv_digest, "time": store.utc_now()})
     store.append_event(root, "orchestrator_decision", plan_id=plan_id, unit_id=unit["id"], candidate=j["candidate"])
     return review_state(root, plan_id, unit)
+
+
+def equivalent_candidates(adir, cand):
+    """The candidate plus every earlier candidate whose review was carried forward to it (carry.json)."""
+    c = _obj(os.path.join(adir, "reviews", "carry.json"))
+    if c and c.get("candidate") == cand and isinstance(c.get("candidates"), list):
+        return set(c["candidates"]) | {cand}
+    return {cand}
+
+
+def carry_forward(root, plan_id, unit):
+    """After an integration: carry the review (and non-vacuity) to the integrated candidate when the unit's own
+    change is unchanged. Returns (carried, previous patch id, integrated patch id); nothing is written otherwise."""
+    j, n, adir, wt = _current(root, plan_id, unit)
+    integ = _obj(os.path.join(adir, "integration.json"))
+    if not integ or integ.get("integrated_candidate") != j["candidate"]:
+        raise ReviewError("the current candidate is not a recorded integration")
+    prev = integ["previous_candidate"]
+    p1 = patch_id(wt, integ["previous_base"], prev)
+    p2 = patch_id(wt, integ["integration_base"], j["candidate"])
+    if p1 is None or p1 != p2:
+        return False, p1, p2
+    chain = sorted(equivalent_candidates(adir, prev))
+    store.write_json_atomic(os.path.join(adir, "reviews", "carry.json"), {
+        "candidate": j["candidate"], "candidates": chain + [j["candidate"]], "time": store.utc_now(),
+        "carried_from": {"candidate": prev, "patch_id": p1, "integrated_patch_id": p2}})
+    store.append_event(root, "review_carried", plan_id=plan_id, unit_id=unit["id"], candidate=j["candidate"],
+                       carried_from=prev, patch_id=p1)
+    return True, p1, p2
 
 
 def review_state(root, plan_id, unit):
@@ -472,14 +506,15 @@ def review_state(root, plan_id, unit):
     cand = j["candidate"]
     rounds = _rounds(adir)
     dec = _obj(os.path.join(adir, "reviews", "orchestrator_decision.json"))
-    if dec and dec.get("candidate") == cand and len(rounds) >= _cap(plan):
+    eq = equivalent_candidates(adir, cand)
+    if dec and dec.get("candidate") in eq and len(rounds) >= _cap(plan):
         return {"state": "ELIGIBLE", "reasons": ["orchestrator decision recorded at the round cap"], "orchestrator_decision": True}
     if not rounds:
         return no("no review round")
     R, rdir, rd = rounds[-1]
     if rd.get("state") != "complete":
         return no("round r%d has no verdict (%s)" % (R, rd.get("state")))
-    if rd.get("candidate") != cand:
+    if rd.get("candidate") not in eq:
         return no("round r%d reviewed %s, not the current candidate" % (R, str(rd.get("candidate"))[:12]))
     sid = next((c.get("session_id") for c in rd["calls"] if c.get("state") == "ok"), None)
     if not sid or sid in author_sessions(root, plan_id, unit["id"], n, rd["host"]):
@@ -489,7 +524,7 @@ def review_state(root, plan_id, unit):
     if rd["verdict"] == "PASS" and not blocking:
         return {"state": "ELIGIBLE", "reasons": [], "orchestrator_decision": False}
     disp = _obj(os.path.join(rdir, "dispositions.json"))
-    if not disp or disp.get("candidate") != cand:
+    if not disp or disp.get("candidate") not in eq:
         return no("round r%d has findings without dispositions bound to the current candidate" % R)
     reasons = []
     for f in findings:

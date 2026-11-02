@@ -39,6 +39,56 @@ class GitError(WorkspaceError):
     pass
 
 
+class DestructiveGit(approval.OwnerStop):
+    """A git command that could lose or rewrite history; refused before it runs (never recorded as a git failure)."""
+
+
+# Every git call of the supervisor goes through `git()`, which refuses these. The supervisor never needs them.
+_HISTORY_VERBS = ("rebase", "filter-branch", "filter-repo")
+_OPT_WITH_VALUE = ("-c", "-C", "--git-dir", "--work-tree", "--namespace")
+# The git builtins the supervisor runs. An alias can never shadow a builtin, so any other subcommand (which git
+# would resolve through an alias or an external `git-<name>` program) is refused, and so is any alias definition.
+_ALLOWED_SUBCOMMANDS = frozenset((
+    "add", "branch", "cat-file", "checkout", "clone", "commit", "diff", "diff-tree", "fetch", "ls-files", "ls-remote",
+    "ls-tree", "merge", "merge-base", "patch-id", "push", "rev-list", "rev-parse", "rm", "status",
+    "symbolic-ref", "worktree"))  # no update-ref or reset: the supervisor never moves a ref or resets a branch by hand
+_FORCE_LONG = ("--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune", "--delete")
+
+
+def destructive_reason(args):
+    """Why `args` (git argv after the executable) is destructive, or None."""
+    a = [x for x in args if isinstance(x, str)]
+    i = 0
+    while i < len(a) and a[i].startswith("-"):
+        if a[i] in ("-c", "--config-env") or a[i].startswith("--config-env="):
+            val = a[i + 1] if a[i] in ("-c", "--config-env") and i + 1 < len(a) else a[i].partition("=")[2]
+            if val.strip().lower().startswith("alias."):
+                return "alias definition (%s)" % val.split("=")[0][:80]
+        i += 2 if a[i] in _OPT_WITH_VALUE or a[i] == "--config-env" else 1
+    if i >= len(a):
+        return None
+    sub, rest = a[i], a[i + 1:]
+    longs = set(x.split("=")[0] for x in rest if x.startswith("--"))
+    shorts = "".join(x[1:] for x in rest if x.startswith("-") and not x.startswith("--"))
+    refs = [x for x in rest if not x.startswith("-")]
+    if sub in _HISTORY_VERBS:
+        return "history rewriting (%s)" % sub
+    if sub not in _ALLOWED_SUBCOMMANDS:
+        return "subcommand %r is not a git builtin the supervisor uses (it could be an alias)" % sub[:40]
+    if sub == "commit" and "--amend" in longs:
+        return "commit --amend"
+    if sub == "reset" and "--hard" in longs:
+        return "reset --hard"
+    if sub == "branch" and ("--delete" in longs or "d" in shorts or "D" in shorts):
+        return "branch deletion"
+    if sub == "update-ref" and ("-d" in rest or "--delete" in longs):
+        return "ref deletion"
+    if sub == "push" and (longs & set(_FORCE_LONG) or "f" in shorts or "d" in shorts
+                          or any(r.startswith(("+", ":")) or ":+" in r for r in refs)):
+        return "forced or deleting push"
+    return None
+
+
 # ---- git ---------------------------------------------------------------------
 
 def git_env():
@@ -54,6 +104,9 @@ def git(cwd, *args, stdin=None, timeout=GIT_TIMEOUT, raw=False, ok=(0,)):
 
     A timeout or a return code outside `ok` raises GitError: an unanswered git question is never success.
     """
+    why = destructive_reason(args)
+    if why:
+        raise DestructiveGit("destructive git refused (%s): git %s" % (why, " ".join(map(str, args))[:200]))
     env = git_env()
     exe = E.resolve_exe("git", env.get("PATH", ""))
     if exe is None:

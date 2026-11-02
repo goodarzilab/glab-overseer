@@ -271,6 +271,11 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
         if cand:  # per-output results are evidence even when the judgment fails
             j["outputs"] = code_outputs(wt, cand, unit)
         return j
+    return _check_candidate(j, unit, adir, wt, cand, timeout)
+
+
+def _check_candidate(j, unit, adir, wt, cand, timeout):
+    """Run the unit's test command and output predicates against `cand` (same rules for author and integrated heads)."""
     # the test runs in a clean, disposable detached checkout of the candidate, so untracked or
     # ignored worktree-only files cannot make it pass; the live worktree is checked afterwards
     scratch = tempfile.mkdtemp(prefix="ovr-test-")
@@ -302,6 +307,47 @@ def _judge_code(root, plan_id, unit, n, adir, cls, ev, timeout):
     if not j["reasons"]:
         j["status"] = "DONE"
     return j
+
+
+def rejudge_integrated(root, plan_id, unit, integration_base, previous_candidate, previous_base,
+                       test_timeout=TEST_TIMEOUT):
+    """Judge the supervisor's merge of the target into the unit branch (never U5 normalization: it rejects merges).
+
+    The worktree must be on the unit branch with no tracked change and HEAD must be a merge of exactly
+    `previous_candidate` and `integration_base`. integration.json is written before anything runs; the new
+    judgment binds to the merge commit and carries `integrated: true`. The caller holds the project lock.
+    """
+    if unit["kind"] != "code":
+        raise JudgeError("only code units have an integrated head")
+    st, n, adir = _unit_attempt(root, plan_id, unit)
+    ws = W.load_workspace(adir)
+    wt = ws["worktree"]
+    if W.git(wt, "symbolic-ref", "-q", "HEAD", ok=(0, 1))["stdout"].strip() != "refs/heads/" + ws["branch"]:
+        raise JudgeError("worktree is not on the unit branch %s" % ws["branch"])
+    head = W.rev(wt, "HEAD")
+    problems = _worktree_problems(wt, head, "supervisor")
+    if problems:
+        raise JudgeError("worktree is not clean: " + "; ".join(problems))
+    if W.git(wt, "rev-list", "--parents", "-n", "1", head)["stdout"].split()[1:] != [previous_candidate, integration_base]:
+        raise JudgeError("HEAD %s is not the merge of %s into %s" % (head[:12], integration_base[:12], previous_candidate[:12]))
+    prev = X._load(os.path.join(adir, "judgment.json"))
+    if not (isinstance(prev, dict) and prev.get("status") == "DONE" and prev.get("candidate") == previous_candidate):
+        raise JudgeError("the previous DONE judgment does not bind to %s" % previous_candidate[:12])
+    store.write_json_atomic(os.path.join(adir, "integration.json"), {
+        "integration_base": integration_base, "previous_candidate": previous_candidate, "previous_base": previous_base,
+        "integrated_candidate": head, "time": store.utc_now()})
+    j = {"status": "FAILED", "base": prev.get("base"), "candidate": head, "integrated": True,
+         "integration_base": integration_base, "previous_candidate": previous_candidate, "test_rc": None,
+         "outputs": [], "reasons": [], "execution": prev.get("execution"), "out_of_scope_dirty": [],
+         "invocation_token": prev.get("invocation_token")}
+    changed = W.zsplit(W.git(wt, "diff", "--name-only", "-z", integration_base, head, raw=True)["stdout"])
+    j["reasons"] += ["out_of_scope_after_integration:" + p for p in changed if not W.in_scope(p, unit["scope"])]
+    if j["reasons"]:
+        j["outputs"] = code_outputs(wt, head, unit)
+        return _record(root, plan_id, unit, n, adir, j)
+    store.append_event(root, "integrated", plan_id=plan_id, unit_id=unit["id"], attempt=n, previous=previous_candidate,
+                       integration_base=integration_base, candidate=head)
+    return _record(root, plan_id, unit, n, adir, _check_candidate(j, unit, adir, wt, head, test_timeout))
 
 
 def _judge_job(unit, adir, cls, ev):

@@ -811,15 +811,23 @@ def wait_for_change(root, timeout=1800.0, poll=15.0, emit=None, sleep=time.sleep
 # ---- commands --------------------------------------------------------------
 
 def configure_dispatch(p):
-    p.add_argument("--unit", required=True, metavar="UNIT")
+    p.add_argument("--unit", default=None, metavar="UNIT", help="omit to dispatch every READY unit up to the free slots")
     p.add_argument("--plan", default=None, metavar="PLAN_ID")
     p.add_argument("--after-quota", action="store_true", help="allow a new attempt after a QUOTA or AUTH failure")
 
 
 def run_dispatch(args):
     root = paths.find_root(args.root)
+    if args.unit is None:
+        from . import controller
+        return controller.dispatch_ready(root, args.plan, args.after_quota)
     with store.ProjectLock(root, "dispatch"):
         pid = args.plan or approval.find_plan_for_unit(root, args.unit)
+        from . import controller
+        problems = controller.owner_problems(root, pid)  # the same owner checks as dispatch without a unit
+        if problems:
+            controller.report_owner_stops(root, "dispatch", pid, problems)
+            return 1
         approval.require_approval(root, pid)
         unit = _unit_of(approval.effective_plan(root, pid), args.unit)
         if unit["kind"] == "code":
@@ -905,9 +913,9 @@ def run_status(args):
         print("plan %s: slots %d/%d (project %d/%d)" % (pid, p["slots_in_use"], p["workers_cap"],
                                                           data["slots_in_use"], data["project_limit"]))
         for uid, u in p["units"].items():
-            print("  %s (%s) auth=%s exec=%s closure=%s attempts=%d" % (
+            print("  %s (%s) auth=%s exec=%s closure=%s tracker=%s attempts=%d" % (
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
-                u["closure"].get("state"), u["attempts"]))
+                u["closure"].get("state"), u["tracker"].get("state", "-"), u["attempts"]))
             for a in u["active"]:
                 print("    a%d/%s %s %s" % (a["attempt"], a["invocation"], a["state"],
                                    "job=%s" % a["job_id"] if a.get("job_id") else "pid=%s" % a.get("pid")))
