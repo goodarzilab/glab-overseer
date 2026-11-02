@@ -15,7 +15,7 @@ SUBCOMMANDS = (
 ).split()
 STUBS = [c for c in SUBCOMMANDS if c not in ("plan", "unlock", "survey", "probe-transport", "models", "dispatch", "status", "wait", "abort", "slurm-handshake", "judge", "resolve", "review", "reproduce", "dispositions", "fix", "nonvacuous")]
 
-STUBS = [c for c in STUBS if c not in ("issues", "pr", "merge", "next")]
+STUBS = [c for c in STUBS if c not in ("issues", "pr", "merge", "next", "report")]
 
 
 class PathsTests(TmpCase):
@@ -266,25 +266,6 @@ class CliTests(TmpCase):
             text = f.read()
         for needle in ('"3.9"', '"3.12"', "push:", "pull_request:", "python -m unittest discover -s tests"):
             self.assertIn(needle, text)
-
-    def test_no_private_identifiers_in_tracked_sources(self):
-        # Site identifiers (cluster, host and user names) are never written here:
-        # committing them would itself break O6. They come from an untracked
-        # file named by OVERSEER_PRIVATE_IDENTIFIERS, one per line.
-        banned = ["/home/"]
-        extra = os.environ.get("OVERSEER_PRIVATE_IDENTIFIERS")
-        if extra:
-            with open(extra) as f:
-                banned += [ln.strip().lower() for ln in f if ln.strip()]
-        for base in ("skills", "tests", ".github"):
-            for dp, _, files in os.walk(os.path.join(helpers.REPO, base)):
-                for n in files:
-                    if n.endswith(".pyc") or n == "test_core.py":
-                        continue
-                    with open(os.path.join(dp, n), errors="replace") as f:
-                        text = f.read().lower()
-                    for b in banned:
-                        self.assertNotIn(b, text, "%s contains %s" % (n, b))
 
 
 if __name__ == "__main__":

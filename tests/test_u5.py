@@ -154,7 +154,8 @@ class CodeJudgment(Case):
         origin_main = sh(self.origin, "rev-parse", "refs/heads/main")
         self.assertEqual((ws["base"], ws["base_ref"], ws["branch"]), (origin_main, "origin/main", "overseer/demo/alpha/a1"))
         self.assertEqual((j["base"], j["test_rc"], j["candidate"]), (origin_main, 0, sh(self.wt(), "rev-parse", "HEAD")))
-        self.assertEqual(j["outputs"], [{"path": "src/alpha.py", "ok": True, "problems": []}])
+        self.assertEqual(j["outputs"], [{"path": "src/alpha.py", "ok": True, "problems": [], "size": 3,  # recorded for reports
+                                         "sha256": hashlib.sha256(b"hi\n").hexdigest()}])
         inv = X._load(os.path.join(self.attempt_dir(), "inv", "01-author", "intent.json"))
         self.assertIn("sonnet", inv["argv"])
         self.assertEqual(inv["cwd"], self.wt())
