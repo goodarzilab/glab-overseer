@@ -120,6 +120,10 @@ class MergeCase(GhCase):
         self.assertEqual(rc, 0, err)
         return json.loads(out)
 
+    def pull(self):
+        """What an orchestrator does before a job that needs merged code: update the checkout."""
+        sh(self.root, "pull", "-q", "--ff-only", "origin", "main")
+
     def merged_count(self):
         return len(self.calls("pr", "merge"))
 
@@ -378,12 +382,61 @@ class Tracker(MergeCase):
         self.assertEqual(self.cli("merge", "ua")[0], 0)
         self.assertEqual((self.facet("ua", "tracker")["state"], self.merged_count()), ("closed", 1))
 
+    def test_job_is_refused_until_the_checkout_holds_every_merge_it_needs(self):
+        self.plan()
+        self.dispatch_both()
+        self.ready("ua")
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        self.pull()  # the checkout now holds ua's merge, but not ub's
+        self.ready("ub")
+        self.assertEqual(self.cli("merge", "ub")[0], 0)
+        self.assertEqual(self.next_lines(), ["dispatch jc"])
+        ub_merge = self.facet("ub", "closure")["merge_commit"]
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, out), (1, ""), err)
+        self.assertIn("does not contain the merge of ub (%s)" % ub_merge[:12], err)
+        self.assertNotIn("ua (", err)
+        self.assertIn("git pull --ff-only origin main", err)
+        self.assertNotIn("unshallow", err)
+        self.assertEqual(list(X.iter_invocations(self.root, "demo", "jc")), [])
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "jc")["counters"]["attempts"], 0)
+        self.pull()
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
+
+    def test_stale_refusal_in_a_shallow_checkout_names_unshallow(self):
+        repo = os.path.join(self.tmp, "deep")
+        sh(self.tmp, "init", "-q", "-b", "main", repo)
+        for n in ("one", "two"):
+            self.put(n, n, base=repo)
+            sh(repo, "add", n)
+            sh(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", n)
+        shallow = os.path.join(self.tmp, "shallow")
+        sh(self.tmp, "clone", "-q", "--depth", "1", "file://" + repo, shallow)
+        self.assertEqual(sh(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        plan = {"target_branch": "main", "units": []}
+        with mock.patch.object(X.approval, "effective_plan", return_value=plan), \
+                mock.patch.object(X, "missing_merges", return_value=[("ub", "f" * 40)]):
+            with self.assertRaisesRegex(X.ExecutionError, r"shallow, so first `git fetch --unshallow origin`"):
+                X.dispatch_job(shallow, "demo", {"id": "jc"})
+        plan = {"target_branch": "main;touch${IFS}PWNED;true", "units": []}
+        failing = mock.Mock(side_effect=W.GitError("git rev-parse failed (rc 129): unknown option"))
+        with mock.patch.object(X.approval, "effective_plan", return_value=plan), \
+                mock.patch.object(X, "missing_merges", return_value=[("ub", "f" * 40)]), \
+                mock.patch.object(W, "git", failing):  # git < 2.15: no --is-shallow-repository
+            with self.assertRaises(X.ExecutionError) as cm:
+                X.dispatch_job(shallow, "demo", {"id": "jc"})
+        msg = str(cm.exception)
+        self.assertIn("`git pull --ff-only origin 'main;touch${IFS}PWNED;true'`", msg)
+        self.assertNotIn("unshallow", msg)
+
     def test_job_unit_closes_on_done_judgment_not_on_exit(self):
         self.plan()
         self.dispatch_both()
         for u in ("ua", "ub"):
             self.ready(u)
             self.assertEqual(self.cli("merge", u)[0], 0)
+        self.pull()
         rc, out, err = self.cli("dispatch")
         self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
         self.wait_done("jc")
@@ -537,6 +590,7 @@ class Round1(MergeCase):
         for u in ("ua", "ub"):
             self.ready(u)
             self.assertEqual(self.cli("merge", u)[0], 0)
+        self.pull()
         self.assertEqual(self.cli("dispatch")[0], 0)
         self.wait_done("jc")
         self.assertEqual(self.cli("judge", "jc")[0], 1)
