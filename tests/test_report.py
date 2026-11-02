@@ -7,7 +7,7 @@ import unittest
 
 from helpers import TmpCase, plan_copy
 
-from overseer import approval, paths, report, store
+from overseer import approval, judge, paths, report, store
 
 HOST = "node-canary-7.example.invalid"
 HOME = "/ho" + "me/canaryuser/proj"  # built at runtime so the tracked-file scan stays clean
@@ -107,7 +107,8 @@ class ReportCase(TmpCase):
             os.makedirs(os.path.join(a, "outputs"))
             with open(os.path.join(a, "outputs", "result.txt"), "w") as f:
                 f.write("hello\n")
-            j["outputs"] = [{"path": "result.txt", "ok": True, "problems": []}]
+            j["outputs"] = [{"path": "result.txt", "ok": True, "problems": [], "size": 6,
+                             "sha256": hashlib.sha256(b"hello\n").hexdigest()}]
         wj(os.path.join(a, "judgment.json"), j)
         self.unit_state("crunch", counters={"attempts": 1, "review_rounds": 0}, tracker={"issue": 13, "state": "closed"})
 
@@ -224,6 +225,138 @@ class StateTests(ReportCase):
         os.rename(os.path.join(self.adir("alpha"), "worktree"), os.path.join(self.tmp, "gone"))
         rep = self.build()
         self.assertTrue(any("size and digest unavailable" in i["item"] for i in rep["incomplete"]), rep["incomplete"])
+
+
+class MissingPlanTests(ReportCase):
+    def test_plan_without_plan_json_is_reported_with_its_uncertain_units(self):
+        self.make_crunch("UNCERTAIN")
+        os.unlink(os.path.join(paths.plan_dir(self.root, self.pid), "plan.json"))
+        for public in (True, False):
+            rep = self.build(public)
+            self.assertEqual([(p["plan_id"], p["units"]) for p in rep["plans"]], [(self.pid, [])])
+            self.assertIn("plan.json", rep["plans"][0]["problem"])
+            self.assertIn({"unit": "crunch", "item": "state UNCERTAIN"}, rep["incomplete"])
+            self.assertTrue(any(i["unit"] is None and "plan.json" in i["item"] for i in rep["incomplete"]))
+        out = os.path.join(self.tmp, "o")
+        self.assertEqual(self.cli("report", "--public", "--out", out).returncode, 0)
+        with open(os.path.join(out, "report.md")) as f:
+            md = f.read()
+        self.assertIn("plan.json", md)
+        self.assertIn("crunch: state UNCERTAIN", md)
+
+    def test_unreadable_plan_json_is_reported_too(self):
+        self.make_crunch("UNCERTAIN")
+        with open(os.path.join(paths.plan_dir(self.root, self.pid), "plan.json"), "w") as f:
+            f.write("{nope")
+        rep = self.build()
+        self.assertEqual([p["plan_id"] for p in rep["plans"]], [self.pid])
+        self.assertIn({"unit": "crunch", "item": "state UNCERTAIN"}, rep["incomplete"])
+
+    def test_failed_and_unjudged_units_are_listed_without_a_plan(self):
+        self.make_crunch("FAILED")
+        os.unlink(os.path.join(paths.plan_dir(self.root, self.pid), "plan.json"))
+        self.assertIn({"unit": "crunch", "item": "state FAILED"}, self.build()["incomplete"])
+
+
+class JobOutputJudgmentTests(ReportCase):
+    def test_changed_output_reports_judged_digest_and_is_incomplete(self):
+        self.make_crunch("DONE")
+        open(os.path.join(self.adir("crunch"), "outputs", "result.txt"), "w").close()
+        rep = self.build()
+        o = self.units(rep)["crunch"]["attempts"][0]["outputs"][0]
+        self.assertEqual((o["ok"], o["size"], o["sha256"]), (True, 6, hashlib.sha256(b"hello\n").hexdigest()))
+        self.assertTrue(o["changed_since_judgment"])
+        self.assertEqual((o["current_size"], o["current_sha256"]), (0, hashlib.sha256(b"").hexdigest()))
+        self.assertIn({"unit": "crunch", "item": "output result.txt changed since judgment"}, rep["incomplete"])
+
+    def test_unchanged_output_is_not_flagged(self):
+        self.make_crunch("DONE")
+        rep = self.build()
+        o = self.units(rep)["crunch"]["attempts"][0]["outputs"][0]
+        self.assertFalse(o["changed_since_judgment"])
+        self.assertFalse([i for i in rep["incomplete"] if i["unit"] == "crunch"])
+
+    def test_judgment_without_a_recorded_digest_is_incomplete(self):
+        self.make_crunch("DONE")
+        j = os.path.join(self.adir("crunch"), "judgment.json")
+        with open(j) as f:
+            d = json.load(f)
+        d["outputs"] = [{"path": "result.txt", "ok": True, "problems": []}]
+        wj(j, d)
+        rep = self.build()
+        o = self.units(rep)["crunch"]["attempts"][0]["outputs"][0]
+        self.assertEqual((o["size"], o["sha256"]), (None, None))
+        self.assertIn({"unit": "crunch", "item": "output result.txt has no size and digest recorded in its judgment"}, rep["incomplete"])
+
+    def test_judge_records_size_and_digest_of_job_outputs(self):
+        adir = os.path.join(self.tmp, "a1")
+        os.makedirs(os.path.join(adir, "outputs"))
+        with open(os.path.join(adir, "outputs", "r.txt"), "wb") as f:
+            f.write(b"abc")
+        r = judge.job_outputs(adir, {"outputs": ["r.txt"]})[0]
+        self.assertEqual((r["ok"], r["size"], r["sha256"]), (True, 3, hashlib.sha256(b"abc").hexdigest()))
+
+
+class PrivateCompletenessTests(ReportCase):
+    def put(self, rel, data):
+        p = os.path.join(paths.state_dir(self.root), rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def files(self):
+        return self.build(False)["private"]["files"]
+
+    def test_every_regular_file_is_listed_with_size_and_digest(self):
+        self.make_alpha()
+        self.put("plans/demo/units/alpha/attempts/a1/inv/01-author/stdout.log", b"unique-worker-log-canary\n")
+        self.put("extra/notes.txt", b"plain text")
+        self.put("extra/blob.bin", b"\xff\xfe\x00\x80")
+        want = set()
+        base = paths.state_dir(self.root)
+        for d, dirs, names in os.walk(base):
+            dirs[:] = [x for x in dirs if x != "report"]
+            want |= set(os.path.relpath(os.path.join(d, n), base) for n in names)
+        got = self.files()
+        self.assertEqual(set(got), want)
+        for rel, e in got.items():
+            data = open(os.path.join(base, rel), "rb").read()
+            self.assertEqual((e["size"], e["sha256"]), (len(data), hashlib.sha256(data).hexdigest()), rel)
+        log = got["plans/demo/units/alpha/attempts/a1/inv/01-author/stdout.log"]
+        self.assertEqual(log["text"], "unique-worker-log-canary\n")
+        self.assertEqual(got["extra/notes.txt"]["text"], "plain text")
+        self.assertEqual(got["survey.json"]["json"], {"host": HOST, "path": HOME})
+        b = got["extra/blob.bin"]
+        self.assertTrue(b["binary"])
+        self.assertNotIn("text", b)
+
+    def test_large_files_are_truncated_to_head_and_tail_with_full_digest(self):
+        n = 600 * 1024
+        data = b"H" * 70000 + b"m" * (n - 140000) + b"T" * 70000
+        self.put("extra/big.log", data)
+        self.put("extra/big.json", json.dumps({"k": "v" * n}).encode())
+        got = self.files()
+        for rel, raw in (("extra/big.log", data), ("extra/big.json", open(os.path.join(paths.state_dir(self.root), "extra/big.json"), "rb").read())):
+            e = got[rel]
+            self.assertTrue(e["truncated"], rel)
+            self.assertEqual((e["size"], e["sha256"]), (len(raw), hashlib.sha256(raw).hexdigest()))
+            self.assertEqual(e["head"], raw[:65536].decode("utf-8", "replace"))
+            self.assertEqual(e["tail"], raw[-65536:].decode("utf-8", "replace"))
+            self.assertNotIn("json", e)
+
+    def test_symlinks_are_listed_not_followed(self):
+        target = os.path.join(self.tmp, "outside.txt")
+        with open(target, "w") as f:
+            f.write("outside-canary")
+        os.symlink(target, os.path.join(paths.state_dir(self.root), "lnk"))
+        got = self.files()
+        self.assertEqual(got["lnk"]["symlink"], target)
+        self.assertNotIn("outside-canary", json.dumps(got))
+
+    def test_public_report_has_no_private_section(self):
+        self.put("extra/notes.txt", b"plain text")
+        self.assertNotIn("private", self.build(True))
 
 
 class FilesTests(ReportCase):

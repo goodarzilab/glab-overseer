@@ -48,8 +48,6 @@ targets=""
 [ "$only" = claude ] || targets="$targets
 $(abs "$agy_dir")/$NAME"
 targets=$(printf '%s\n' "$targets" | sed '/^$/d')
-IFS='
-'  # targets are newline separated, so paths with spaces work
 
 marked() { [ -d "$1" ] && [ ! -L "$1" ] && [ -f "$1/$MARKER" ] && [ ! -L "$1/$MARKER" ]; }
 mode_of() { sed -n 's/^mode=//p' "$1/$MARKER" | head -n 1; }
@@ -82,7 +80,7 @@ mode=copy
 [ "$link" -eq 0 ] || mode=link
 
 if [ "$uninstall" -eq 1 ]; then
-  for t in $targets; do
+  while IFS= read -r t; do
     if [ ! -e "$t" ] && [ ! -L "$t" ]; then
       echo "not installed: $t"
     elif marked "$t"; then
@@ -91,20 +89,24 @@ if [ "$uninstall" -eq 1 ]; then
       echo "refusing to remove $t: no $MARKER marker (not created by this installer)" >&2
       rc=1
     fi
-  done
+  done <<EOF
+$targets
+EOF
   exit $rc
 fi
 
 # Check every target before changing any.
-for t in $targets; do
+while IFS= read -r t; do
   if { [ -e "$t" ] || [ -L "$t" ]; } && ! marked "$t"; then
     echo "refusing to overwrite $t: no $MARKER marker (not created by this installer)" >&2
     rc=1
   fi
-done
+done <<EOF
+$targets
+EOF
 [ "$rc" -eq 0 ] || exit 1
 
-for t in $targets; do
+while IFS= read -r t; do
   if marked "$t" && same_as_source "$t" "$mode"; then
     echo "unchanged: $t ($mode)"
     continue
@@ -120,4 +122,6 @@ for t in $targets; do
   if marked "$t"; then rm -rf "$t"; fi
   mv "$new" "$t"
   echo "$verb ($mode): $t"
-done
+done <<EOF
+$targets
+EOF

@@ -169,6 +169,18 @@ class InstallTests(InstallCase):
         self.assertEqual(self.run_install("--uninstall").returncode, 0)
         self.assertTrue(os.path.isfile(os.path.join(SRC, "SKILL.md")), "uninstall must not follow links into the checkout")
 
+    def test_glob_characters_in_a_root_are_literal(self):
+        for shell in [x for x in ("bash", "dash") if shutil.which(x)]:
+            t = os.path.join(self.tmp, "g" + shell)
+            odd, plain = os.path.join(t, "a[1]"), os.path.join(t, "a1")
+            for d in (odd, plain):
+                r = subprocess.run([shell, INSTALL, "--only", "claude", "--claude-dir", d], capture_output=True, text=True, env=self.env())
+                self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run([shell, INSTALL, "--only", "claude", "--claude-dir", odd, "--uninstall"], capture_output=True, text=True, env=self.env())
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(odd, "glab-overseer")), shell)
+            self.assertTrue(os.path.isfile(os.path.join(plain, "glab-overseer", MARKER)), shell)
+
     def test_unknown_flag_and_missing_value(self):
         self.assertEqual(self.run_install("--nope").returncode, 2)
         r = subprocess.run(["bash", INSTALL, "--claude-dir"], capture_output=True, text=True, env=self.env())

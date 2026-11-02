@@ -186,7 +186,10 @@ def job_outputs(adir, unit):
                         return fh.read()
                 problems = _predicate(dict((k, v) for k, v in o.items() if k != "validate"), 1,
                                       os.path.getsize(full), read, None)
-        results.append({"path": o["path"], "ok": not problems, "problems": problems, "_full": full, "_o": o})
+        r = {"path": o["path"], "ok": not problems, "problems": problems, "_full": full, "_o": o}
+        if not problems and full is not None:  # recorded at judgment time, so a report can tell a later change
+            r["size"], r["sha256"] = os.path.getsize(full), _file_sha(full)
+        results.append(r)
     todo = [r for r in results if r["ok"] and r["_o"].get("validate") is not None]
     before = _tree(out) if todo else None
     for r in todo:
