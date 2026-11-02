@@ -453,9 +453,14 @@ def record_decision(root, plan_id, unit, text):
     done = len(_rounds(adir))
     if done < _cap(plan):
         raise ReviewError("%d of %d review rounds used; an orchestrator decision is accepted only at the cap" % (done, _cap(plan)))
+    try:  # binds the decision to the non-vacuity record that exists now (null when none does)
+        with open(os.path.join(adir, "nonvacuous.json"), "rb") as f:
+            nv_digest = hashlib.sha256(f.read()).hexdigest()
+    except FileNotFoundError:
+        nv_digest = None
     store.write_json_atomic(os.path.join(adir, "reviews", "orchestrator_decision.json"),
                             {"orchestrator_decision": True, "text": text.strip(), "candidate": j["candidate"],
-                             "rounds": done, "time": store.utc_now()})
+                             "rounds": done, "nonvacuous_sha256": nv_digest, "time": store.utc_now()})
     store.append_event(root, "orchestrator_decision", plan_id=plan_id, unit_id=unit["id"], candidate=j["candidate"])
     return review_state(root, plan_id, unit)
 

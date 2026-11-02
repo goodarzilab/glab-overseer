@@ -14,6 +14,7 @@ and after a restart.
 forward by patch id) and `units/<unit>/merge.json` (intent, then `pr_head` and `merge_commit` as separate fields).
 Owner stops are raised as `approval.OwnerStop`; `cli.main` records each as an `OWNER_STOP` event.
 """
+import hashlib
 import json
 import os
 import sys
@@ -106,15 +107,17 @@ def _dict(path):
 
 
 def _decision_after(adir, cand):
-    """An orchestrator decision recorded for exactly `cand`, after the current non-vacuity record was written.
+    """An orchestrator decision for exactly `cand` that was recorded against the current non-vacuity record.
 
-    A decision carried forward by patch id (another candidate) or made before the FAIL never accepts it."""
-    dpath = os.path.join(adir, "reviews", "orchestrator_decision.json")
-    dec = _dict(dpath)
+    `record_decision` stores the SHA-256 of nonvacuous.json as it was then (null when none existed). A decision
+    carried forward by patch id, or made before the FAIL (null or another digest), never accepts it."""
+    dec = _dict(os.path.join(adir, "reviews", "orchestrator_decision.json"))
     if not (dec and dec.get("orchestrator_decision") is True and dec.get("candidate") == cand):
         return False
+    digest = dec.get("nonvacuous_sha256")
     try:
-        return os.stat(os.path.join(adir, "nonvacuous.json")).st_mtime_ns <= os.stat(dpath).st_mtime_ns
+        with open(os.path.join(adir, "nonvacuous.json"), "rb") as f:
+            return isinstance(digest, str) and digest == hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return False
 
@@ -369,9 +372,11 @@ def merge_unit(root, plan_id, unit):
 
 # ---- next ---------------------------------------------------------------------
 
-def _review_action(adir, plan, cand):
+def _review_action(adir, plan, cand, reasons=()):
     rounds = R._rounds(adir)
     cap = plan["caps"]["review_rounds"]
+    if rounds and any("reviewer session id" in r for r in reasons):  # dispositions cannot repair an invalid reviewer session
+        return ("review", "") if len(rounds) < cap else ("stop", "review round r%d used a non-independent reviewer session at the cap" % rounds[-1][0])
     if not rounds:
         return "review", ""
     num, rdir, rd = rounds[-1]
@@ -386,7 +391,7 @@ def _review_action(adir, plan, cand):
     return ("fix", "round r%d" % num) if len(rounds) < cap else ("stop", "review cap reached with blocking findings: an orchestrator decision is needed")
 
 
-def _unit_action(root, plan, u, st, free):
+def _unit_action(root, plan, u, st, free, after_quota=False):
     """(action, detail) for one unit or None."""
     pid, uid, n = plan["plan_id"], u["id"], st["counters"]["attempts"]
     if st["closure"].get("state") == "abandoned":
@@ -407,7 +412,7 @@ def _unit_action(root, plan, u, st, free):
         if not all(is_closed(root, pid, X._unit_of(plan, d), approval.load_unit_state(root, pid, d)) for d in u["needs"]):
             return None
         cls = _dict(os.path.join(adir, "classification.json")) if adir else None
-        if cls and cls.get("class") in X.BLOCKING_CLASSES:
+        if cls and cls.get("class") in X.BLOCKING_CLASSES and not after_quota:
             return "stop", "attempt a%d ended with %s; an orchestrator decision is needed" % (n, cls["class"])
         return ("dispatch", "") if free[0] > 0 and free[1] > 0 else None
     j = J.valid_judgment(root, pid, u, n)
@@ -430,7 +435,7 @@ def _unit_action(root, plan, u, st, free):
         return "stop", "%s: %s" % (stop.get("kind"), ", ".join(stop.get("files") or []))
     rs = R.review_state(root, pid, u)
     if rs["state"] != "ELIGIBLE":
-        return _review_action(adir, plan, j["candidate"])
+        return _review_action(adir, plan, j["candidate"], rs["reasons"])
     nv = nonvacuity_problem(adir, j["candidate"], rs)
     if nv:
         return ("nonvacuous", "") if "no non-vacuity" in nv or "another candidate" in nv else ("stop", nv)
@@ -440,7 +445,7 @@ def _unit_action(root, plan, u, st, free):
     return "merge", "PR #%s" % pr.get("number")
 
 
-def compute_actions(root, only_plan=None, write=False):
+def compute_actions(root, only_plan=None, write=False, after_quota=False, exclude=()):
     acts = []
     pdir = paths.plans_dir(root)
     total = [X.slots_in_use(root, write)]
@@ -454,7 +459,9 @@ def compute_actions(root, only_plan=None, write=False):
         plan = approval.effective_plan(root, pid)
         free = [plan["caps"]["workers"] - X.slots_in_use(root, write, pid), X.PROJECT_SLOTS - total[0]]
         for u in plan["units"]:
-            a = _unit_action(root, plan, u, approval.load_unit_state(root, pid, u["id"]), free)
+            if (pid, u["id"]) in exclude:  # a launch already skipped in this dispatch: its slot goes to the next unit
+                continue
+            a = _unit_action(root, plan, u, approval.load_unit_state(root, pid, u["id"]), free, after_quota)
             if a:
                 acts.append({"plan": pid, "unit": u["id"], "action": a[0], "detail": a[1]})
                 if a[0] in ("dispatch", "retry"):
@@ -486,37 +493,72 @@ def run_next(args):
 
 # ---- dispatch -----------------------------------------------------------------
 
-def dispatch_ready(root, plan_id=None):
+def report_owner_stops(root, command, plan_id, problems):
+    for text in problems:
+        sys.stderr.write("OWNER_STOP: %s: %s\n" % (plan_id, text))
+        store.append_event(root, "OWNER_STOP", command=command, plan_id=plan_id, reason=text)
+
+
+def dispatch_ready(root, plan_id=None, after_quota=False):
     """Dispatch every READY unit and every retryable failed unit up to the free slots (plan cap and the project limit).
 
     A retry stops at the attempts cap (acquire_attempt refuses a new attempt past it). Each owner stop is recorded
-    as an OWNER_STOP event and printed on stderr; the exit code is non-zero when any exists."""
+    as an OWNER_STOP event and printed on stderr; the exit code is non-zero when any exists. A skipped launch
+    (slots full, or an error) is excluded and the actions are recomputed from disk, so the slot it had reserved
+    goes to the next ready unit; passes continue until one launches or skips nothing new."""
     rc = 0
+    skipped = set()
+    stops_seen = set()
     with store.ProjectLock(root, "dispatch"):
-        for a in compute_actions(root, plan_id, True):
-            if a["action"] == "stop" and a["unit"] is None:  # a plan-level owner stop (unit-level stops are `next` output only)
-                sys.stderr.write("OWNER_STOP: %s: %s\n" % (a["plan"], a["detail"]))
-                store.append_event(root, "OWNER_STOP", command="dispatch", plan_id=a["plan"], reason=a["detail"])
-                rc = 1
-                continue
-            if a["action"] not in ("dispatch", "retry"):
-                continue
-            plan = approval.effective_plan(root, a["plan"])
-            u = X._unit_of(plan, a["unit"])
-            try:
-                if u["kind"] == "code":
-                    rec = W.dispatch_code(root, a["plan"], u)
-                else:
-                    rec = X.dispatch_job(root, a["plan"], u)
-            except X.SlotsFull as e:  # skip this unit; other plans or units may still have a slot
-                sys.stderr.write("skipped %s: %s\n" % (a["unit"], e))
-                continue
-            except X.ExecutionError as e:
-                sys.stderr.write("error: %s: %s\n" % (a["unit"], e))
-                rc = 1
-                continue
-            print(json.dumps({"plan": a["plan"], "unit": a["unit"], "attempt": rec["attempt"], "invocation": rec["seq"]}, sort_keys=True))
+        for _ in range(_unit_count(root, plan_id) + 1):
+            again = False
+            for a in compute_actions(root, plan_id, True, after_quota, skipped):
+                if a["action"] == "stop" and a["unit"] is None:  # a plan-level owner stop (unit-level stops are `next` output only)
+                    if (a["plan"], a["detail"]) not in stops_seen:
+                        stops_seen.add((a["plan"], a["detail"]))
+                        report_owner_stops(root, "dispatch", a["plan"], [a["detail"]])
+                    rc = 1
+                    continue
+                if a["action"] not in ("dispatch", "retry"):
+                    continue
+                plan = approval.effective_plan(root, a["plan"])
+                u = X._unit_of(plan, a["unit"])
+                try:
+                    if u["kind"] == "code":
+                        rec = W.dispatch_code(root, a["plan"], u, after_quota)
+                    else:
+                        rec = X.dispatch_job(root, a["plan"], u, after_quota)
+                except X.SlotsFull as e:  # skip this unit; other plans or units may still have a slot
+                    sys.stderr.write("skipped %s: %s\n" % (a["unit"], e))
+                    skipped.add((a["plan"], a["unit"]))
+                    again = True
+                    continue
+                except X.ExecutionError as e:
+                    sys.stderr.write("error: %s: %s\n" % (a["unit"], e))
+                    rc = 1
+                    skipped.add((a["plan"], a["unit"]))
+                    again = True
+                    continue
+                print(json.dumps({"plan": a["plan"], "unit": a["unit"], "attempt": rec["attempt"], "invocation": rec["seq"]}, sort_keys=True))
+            if not again:
+                break
     return rc
+
+
+def _unit_count(root, only_plan):
+    n = 0
+    for p in _plan_ids(root, only_plan):
+        try:
+            n += len(approval.effective_plan(root, p)["units"])
+        except approval.ApprovalError:  # an owner stop: compute_actions reports it and launches nothing for the plan
+            pass
+    return n
+
+
+def _plan_ids(root, only_plan):
+    pdir = paths.plans_dir(root)
+    return [p for p in (sorted(os.listdir(pdir)) if os.path.isdir(pdir) else [])
+            if paths.valid_id(p) and os.path.exists(os.path.join(pdir, p, "plan.json")) and only_plan in (None, p)]
 
 
 # ---- merge command ------------------------------------------------------------

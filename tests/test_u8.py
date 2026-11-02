@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -452,7 +453,7 @@ class OwnerStops(MergeCase):
                      ["-c", "a.b=c", "reset", "--hard"], ["update-ref", "-d", "refs/heads/main"]):
             with self.assertRaises(W.DestructiveGit, msg=argv):
                 W.git(self.root, *argv)
-        for argv in (["push", "origin", "b:b"], ["fetch", "origin", "+refs/heads/m:refs/remotes/origin/m"], ["reset", "--soft", "HEAD"],
+        for argv in (["push", "origin", "b:b"], ["fetch", "origin", "+refs/heads/m:refs/remotes/origin/m"],
                      ["branch", "--list"], ["-c", "user.name=x", "merge", "--no-ff", "origin/main"], ["worktree", "add", "-b", "b", "p"]):
             self.assertIsNone(W.destructive_reason(argv), argv)
         with mock.patch.object(G, "push_argv", return_value=["push", "--force", "origin", "b:b"]):  # U7's push uses the same helper
@@ -707,54 +708,19 @@ class Round2(MergeCase):
         adir = os.path.join(self.tmp, "att")
         nv, dec = os.path.join(adir, "nonvacuous.json"), os.path.join(adir, "reviews", "orchestrator_decision.json")
         store.write_json_atomic(nv, {"candidate": "c2", "status": "FAIL"})
+        digest = hashlib.sha256(open(nv, "rb").read()).hexdigest()
         rs = {"orchestrator_decision": True}
 
-        def decide(cand, delta):
-            store.write_json_atomic(dec, {"orchestrator_decision": True, "candidate": cand, "text": "t"})
-            t = os.stat(nv).st_mtime + delta
-            os.utime(dec, (t, t))
-        decide("c1", 5)  # a carried decision for another candidate, even a later one
+        def decide(cand, dig):
+            store.write_json_atomic(dec, {"orchestrator_decision": True, "candidate": cand, "text": "t", "nonvacuous_sha256": dig})
+        decide("c1", digest)  # a carried decision for another candidate
         self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c2", rs))
-        decide("c2", -5)  # right candidate, recorded before the FAIL
+        decide("c2", None)  # right candidate, recorded before any non-vacuity record
         self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c2", rs))
-        decide("c2", 5)
+        decide("c2", "0" * 64)  # recorded against an earlier record
+        self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c2", rs))
+        decide("c2", digest)
         self.assertIsNone(C.nonvacuity_problem(adir, "c2", rs))
-
-    def test_f3_retry_needs_a_free_slot_and_dispatch_continues_to_other_plans(self):
-        a = plan_copy()
-        a.update(plan_id="demo", scope=["src/**"], target_branch="main", caps={"workers": 1, "attempts": 2, "review_rounds": 3})
-        a["units"] = [{"id": "j1", "kind": "job", "title": "J1", "command": "true", "outputs": ["result.txt"], "needs": []},
-                      {"id": "j2", "kind": "job", "title": "J2", "command": "while :; do :; done", "outputs": ["x"], "needs": []}]
-        b = plan_copy()
-        b.update(plan_id="zeta", scope=["src/**"], target_branch="main")
-        b["units"] = [{"id": "k1", "kind": "job", "title": "K1", "command": "true", "outputs": ["y"], "needs": []}]
-        approval.approve_plan(self.root, a, "me")
-        approval.approve_plan(self.root, b, "me")
-        self.assertEqual(self.cli("dispatch", "--unit", "j1")[0], 0)
-        self.wait_done("j1")
-        self.assertEqual(self.cli("judge", "j1")[0], 1)
-        self.assertEqual(self.cli("dispatch", "--unit", "j2")[0], 0)  # plan demo is now at its one-worker cap
-        try:
-            acts = [(x["unit"], x["action"]) for x in json.loads(self.cli("next", "--json")[1])]
-            self.assertNotIn(("j1", "retry"), acts)
-            self.assertIn(("k1", "dispatch"), acts)
-            rc, out, err = self.cli("dispatch")
-            self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["k1"]), err)
-        finally:
-            self.cli("abort", "j2")
-
-    def test_f4_a_carried_decision_does_not_accept_a_new_nonvacuity_fail(self):
-        self.seed_cfg()
-        self.plan(caps={"workers": 3, "attempts": 2, "review_rounds": 1},
-                  ua_test='read -r v < src/cfg.txt; [ "$v" = on ] || [ -f src/ua.py ]')
-        self.dispatch_both()
-        self.assertEqual(self.ready("ua")["status"], "PASS")
-        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "accept the review finding")[0], 0)
-        self.advance_target("src/cfg.txt", "on\n")
-        rc, _, err = self.cli("merge", "ua")
-        self.assertEqual((rc, "non-vacuity FAIL" in err, self.merged_count()), (1, True, 0), err)
-        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "accept the new FAIL too")[0], 0)
-        self.assertEqual(self.cli("merge", "ua")[0], 0)
 
     def test_f5_update_ref_cannot_move_the_target_backward(self):
         repo = os.path.join(self.tmp, "refrepo")
@@ -769,6 +735,109 @@ class Round2(MergeCase):
             with self.assertRaises(W.DestructiveGit, msg=argv):
                 W.git(repo, *argv)
         self.assertEqual(sh(repo, "rev-parse", "main"), head)
+
+
+class Round3(MergeCase):
+    def test_f1_reset_soft_cannot_move_the_target_backward(self):
+        repo = os.path.join(self.tmp, "resetrepo")
+        os.makedirs(repo)
+        sh(repo, "init", "-q", "-b", "main")
+        for i in (1, 2):
+            self.put("f.txt", "v%d\n" % i, base=repo)
+            sh(repo, "add", "-A")
+            sh(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "c%d" % i)
+        head = sh(repo, "rev-parse", "HEAD")
+        for argv in (["reset", "--soft", "HEAD~1"], ["reset", "--mixed", "HEAD~1"], ["reset", "HEAD~1"], ["reset", "--hard", "HEAD~1"]):
+            with self.assertRaises(W.DestructiveGit, msg=argv):
+                W.git(repo, *argv)
+        self.assertEqual(sh(repo, "rev-parse", "main"), head)
+
+    def test_f2_equal_timestamps_do_not_let_an_earlier_decision_accept_a_fail(self):
+        adir = os.path.join(self.tmp, "att")
+        nv, dec = os.path.join(adir, "nonvacuous.json"), os.path.join(adir, "reviews", "orchestrator_decision.json")
+        store.write_json_atomic(dec, {"orchestrator_decision": True, "candidate": "c", "text": "t", "nonvacuous_sha256": None})
+        store.write_json_atomic(nv, {"candidate": "c", "status": "FAIL"})
+        for f in (nv, dec):
+            os.utime(f, (1000000000, 1000000000))
+        self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c", {"orchestrator_decision": True}))
+
+    def test_f2_record_decision_stores_the_digest_of_the_current_record(self):
+        self.plan(caps={"workers": 3, "attempts": 2, "review_rounds": 1})
+        self.dispatch_both()
+        self.fake_review("ua")
+        adir = paths.attempt_dir(self.root, "demo", "ua", 1)
+        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "before any record")[0], 0)
+        self.assertIsNone(jload(os.path.join(adir, "reviews", "orchestrator_decision.json"))["nonvacuous_sha256"])
+        self.assertEqual(self.cli("nonvacuous", "ua")[0], 0)
+        nv = os.path.join(adir, "nonvacuous.json")
+        store.write_json_atomic(nv, dict(jload(nv), status="FAIL"))
+        rc, _, err = self.cli("merge", "ua")
+        self.assertEqual((rc, "non-vacuity FAIL" in err, self.merged_count()), (1, True, 0), err)
+        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "after the FAIL")[0], 0)
+        self.assertEqual(jload(os.path.join(adir, "reviews", "orchestrator_decision.json"))["nonvacuous_sha256"],
+                         hashlib.sha256(open(nv, "rb").read()).hexdigest())
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+
+    def one_job_plan(self, pid="demo", uid="j1"):
+        p = plan_copy()
+        p.update(plan_id=pid, scope=["src/**"], target_branch="main")
+        p["units"] = [{"id": uid, "kind": "job", "title": uid, "command": "true", "outputs": [uid + ".out"], "needs": []}]
+        approval.approve_plan(self.root, p, "me")
+
+    def test_f3_dispatch_all_passes_after_quota_through(self):
+        self.one_job_plan()
+        n, _ = X.allocate_attempt(self.root, "demo", "j1")
+        X.record_classification(self.root, "demo", "j1", n, "QUOTA")
+        self.assertEqual([a["action"] for a in C.compute_actions(self.root)], ["stop"])
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, out), (0, ""), err)
+        rc, out, err = self.cli("dispatch", "--after-quota")
+        self.assertEqual((rc, [(json.loads(l)["unit"], json.loads(l)["attempt"]) for l in out.splitlines()]), (0, [("j1", 2)]), err)
+
+    def test_f4_a_skipped_launch_returns_its_reserved_slot_to_the_next_ready_unit(self):
+        self.one_job_plan("demo", "j1")
+        self.one_job_plan("zeta", "k1")
+        real = X.dispatch_job
+
+        def full(root, pid, unit, *args):
+            if unit["id"] == "j1":
+                raise X.SlotsFull("plan demo has 1 of its 1 worker slots in use")
+            return real(root, pid, unit, *args)
+        with mock.patch.object(X, "PROJECT_SLOTS", 1), mock.patch.object(X, "dispatch_job", side_effect=full):
+            rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["k1"]), err)
+        self.assertIn("skipped j1", err)
+
+    def test_f5_a_pass_round_rejected_on_session_independence_needs_a_new_review(self):
+        self.plan()
+        self.dispatch_both()
+        self.fake_review("ua")
+        with mock.patch.object(R, "author_sessions", return_value={"reviewer-ua-1"}):
+            acts = [(a["unit"], a["action"]) for a in json.loads(self.cli("next", "--json")[1])]
+            self.assertIn(("ua", "review"), acts)
+            self.assertNotIn(("ua", "dispositions"), acts)
+        self.assertNotIn(("ua", "dispositions"), [(a["unit"], a["action"]) for a in json.loads(self.cli("next", "--json")[1])])
+
+    def test_f5_the_same_rejection_at_the_cap_is_a_stop(self):
+        self.plan(caps={"workers": 3, "attempts": 2, "review_rounds": 1})
+        self.dispatch_both()
+        self.fake_review("ua")
+        with mock.patch.object(R, "author_sessions", return_value={"reviewer-ua-1"}):
+            acts = [(a["unit"], a["action"]) for a in json.loads(self.cli("next", "--json")[1])]
+        self.assertIn(("ua", "stop"), acts)
+
+    def test_f6_dispatch_unit_runs_the_owner_checks(self):
+        self.plan()
+        p = os.path.join(paths.plan_dir(self.root, "demo"), "approval.json")
+        a = jload(p)
+        store.write_json_atomic(p, dict(a, boundary=dict(a["boundary"], caps=dict(a["boundary"]["caps"], workers=1))))
+        n = len(self.events("OWNER_STOP"))
+        rc, out, err = self.cli("dispatch", "--unit", "ua")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("cap workers=3 is above the approved 1", err)
+        self.assertEqual((out, list(X.iter_invocations(self.root))), ("", []))
+        ev = self.events("OWNER_STOP")
+        self.assertTrue(len(ev) > n and "above the approved" in ev[-1]["reason"] and ev[-1]["command"] == "dispatch")
 
 
 if __name__ == "__main__":

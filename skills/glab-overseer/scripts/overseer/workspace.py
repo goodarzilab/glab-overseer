@@ -50,8 +50,8 @@ _OPT_WITH_VALUE = ("-c", "-C", "--git-dir", "--work-tree", "--namespace")
 # would resolve through an alias or an external `git-<name>` program) is refused, and so is any alias definition.
 _ALLOWED_SUBCOMMANDS = frozenset((
     "add", "branch", "cat-file", "checkout", "clone", "commit", "diff", "diff-tree", "fetch", "ls-files", "ls-remote",
-    "ls-tree", "merge", "merge-base", "patch-id", "push", "reset", "rev-list", "rev-parse", "rm", "status",
-    "symbolic-ref", "worktree"))  # no update-ref: the supervisor never moves a ref by hand
+    "ls-tree", "merge", "merge-base", "patch-id", "push", "rev-list", "rev-parse", "rm", "status",
+    "symbolic-ref", "worktree"))  # no update-ref or reset: the supervisor never moves a ref or resets a branch by hand
 _FORCE_LONG = ("--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune", "--delete")
 
 

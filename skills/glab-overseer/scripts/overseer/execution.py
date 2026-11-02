@@ -820,9 +820,14 @@ def run_dispatch(args):
     root = paths.find_root(args.root)
     if args.unit is None:
         from . import controller
-        return controller.dispatch_ready(root, args.plan)
+        return controller.dispatch_ready(root, args.plan, args.after_quota)
     with store.ProjectLock(root, "dispatch"):
         pid = args.plan or approval.find_plan_for_unit(root, args.unit)
+        from . import controller
+        problems = controller.owner_problems(root, pid)  # the same owner checks as dispatch without a unit
+        if problems:
+            controller.report_owner_stops(root, "dispatch", pid, problems)
+            return 1
         approval.require_approval(root, pid)
         unit = _unit_of(approval.effective_plan(root, pid), args.unit)
         if unit["kind"] == "code":
