@@ -16,7 +16,7 @@ COMMANDS = ("survey probe-transport models slurm-handshake plan issues next disp
             "dispositions fix nonvacuous pr merge resolve abort status report unlock").split()
 LOOP = "next dispatch wait judge review reproduce dispositions fix nonvacuous pr merge resolve report".split()
 ACTIONS = "dispatch wait judge resolve retry review dispositions fix nonvacuous pr merge tracker stop".split()
-FOREIGN_FLAGS = {"--json-schema", "--sandbox", "--pty", "--squash", "--match-head-commit", "--force"}
+FOREIGN_FLAGS = {"--json-schema", "--sandbox", "--pty", "--squash", "--match-head-commit", "--force", "--ff-only"}
 NESTED = ("plan", "issues")
 
 
