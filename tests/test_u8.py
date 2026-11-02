@@ -57,7 +57,7 @@ class MergeCase(GhCase):
         mock.patch.object(C, "POLL_INTERVAL", 0.01).start()
         mock.patch.object(C, "POLL_SECONDS", 0.05).start()
 
-    def plan(self, target="main", shared=False, caps=None):
+    def plan(self, target="main", shared=False, caps=None, ua_test=None):
         p = plan_copy()
         p.update(plan_id="demo", scope=["src/**", "tests/**"], target_branch=target)
         if caps:
@@ -68,6 +68,8 @@ class MergeCase(GhCase):
                           "scope": ["src/shared.txt"] if shared else ["src/%s*" % uid, "tests/test_%s.py" % uid], "needs": []}
         p["units"] = [mk("ua"), mk("ub"), {"id": "jc", "kind": "job", "title": "Job", "command": "true",
                                            "outputs": ["result.txt"], "needs": ["ua", "ub"]}]
+        if ua_test:
+            p["units"][0]["test_command"] = ua_test
         approval.approve_plan(self.root, p, "me")
         self.assertEqual(self.cli("issues", "file")[0], 0)
         return p
@@ -410,7 +412,7 @@ class OwnerStops(MergeCase):
         store.write_json_atomic(p, dict(a, boundary=dict(a["boundary"], scope=["docs/**"])))
         rc, _, err = self.cli("merge", "ua")
         self.stopped(rc, ("widens the approved scope", err))
-        self.assertEqual(self.cli("dispatch")[0], 0)  # dispatch-all refuses the plan silently: nothing launched
+        self.assertEqual(self.cli("dispatch")[0], 1)  # dispatch-all reports the owner stop: nothing launched
         self.assertEqual(list(X.iter_invocations(self.root)), [])
         store.write_json_atomic(p, a)
         st = approval.load_unit_state(self.root, "demo", "ua")
@@ -457,6 +459,144 @@ class OwnerStops(MergeCase):
         with mock.patch.object(C, "merge_unit", side_effect=lambda *a: W.git(self.root, "branch", "-D", "main")):
             rc, _, err = self.cli("merge", "ua")
         self.stopped(rc, ("branch deletion", err))
+
+
+class Round1(MergeCase):
+    def commit_main(self, rel, text):
+        self.put(rel, text)
+        sh(self.root, "add", "-A")
+        sh(self.root, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "c " + rel)
+        sh(self.root, "push", "-q", "origin", "main")
+
+    def test_f1_abandoned_need_never_readies_its_dependent(self):
+        self.plan()
+        self.dispatch_both()
+        self.ready("ub")
+        self.assertEqual(self.cli("merge", "ub")[0], 0)
+        st = approval.load_unit_state(self.root, "demo", "ua")
+        st["closure"] = {"state": "abandoned"}
+        approval.save_unit_state(self.root, "demo", "ua", st)
+        lines = self.next_lines()
+        self.assertNotIn("dispatch jc", lines)
+        self.assertTrue([l for l in lines if l.startswith("stop jc")], lines)
+        self.assertEqual(self.cli("dispatch")[0], 0)
+        self.assertEqual(list(X.iter_invocations(self.root, "demo", "jc")), [])
+
+    def test_f2_nonvacuity_is_rerun_on_the_integrated_candidate(self):
+        self.commit_main("src/cfg.txt", "off\n")
+        self.plan(caps={"workers": 3, "attempts": 2, "review_rounds": 1},
+                  ua_test='read -r v < src/cfg.txt; [ "$v" = on ] || [ -f src/ua.py ]')
+        self.dispatch_both()
+        self.assertEqual(self.ready("ua")["status"], "PASS")
+        self.commit_main("src/cfg.txt", "on\n")  # the target now makes the unit's change unnecessary
+        rc, _, err = self.cli("merge", "ua")
+        self.assertEqual((rc, "non-vacuity FAIL" in err, self.merged_count()), (1, True, 0), err)
+        nv = jload(os.path.join(paths.attempt_dir(self.root, "demo", "ua", 1), "nonvacuous.json"))
+        self.assertEqual((nv["status"], nv["candidate"]), ("FAIL", self.head("ua")))
+        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "owner accepted the redundant change")[0], 0)
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        self.assertEqual(self.merged_count(), 1)
+
+    def test_f3_crash_between_merged_record_and_closure_reconciles(self):
+        real = store.write_json_atomic
+
+        def crash(path, data, *a, **k):
+            real(path, data, *a, **k)
+            if path.endswith("merge.json") and isinstance(data, dict) and data.get("state") == "merged":
+                raise KeyboardInterrupt
+        self.plan()
+        self.dispatch_both()
+        self.ready("ua")
+        with mock.patch.object(store, "write_json_atomic", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("merge", "ua")
+        self.assertEqual((self.unit_json("ua", "merge.json")["state"], self.facet("ua", "closure")["state"]), ("merged", "open"))
+        before = len(self.events("integration_intent"))
+        rc, out, err = self.cli("merge", "ua")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.merged_count(), self.facet("ua", "closure")["state"], self.facet("ua", "tracker")["state"]),
+                         (1, "merged", "closed"))
+        self.assertEqual(len(self.events("integration_intent")), before)
+        self.assertEqual(json.loads(out)["merge_commit"], sh(self.origin, "rev-parse", "refs/heads/main"))
+        self.assertFalse(os.path.exists(os.path.join(paths.attempt_dir(self.root, "demo", "ua", 1), "integration_intent.json")))
+
+    def test_f4_dispatch_all_launches_a_retry_within_the_attempts_cap(self):
+        self.plan()
+        self.dispatch_both()
+        for u in ("ua", "ub"):
+            self.ready(u)
+            self.assertEqual(self.cli("merge", u)[0], 0)
+        self.assertEqual(self.cli("dispatch")[0], 0)
+        self.wait_done("jc")
+        self.assertEqual(self.cli("judge", "jc")[0], 1)
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [(json.loads(l)["unit"], json.loads(l)["attempt"]) for l in out.splitlines()]), (0, [("jc", 2)]), err)
+        self.wait_done("jc")
+        self.assertEqual(self.cli("judge", "jc")[0], 1)
+        rc, out, err = self.cli("dispatch")  # at the attempts cap: nothing more is launched
+        self.assertEqual((rc, out), (0, ""), err)
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "jc")["counters"]["attempts"], 2)
+
+    def test_f5_dispatch_all_records_and_reports_owner_stops(self):
+        self.plan()
+        p = os.path.join(paths.plan_dir(self.root, "demo"), "approval.json")
+        a = jload(p)
+        store.write_json_atomic(p, dict(a, boundary=dict(a["boundary"], scope=["docs/**"])))
+        n = len(self.events("OWNER_STOP"))
+        rc, out, err = self.cli("dispatch")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("widens the approved scope", err)
+        ev = self.events("OWNER_STOP")
+        self.assertTrue(len(ev) > n)
+        self.assertTrue(all("widens the approved scope" in e["reason"] and e["command"] == "dispatch" for e in ev[n:]))
+        self.assertEqual(list(X.iter_invocations(self.root)), [])
+
+    def test_f6_alias_cannot_hide_a_destructive_git_command(self):
+        repo = os.path.join(self.tmp, "aliasrepo")
+        os.makedirs(repo)
+        sh(repo, "init", "-q", "-b", "main")
+        for i in (1, 2):
+            self.put("f.txt", "v%d\n" % i, base=repo)
+            sh(repo, "add", "-A")
+            sh(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "c%d" % i)
+        self.put("f.txt", "dirty\n", base=repo)
+        head = sh(repo, "rev-parse", "HEAD")
+        for argv in (["-c", "alias.undo=reset --hard", "undo", "HEAD~1"], ["-c", "ALIAS.undo=reset --hard", "undo", "HEAD~1"],
+                     ["--config-env=alias.undo=X", "undo"], ["undo", "HEAD~1"], ["-c", "alias.status=!rm -rf x", "status"],
+                     ["totally-unknown"]):
+            with self.assertRaises(W.DestructiveGit, msg=argv):
+                W.git(repo, *argv)
+        self.assertEqual((sh(repo, "rev-parse", "HEAD"), open(os.path.join(repo, "f.txt")).read()), (head, "dirty\n"))
+        for argv in (["status", "--porcelain=v1"], ["-c", "user.name=x", "rev-parse", "HEAD"], ["--literal-pathspecs", "ls-files"]):
+            self.assertIsNone(W.destructive_reason(argv), argv)
+
+    def interrupted_integration(self):
+        self.plan()
+        self.dispatch_both()
+        self.ready("ua")
+        self.ready("ub")
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        with mock.patch.object(C, "_merge_in", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("merge", "ub")
+        self.assertTrue(os.path.exists(os.path.join(paths.attempt_dir(self.root, "demo", "ub", 1), "integration_intent.json")))
+
+    def test_f7_resume_refuses_a_dirty_worktree(self):
+        self.interrupted_integration()
+        before = self.head("ub")
+        self.put("src/ub.py", "tampered\n", base=self.wtree("ub"))
+        rc, _, err = self.cli("merge", "ub")
+        self.assertEqual((rc, "not clean" in err, self.head("ub")), (1, True, before), err)
+        self.assertEqual(open(os.path.join(self.wtree("ub"), "src/ub.py")).read(), "tampered\n")
+
+    def test_f7_resume_aborts_its_own_half_done_merge_then_completes(self):
+        self.interrupted_integration()
+        wt = self.wtree("ub")
+        sh(wt, "-c", "user.name=t", "-c", "user.email=t@localhost", "merge", "--no-commit", "--no-ff", "origin/main")
+        self.assertNotEqual(sh(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False), "")
+        rc, _, err = self.cli("merge", "ub")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.merged_count(), 2)
 
 
 if __name__ == "__main__":

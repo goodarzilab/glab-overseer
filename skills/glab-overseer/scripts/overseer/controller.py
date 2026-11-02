@@ -82,7 +82,9 @@ def inside_root(root, path):
 # ---- shared reads -------------------------------------------------------------
 
 def is_closed(root, plan_id, unit, st):
-    if st["closure"].get("state") in ("merged", "closed", "abandoned"):
+    """A code unit is closed by a merged pull request; a job unit by a DONE judgment. `abandoned` closes nothing."""
+    state = st["closure"].get("state")
+    if state == "merged" or (state == "closed" and unit["kind"] == "job"):
         return True
     if unit["kind"] == "job" and X._int(st["counters"]["attempts"]):
         j = J.valid_judgment(root, plan_id, unit, st["counters"]["attempts"])
@@ -106,21 +108,31 @@ def nonvacuity_problem(adir, cand, review_state):
     nv = _dict(os.path.join(adir, "nonvacuous.json"))
     if nv is None:
         return "no non-vacuity record (run `nonvacuous`)"
-    if nv.get("candidate") not in R.equivalent_candidates(adir, cand):
+    if nv.get("candidate") != cand:  # never carried across an integration: the target may have changed what the tests need
         return "the non-vacuity record is for another candidate"
     if nv.get("status") in ("PASS", "NOT_APPLICABLE") or (nv.get("status") == "FAIL" and review_state["orchestrator_decision"]):
         return None
     return "non-vacuity %s: the tests pass without the change" % nv.get("status")
 
 
-def gate_problems(root, plan_id, unit):
-    """(valid DONE judgment or None, reasons the unit cannot merge yet)."""
+def gate_problems(root, plan_id, unit, fresh=False):
+    """(valid DONE judgment or None, reasons the unit cannot merge yet).
+
+    With `fresh`, an integrated candidate whose review is eligible gets a non-vacuity run of its own when the
+    stored record is for another candidate (merge only; `next` never writes)."""
     j = J.valid_judgment(root, plan_id, unit)
     if not j or j.get("status") != "DONE" or not isinstance(j.get("candidate"), str):
         return None, ["no DONE judgment bound to the worktree HEAD"]
     rs = R.review_state(root, plan_id, unit)
     n = approval.load_unit_state(root, plan_id, unit["id"])["counters"]["attempts"]
     problems = list(rs["reasons"]) if rs["state"] != "ELIGIBLE" else []
+    if fresh and j.get("integrated") is True and not problems:
+        nv = _dict(os.path.join(paths.attempt_dir(root, plan_id, unit["id"], n), "nonvacuous.json"))
+        if nv is None or nv.get("candidate") != j["candidate"]:
+            try:
+                R.nonvacuous(root, plan_id, unit)
+            except R.ReviewError as e:
+                raise NotReady("non-vacuity could not run on the integrated candidate: %s" % e)
     nv = nonvacuity_problem(paths.attempt_dir(root, plan_id, unit["id"], n), j["candidate"], rs)
     return j, problems + ([nv] if nv else [])
 
@@ -158,7 +170,16 @@ def _integrate(root, plan_id, unit, wt, adir, target, j):
     """Merge the fetched target into the unit branch when the candidate lacks it. Returns (judgment, base, pend)."""
     ipath = os.path.join(adir, "integration_intent.json")
     pend = _dict(ipath)
-    if pend is None:
+    if pend is not None:
+        for k in ("integration_base", "previous_candidate", "previous_base"):
+            if not isinstance(pend.get(k), str) or not pend[k]:
+                raise ControllerError("%s: field %s is missing or not a string" % (ipath, k))
+        if W.git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", ok=(0, 1))["rc"] == 0:
+            W.git(wt, "merge", "--abort")  # our own interrupted merge-in
+        dirty = J._worktree_problems(wt, W.rev(wt, "HEAD"), "supervisor")  # same cleanliness rule as first entry
+        if dirty:
+            raise NotReady("the worktree is not clean: " + "; ".join(dirty))
+    else:
         base = _fetch_target(wt, target)
         if W.git(wt, "merge-base", "--is-ancestor", base, j["candidate"], ok=(0, 1))["rc"] == 0:
             return j, base, None
@@ -194,13 +215,29 @@ def _record_merge(root, plan_id, unit, intent, back):
                                 dict(rec, state="unverified"))
         raise ControllerError("pull request #%s is MERGED at head %s with merge commit %s, not the judged candidate %s; "
                               "closure not set" % (intent["number"], back["head_oid"][:12], back["merge_oid"], intent["candidate"][:12]))
-    store.write_json_atomic(os.path.join(paths.unit_dir(root, plan_id, unit["id"]), "merge.json"), rec)
-    st = approval.load_unit_state(root, plan_id, unit["id"])
-    st["closure"] = {"state": "merged", "pr": intent["number"], "merge_commit": rec["merge_commit"], "time": rec["merged_at"]}
-    approval.save_unit_state(root, plan_id, unit["id"], st)
-    store.append_event(root, "merged", plan_id=plan_id, unit_id=unit["id"], number=intent["number"],
-                       pr_head=rec["pr_head"], merge_commit=rec["merge_commit"])
+    store.write_json_atomic(os.path.join(paths.unit_dir(root, plan_id, unit["id"]), "merge.json"), rec)  # merged record first
+    _close(root, plan_id, unit, rec)  # closure last; a rerun that finds the record but no closure runs only this
     return rec
+
+
+def _close(root, plan_id, unit, rec):
+    """Record closure from a verified merged record. Idempotent: only the first call writes and logs."""
+    st = approval.load_unit_state(root, plan_id, unit["id"])
+    if st["closure"].get("state") == "merged":
+        return
+    st["closure"] = {"state": "merged", "pr": rec["number"], "merge_commit": rec["merge_commit"], "time": rec["merged_at"]}
+    approval.save_unit_state(root, plan_id, unit["id"], st)
+    store.append_event(root, "merged", plan_id=plan_id, unit_id=unit["id"], number=rec["number"],
+                       pr_head=rec["pr_head"], merge_commit=rec["merge_commit"])
+
+
+def _merged_record(mrec, path):
+    """A merged.json that carries every field closure needs, each of the right type."""
+    ok = (type(mrec.get("number")) is int and all(isinstance(mrec.get(k), str) and mrec[k]
+                                                  for k in ("candidate", "pr_head", "merge_commit", "merged_at")))
+    if not ok:
+        raise ControllerError("%s is malformed: a merged record needs number, candidate, pr_head, merge_commit and merged_at" % path)
+    return mrec
 
 
 def sync_tracker(root, plan_id, unit, repo, target):
@@ -259,12 +296,18 @@ def merge_unit(root, plan_id, unit):
     st = approval.load_unit_state(root, plan_id, uid)
     mpath = os.path.join(paths.unit_dir(root, plan_id, uid), "merge.json")
     mrec = _dict(mpath)
-    if mrec and mrec.get("state") == "merged" and st["closure"].get("state") == "merged":
-        done = st["tracker"].get("state") == "closed"
+    if mrec and mrec.get("state") == "merged":  # reconcile a crash between this record and closure: no integrate, merge or review
+        _merged_record(mrec, mpath)
+        _close(root, plan_id, unit, mrec)
+        done = approval.load_unit_state(root, plan_id, uid)["tracker"].get("state") in ("closed", "none")
         return dict(mrec, tracker="closed" if done else sync_tracker(root, plan_id, unit, repo, target))
     if mrec and mrec.get("state") == "intent":  # interrupted: the read-back decides, a MERGED pull request is never merged again
+        if type(mrec.get("number")) is not int:
+            raise ControllerError("%s is malformed: an intent needs an integer number" % mpath)
         back = G.readback_pr(mrec["number"], repo)
         if back["state"] == "MERGED":
+            if not (type(mrec.get("number")) is int and isinstance(mrec.get("candidate"), str)):
+                raise ControllerError("%s is malformed: an intent needs number and candidate" % mpath)
             rec = _record_merge(root, plan_id, unit, mrec, back)
             return dict(rec, tracker=sync_tracker(root, plan_id, unit, repo, target))
         if back["state"] == "CLOSED":
@@ -275,14 +318,14 @@ def merge_unit(root, plan_id, unit):
     adir = paths.attempt_dir(root, plan_id, uid, n)
     wt = inside_root(root, W.load_workspace(adir)["worktree"])
     pend = _dict(os.path.join(adir, "integration_intent.json"))
-    j, problems = gate_problems(root, plan_id, unit)
+    j, problems = gate_problems(root, plan_id, unit, fresh=True)
     if pend is None and problems:
         raise NotReady("; ".join(problems))
     base = None
     if pend is not None or j:
         j, base, pend = _integrate(root, plan_id, unit, wt, adir, target, j or {})
         if pend is not None:
-            j, problems = gate_problems(root, plan_id, unit)
+            j, problems = gate_problems(root, plan_id, unit, fresh=True)
             if problems:
                 raise NotReady("after integration: " + "; ".join(problems))
     rec = G.open_pr(root, plan_id, unit)  # plain push, create or re-body, and the read-back head must equal the candidate
@@ -318,6 +361,11 @@ def _review_action(adir, plan, cand):
 def _unit_action(root, plan, u, st, free):
     """(action, detail) for one unit or None."""
     pid, uid, n = plan["plan_id"], u["id"], st["counters"]["attempts"]
+    if st["closure"].get("state") == "abandoned":
+        return None
+    blocked = [d for d in u["needs"] if approval.load_unit_state(root, pid, d)["closure"].get("state") == "abandoned"]
+    if blocked:
+        return "stop", "needs %s, which is abandoned and never merged; an orchestrator decision is needed" % ", ".join(blocked)
     if is_closed(root, pid, u, st):
         if _issue(root, pid, uid) and st["tracker"].get("state") not in ("closed", "none"):
             return "tracker", ("run `issues close`" if u["kind"] == "job" else "rerun `merge` to retry the tracker step")
@@ -379,7 +427,7 @@ def compute_actions(root, only_plan=None, write=False):
             a = _unit_action(root, plan, u, approval.load_unit_state(root, pid, u["id"]), free)
             if a:
                 acts.append({"plan": pid, "unit": u["id"], "action": a[0], "detail": a[1]})
-                if a[0] == "dispatch":
+                if a[0] in ("dispatch", "retry"):
                     free[0] -= 1
                     free[1] -= 1
                     total[0] += 1
@@ -409,11 +457,19 @@ def run_next(args):
 # ---- dispatch -----------------------------------------------------------------
 
 def dispatch_ready(root, plan_id=None):
-    """Dispatch every READY unit up to the free slots (plan cap and the project limit)."""
+    """Dispatch every READY unit and every retryable failed unit up to the free slots (plan cap and the project limit).
+
+    A retry stops at the attempts cap (acquire_attempt refuses a new attempt past it). Each owner stop is recorded
+    as an OWNER_STOP event and printed on stderr; the exit code is non-zero when any exists."""
     rc = 0
     with store.ProjectLock(root, "dispatch"):
         for a in compute_actions(root, plan_id, True):
-            if a["action"] != "dispatch":
+            if a["action"] == "stop" and a["unit"] is None:  # a plan-level owner stop (unit-level stops are `next` output only)
+                sys.stderr.write("OWNER_STOP: %s: %s\n" % (a["plan"], a["detail"]))
+                store.append_event(root, "OWNER_STOP", command="dispatch", plan_id=a["plan"], reason=a["detail"])
+                rc = 1
+                continue
+            if a["action"] not in ("dispatch", "retry"):
                 continue
             plan = approval.effective_plan(root, a["plan"])
             u = X._unit_of(plan, a["unit"])
