@@ -10,7 +10,7 @@ A unit is READY when every unit in `needs` is closed. A code unit is closed when
 
 ## Actions
 
-`dispatch [--unit U] [--plan P] [--after-quota]`. Without `--unit`, dispatches every READY unit while slots remain (3 per project). A code unit gets a worktree on a branch `overseer/PLAN/UNIT/aN` cut from the freshly fetched target and an author invocation. A job unit gets its command with `OVERSEER_OUT`. `--after-quota` allows a new attempt after a QUOTA or AUTH failure and needs the owner's agreement. Each dispatch uses an attempt; at most 2 per unit.
+`dispatch [--unit U] [--plan P] [--after-quota]`. Without `--unit`, dispatches every READY unit while slots remain (3 per project). A code unit gets a worktree on a branch `overseer/PLAN/UNIT/aN` cut from the freshly fetched target and an author invocation. A job unit gets its command with `OVERSEER_OUT` and runs in the project checkout, so `dispatch` refuses a job while that checkout lacks the merge commit of any code unit in its `needs` (transitively); update the checkout to the target (`git pull --ff-only origin TARGET` on the target branch) and dispatch again. `--after-quota` allows a new attempt after a QUOTA or AUTH failure and needs the owner's agreement. Each dispatch uses an attempt; at most 2 per unit.
 
 `wait [--timeout S] [--poll S]` blocks, polling in Python, until an active invocation changes state. Exit 0 on a change, 3 on timeout (default 1800 s); call it again. It spends no model turns.
 

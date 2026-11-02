@@ -120,6 +120,10 @@ class MergeCase(GhCase):
         self.assertEqual(rc, 0, err)
         return json.loads(out)
 
+    def pull(self):
+        """What an orchestrator does before a job that needs merged code: update the checkout."""
+        sh(self.root, "pull", "-q", "--ff-only", "origin", "main")
+
     def merged_count(self):
         return len(self.calls("pr", "merge"))
 
@@ -378,12 +382,34 @@ class Tracker(MergeCase):
         self.assertEqual(self.cli("merge", "ua")[0], 0)
         self.assertEqual((self.facet("ua", "tracker")["state"], self.merged_count()), ("closed", 1))
 
+    def test_job_is_refused_until_the_checkout_holds_every_merge_it_needs(self):
+        self.plan()
+        self.dispatch_both()
+        self.ready("ua")
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        self.pull()  # the checkout now holds ua's merge, but not ub's
+        self.ready("ub")
+        self.assertEqual(self.cli("merge", "ub")[0], 0)
+        self.assertEqual(self.next_lines(), ["dispatch jc"])
+        ub_merge = self.facet("ub", "closure")["merge_commit"]
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, out), (1, ""), err)
+        self.assertIn("lacks the merge of ub (%s)" % ub_merge[:12], err)
+        self.assertNotIn("ua (", err)
+        self.assertIn("git pull --ff-only origin main", err)
+        self.assertEqual(list(X.iter_invocations(self.root, "demo", "jc")), [])
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "jc")["counters"]["attempts"], 0)
+        self.pull()
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
+
     def test_job_unit_closes_on_done_judgment_not_on_exit(self):
         self.plan()
         self.dispatch_both()
         for u in ("ua", "ub"):
             self.ready(u)
             self.assertEqual(self.cli("merge", u)[0], 0)
+        self.pull()
         rc, out, err = self.cli("dispatch")
         self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
         self.wait_done("jc")
@@ -537,6 +563,7 @@ class Round1(MergeCase):
         for u in ("ua", "ub"):
             self.ready(u)
             self.assertEqual(self.cli("merge", u)[0], 0)
+        self.pull()
         self.assertEqual(self.cli("dispatch")[0], 0)
         self.wait_done("jc")
         self.assertEqual(self.cli("judge", "jc")[0], 1)

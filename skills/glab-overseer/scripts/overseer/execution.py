@@ -642,10 +642,42 @@ def acquire_attempt(root, plan_id, uid, after_quota=False):
     return allocate_attempt(root, plan_id, uid, after_quota)
 
 
+def missing_merges(root, plan_id, plan, unit):
+    """(unit, merge commit) for each merged code unit in `unit`'s transitive needs whose merge
+    commit the project checkout's HEAD does not contain (including one not fetched at all)."""
+    from . import workspace as W
+    seen, todo, missing = set(), list(unit.get("needs") or []), []
+    while todo:
+        uid = todo.pop()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        dep = _unit_of(plan, uid)
+        todo.extend(dep.get("needs") or [])
+        closure = approval.load_unit_state(root, plan_id, uid)["closure"]
+        sha = closure.get("merge_commit")
+        if dep["kind"] != "code" or closure.get("state") != "merged" or not isinstance(sha, str):
+            continue
+        r = W.git(root, "merge-base", "--is-ancestor", sha, "HEAD", ok=(0, 1, 128))
+        if r["rc"] != 0:  # 1: not an ancestor; 128: not a commit here (never fetched)
+            missing.append((uid, sha))
+    return sorted(missing)
+
+
 def dispatch_job(root, plan_id, unit, after_quota=False):
-    """Run a job unit's command through the local backend with OVERSEER_OUT set."""
+    """Run a job unit's command in the project checkout with OVERSEER_OUT set.
+
+    The command runs on whatever the checkout holds, and merges land on the remote target, so
+    a job that depends on merged code units is refused until the checkout contains them."""
     plan = approval.effective_plan(root, plan_id)
     uid = unit["id"]
+    stale = missing_merges(root, plan_id, plan, unit)
+    if stale:
+        raise ExecutionError(
+            "the project checkout lacks the merge of %s, so job %s would run on pre-merge files; "
+            "bring the checkout up to the target (on branch %s: `git pull --ff-only origin %s`), "
+            "then dispatch again" % (", ".join("%s (%s)" % (u, s[:12]) for u, s in stale), uid,
+                                     plan["target_branch"], plan["target_branch"]))
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)  # refuses before any attempt is allocated or sbatch runs
