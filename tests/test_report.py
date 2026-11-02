@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -101,7 +102,7 @@ class ReportCase(TmpCase):
     def make_crunch(self, status):
         a = self.adir("crunch")
         self.inv("crunch", "job", ["/x/bin/sh", "-c", "true"], backend="slurm")
-        j = {"status": status, "base": None, "candidate": None, "test_rc": None, "invocation_token": TOKEN_ID,
+        j = {"status": status, "kind": "job", "base": None, "candidate": None, "test_rc": None, "invocation_token": TOKEN_ID,
              "orchestrator_resolved": status == "DONE", "reasons": [HOME], "outputs": []}
         if status == "DONE":
             os.makedirs(os.path.join(a, "outputs"))
@@ -328,22 +329,8 @@ class PrivateCompletenessTests(ReportCase):
         self.assertEqual(got["extra/notes.txt"]["text"], "plain text")
         self.assertEqual(got["survey.json"]["json"], {"host": HOST, "path": HOME})
         b = got["extra/blob.bin"]
-        self.assertTrue(b["binary"])
+        self.assertEqual((b["encoding"], base64.b64decode(b["content"])), ("base64", b"\xff\xfe\x00\x80"))
         self.assertNotIn("text", b)
-
-    def test_large_files_are_truncated_to_head_and_tail_with_full_digest(self):
-        n = 600 * 1024
-        data = b"H" * 70000 + b"m" * (n - 140000) + b"T" * 70000
-        self.put("extra/big.log", data)
-        self.put("extra/big.json", json.dumps({"k": "v" * n}).encode())
-        got = self.files()
-        for rel, raw in (("extra/big.log", data), ("extra/big.json", open(os.path.join(paths.state_dir(self.root), "extra/big.json"), "rb").read())):
-            e = got[rel]
-            self.assertTrue(e["truncated"], rel)
-            self.assertEqual((e["size"], e["sha256"]), (len(raw), hashlib.sha256(raw).hexdigest()))
-            self.assertEqual(e["head"], raw[:65536].decode("utf-8", "replace"))
-            self.assertEqual(e["tail"], raw[-65536:].decode("utf-8", "replace"))
-            self.assertNotIn("json", e)
 
     def test_symlinks_are_listed_not_followed(self):
         target = os.path.join(self.tmp, "outside.txt")
@@ -357,6 +344,75 @@ class PrivateCompletenessTests(ReportCase):
     def test_public_report_has_no_private_section(self):
         self.put("extra/notes.txt", b"plain text")
         self.assertNotIn("private", self.build(True))
+
+
+class Round2ReportTests(ReportCase):
+    def put(self, rel, data):
+        p = os.path.join(paths.state_dir(self.root), rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_f3_merged_unit_with_missing_judgment_is_incomplete(self):
+        self.make_alpha()
+        os.unlink(os.path.join(self.adir("alpha"), "judgment.json"))
+        for public in (True, False):
+            rep = self.build(public)
+            self.assertEqual(self.units(rep)["alpha"]["state"], "merged")
+            self.assertIn({"unit": "alpha", "item": "judgment missing"}, rep["incomplete"])
+
+    def test_f3_intact_merged_unit_has_no_judgment_item(self):
+        self.make_alpha()
+        self.assertNotIn({"unit": "alpha", "item": "judgment missing"}, self.build()["incomplete"])
+
+    def test_f4_orphan_done_code_unit_that_is_not_merged_is_incomplete(self):
+        self.make_alpha()
+        self.unit_state("alpha", closure={"state": "open"}, tracker={"issue": 11, "state": "open"})
+        os.unlink(os.path.join(paths.plan_dir(self.root, self.pid), "plan.json"))
+        rep = self.build()
+        self.assertIn({"unit": "alpha", "item": "state DONE, not merged"}, rep["incomplete"])
+
+    def test_f4_orphan_merged_code_unit_and_done_job_are_complete(self):
+        self.make_alpha()
+        self.make_crunch("DONE")
+        os.unlink(os.path.join(paths.plan_dir(self.root, self.pid), "plan.json"))
+        rep = self.build()
+        self.assertFalse([i for i in rep["incomplete"] if i["unit"] in ("alpha", "crunch")], rep["incomplete"])
+
+    def test_f5_private_report_inlines_whole_large_and_binary_files(self):
+        n = 300000
+        log = b"A" * n + b"unique-middle-traceback" + b"B" * n
+        blob = bytes(range(256)) * 3000
+        self.put("extra/big.log", log)
+        self.put("extra/blob.bin", blob)
+        self.put("extra/big.json", json.dumps({"k": "v" * 700000}).encode())
+        got = self.build(False)["private"]["files"]
+        e = got["extra/big.log"]
+        self.assertEqual(e["text"], log.decode())
+        self.assertNotIn("truncated", e)
+        self.assertEqual((e["size"], e["sha256"]), (len(log), hashlib.sha256(log).hexdigest()))
+        b = got["extra/blob.bin"]
+        self.assertEqual((b["encoding"], base64.b64decode(b["content"])), ("base64", blob))
+        self.assertEqual(got["extra/big.json"]["json"], {"k": "v" * 700000})
+
+    def test_f5_worktree_files_are_listed_only_and_report_md_says_so(self):
+        self.make_alpha()
+        wt = os.path.join("plans", self.pid, "units", "alpha", "attempts", "a1", "worktree")
+        got = self.build(False)["private"]["files"]
+        e = got[os.path.join(wt, "src", "alpha.py")]
+        self.assertEqual(e["listed_only"], True)
+        self.assertEqual(e["sha256"], hashlib.sha256(b"print(1)\n").hexdigest())
+        self.assertNotIn("text", e)
+        self.assertTrue([k for k in got if os.sep + ".git" + os.sep in k and got[k].get("listed_only")])
+        out = os.path.join(self.tmp, "o")
+        self.assertEqual(self.cli("report", "--out", out).returncode, 0)
+        with open(os.path.join(out, "report.md")) as f:
+            md = f.read()
+        self.assertIn("listed with size and digest only", md)
+        self.assertEqual(self.cli("report", "--public", "--out", os.path.join(self.tmp, "p")).returncode, 0)
+        with open(os.path.join(self.tmp, "p", "report.md")) as f:
+            self.assertNotIn("listed with size and digest only", f.read())
 
 
 class FilesTests(ReportCase):

@@ -38,6 +38,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$only" in ""|claude|agy) ;; *) die "--only must be claude or agy" ;; esac
+NL=$(printf '\nx'); NL=${NL%x}
+CR=$(printf '\rx'); CR=${CR%x}
+for d in "$claude_dir" "$agy_dir"; do
+  case "$d" in *"$NL"*|*"$CR"*) die "a skills directory must not contain a newline or carriage return" ;; esac
+done
 [ -n "$claude_dir" ] && [ -n "$agy_dir" ] || die "no skills directory: set HOME or pass --claude-dir and --agy-dir"
 [ -f "$SRC/SKILL.md" ] || die "cannot find $SRC/SKILL.md; run install.sh from a checkout"
 

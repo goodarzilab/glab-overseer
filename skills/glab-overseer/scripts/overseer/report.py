@@ -7,6 +7,7 @@ item, never guessed. The private report is the public structure plus a `private`
 file. Both files are rendered from one dict, so they agree.
 """
 import hashlib
+import base64
 import json
 import os
 import re
@@ -20,8 +21,6 @@ WORD_RE = re.compile(r"^[A-Za-z0-9_]{1,40}$")
 MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+)$")
 FAMILY = {"claude": "claude", "agy": "google", "google": "google"}
 BACKENDS = ("local", "slurm")
-MAX_FILE = 512 * 1024
-EDGE = 64 * 1024  # a file over MAX_FILE is inlined as its first and last EDGE bytes
 LIST_ONLY_DIRS = ("worktree", ".git")  # git checkouts: listed with size and digest, content not inlined
 
 
@@ -170,7 +169,7 @@ def _reviews(adir, uid, gaps):
     return rounds
 
 
-def _attempt(root, pid, u, n, repo, gaps):
+def _attempt(root, pid, u, n, repo, gaps, need_judgment=False):
     uid = u["id"]
     adir = paths.attempt_dir(root, pid, uid, n)
     invs = [i for i in X.iter_invocations(root, pid, uid) if i["attempt"] == n]
@@ -184,7 +183,7 @@ def _attempt(root, pid, u, n, repo, gaps):
             models.append({"family": fam, "model": model})
     ws = gaps.obj(os.path.join(adir, "workspace.json"), uid, "workspace") if u["kind"] == "code" else None
     wt = ws.get("worktree") if isinstance(ws, dict) and isinstance(ws.get("worktree"), str) and os.path.isdir(ws["worktree"]) else None
-    j = gaps.obj(os.path.join(adir, "judgment.json"), uid, "judgment") or {}
+    j = gaps.obj(os.path.join(adir, "judgment.json"), uid, "judgment", need_judgment) or {}
     integ = gaps.obj(os.path.join(adir, "integration.json"), uid, "integration record") or {}
     dec = gaps.obj(os.path.join(adir, "reviews", "orchestrator_decision.json"), uid, "orchestrator decision")
     return {
@@ -236,7 +235,7 @@ def _unit(root, pid, u, st, repo, gaps, effective):
     if X._int(n):
         for k in range(1, n + 1):
             if os.path.isdir(paths.attempt_dir(root, pid, uid, k)):
-                attempts.append(_attempt(root, pid, u, k, repo, gaps))
+                attempts.append(_attempt(root, pid, u, k, repo, gaps, k == n and state in approval.CLOSED_STATES))
             else:
                 gaps.add(uid, "attempt a%d directory missing" % k)
     if state in ("UNCERTAIN", "failed", "unjudged", "unknown", "running", "pending", "judged_done"):
@@ -272,6 +271,10 @@ def _orphan_units(root, pid, gaps):
         status = _word(j.get("status")) if isinstance(j, dict) else None
         if status != "DONE":
             gaps.add(uid, "state %s" % (status if status in ("UNCERTAIN", "FAILED") else "unjudged"))
+        elif j.get("kind") != "job":  # a code unit is complete only when merged (or otherwise closed)
+            st = approval.load_unit_state(root, pid, uid)
+            if st["closure"].get("state") not in approval.CLOSED_STATES:
+                gaps.add(uid, "state DONE, not merged")
 
 
 def public_report(root):
@@ -311,41 +314,29 @@ def public_report(root):
 # ---- private -----------------------------------------------------------------
 
 def _file_entry(f, rel_in_listonly):
-    """One regular file: size and sha256 always; content per the size cap; nothing is silently omitted."""
+    """One regular file: size and sha256 always, and its whole content (text, parsed JSON or base64)."""
     try:
-        size, digest = _stat_digest(f)
-        if size is None:
-            return {"unreadable": "could not read the file"}
-        e = {"size": size, "sha256": digest}
-        if rel_in_listonly:
-            e["listed_only"] = True
-            return e
         with open(f, "rb") as fh:
-            if size <= MAX_FILE:
-                data = fh.read(MAX_FILE + 1)
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    e["binary"] = True
-                    return e
-                if f.endswith(".json"):
-                    try:
-                        e["json"] = json.loads(text)
-                        return e
-                    except ValueError:
-                        pass
-                e["text"] = text
-                return e
-            head = fh.read(EDGE)
-            fh.seek(max(size - EDGE, 0))
-            tail = fh.read(EDGE)
-        if b"\0" in head or b"\0" in tail:
-            e["binary"] = True
-            return e
-        e.update(truncated=True, head=head.decode("utf-8", errors="replace"), tail=tail.decode("utf-8", errors="replace"))
-        return e
+            data = fh.read()
     except OSError as ex:
         return {"unreadable": str(ex)}
+    e = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    if rel_in_listonly:
+        e["listed_only"] = True
+        return e
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        e.update(encoding="base64", content=base64.b64encode(data).decode("ascii"))
+        return e
+    if f.endswith(".json"):
+        try:
+            e["json"] = json.loads(text)
+            return e
+        except ValueError:
+            pass
+    e["text"] = text
+    return e
 
 
 def private_section(root):
@@ -455,7 +446,8 @@ def render(rep):
     if not rep["public"]:
         pv = rep["private"]
         out += ["", "## Private state", "", "%d state files, %d events." % (len(pv["files"]), len(pv["events"]) if isinstance(pv["events"], list) else 0),
-                "The full records are in report.json under `private`."]
+                "The full records are in report.json under `private`.",
+                "Files inside an attempt `worktree/` or any `.git/` directory are listed with size and digest only; they are recoverable from the recorded commits."]
     return "\n".join(out) + "\n"
 
 

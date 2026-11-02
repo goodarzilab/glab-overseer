@@ -181,6 +181,18 @@ class InstallTests(InstallCase):
             self.assertFalse(os.path.exists(os.path.join(odd, "glab-overseer")), shell)
             self.assertTrue(os.path.isfile(os.path.join(plain, "glab-overseer", MARKER)), shell)
 
+    def test_round2_newline_or_cr_in_a_root_is_refused(self):
+        self.run_install("--only", "claude")
+        for bad in (self.tc + "\n" + os.path.join(self.tmp, "b"), self.c + "\r", "x\ny"):
+            for extra in ((), ("--uninstall",), ("--dry-run",)):
+                r = subprocess.run(["bash", INSTALL, "--only", "claude", "--claude-dir", bad] + list(extra),
+                                   capture_output=True, text=True, env=self.env())
+                self.assertEqual(r.returncode, 2, (bad, extra, r.stdout))
+                self.assertIn("newline", r.stderr)
+        self.assertTrue(os.path.isdir(self.tc), "an unrelated installation was removed")
+        r = subprocess.run(["bash", INSTALL, "--only", "agy", "--agy-dir", "a\nb", "--claude-dir", self.c], capture_output=True, text=True, env=self.env())
+        self.assertEqual(r.returncode, 2)
+
     def test_unknown_flag_and_missing_value(self):
         self.assertEqual(self.run_install("--nope").returncode, 2)
         r = subprocess.run(["bash", INSTALL, "--claude-dir"], capture_output=True, text=True, env=self.env())

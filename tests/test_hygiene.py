@@ -15,24 +15,42 @@ import unittest
 
 import helpers
 
+# Every quantifier is bounded so a match is always shorter than OVERLAP and is seen whole in some buffer.
 CREDENTIALS = {
-    "anthropic key": re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"),
-    "api key": re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{32,}"),
+    "anthropic key": re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,512}"),
+    # sk-proj-... and similar: internal hyphen or underscore segments; needs a digit or capital so kebab-case words never match
+    "api key": re.compile(r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{32,512}"),
     "google key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
     "github token": re.compile(r"ghp_[A-Za-z0-9]{36}"),
-    "github fine-grained token": re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
-    "slack token": re.compile(r"xox[bp]-[0-9]+"),
+    "github fine-grained token": re.compile(r"github_pat_[A-Za-z0-9_]{22,255}"),
+    "slack token": re.compile(r"xox[bp]-[0-9]{1,64}"),
     "private key header": re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
 }
-HOME_PATH = re.compile(r"/(?:home|Users)/[A-Za-z_][A-Za-z0-9._-]*/")
+HOME_PATH = re.compile(r"/(?:home|Users)/[A-Za-z_][A-Za-z0-9._-]{0,255}/")
 CHUNK = 1024 * 1024
 OVERLAP = 64 * 1024  # longer than any token pattern here and any sane identifier
 ID_CHARS = "A-Za-z0-9_"
 
 
-def scan_text(text):
-    hits = [name for name, rx in CREDENTIALS.items() if rx.search(text)]
-    if HOME_PATH.search(text):
+def found(rx, text, first=True, last=True):
+    """True when rx matches with both neighbours inside the buffer or at the true start or end of the file.
+
+    A buffer edge is never a token boundary: a match that touches an edge that is not the file's own edge is
+    left for the next buffer, which holds it whole because buffers overlap.
+    """
+    pos = 0
+    while True:
+        m = rx.search(text, pos)
+        if m is None:
+            return False
+        if (m.start() > 0 or first) and (m.end() < len(text) or last):
+            return True
+        pos = m.start() + 1
+
+
+def scan_text(text, first=True, last=True):
+    hits = [name for name, rx in CREDENTIALS.items() if found(rx, text, first, last)]
+    if found(HOME_PATH, text, first, last):
         hits.append("home path")
     return hits
 
@@ -45,7 +63,7 @@ def id_regex(ident):
 def identifier_hits(items, banned):
     """(path, identifier) for every identifier found as a whole token in a path or its content."""
     rx = [(b, id_regex(b)) for b in banned]
-    return [(rel, b) for rel, text in items for b, r in rx if r.search(text) or r.search(rel)]
+    return [(rel, b) for rel, text in items for b, r in rx if found(r, text) or found(r, rel)]
 
 
 def tracked_files(repo=None):
@@ -58,46 +76,49 @@ def tracked_files(repo=None):
 
 
 def chunks(path, size=CHUNK, overlap=OVERLAP):
-    """Text of a file in pieces of `size` bytes that overlap by `overlap`, so no match is split across pieces.
+    """(text, first, last) for pieces of `size` bytes that overlap by `overlap`.
 
     A symlink yields its target string (os.readlink), never the target file. Size never exempts a file.
     """
     if os.path.islink(path):
-        yield os.readlink(path)
+        yield os.readlink(path), True, True
         return
     if not os.path.isfile(path):
         return
     overlap = min(overlap, size - 1)
+    first = True
     with open(path, "rb") as f:
         buf = b""
         while True:
             more = f.read(size - len(buf))
             buf += more
-            if buf:
-                yield buf.decode("utf-8", errors="replace")
-            if not more or len(buf) < size:
+            last = not more or len(buf) < size
+            if buf or first:
+                yield buf.decode("utf-8", errors="replace"), first, last
+            if last:
                 return
+            first = False
             buf = buf[-overlap:] if overlap else b""
 
 
 def scan_file(path, rel, banned_rx=(), size=CHUNK, overlap=OVERLAP):
     """(credential/home-path hit names, identifiers found) for one path."""
     names, ids = [], []
-    for text in chunks(path, size, overlap):
-        names += [n for n in scan_text(text) if n not in names]
-        ids += [b for b, rx in banned_rx if b not in ids and rx.search(text)]
-    ids += [b for b, rx in banned_rx if b not in ids and rx.search(rel)]
+    for text, first, last in chunks(path, size, overlap):
+        names += [n for n in scan_text(text, first, last) if n not in names]
+        ids += [b for b, rx in banned_rx if b not in ids and found(rx, text, first, last)]
+    ids += [b for b, rx in banned_rx if b not in ids and found(rx, rel)]
     return names, ids
 
 
 def scan_repo(repo, banned=(), skip=None, size=CHUNK, overlap=OVERLAP):
     """{rel: (names, ids)} for every file with a hit. `skip` is a path (the identifier list) never scanned."""
-    skip = os.path.realpath(skip) if skip else None
+    skip = set([os.path.abspath(skip), os.path.realpath(skip)]) if skip else set()
     rx = [(b, id_regex(b)) for b in banned]
     hits = {}
     for rel in tracked_files(repo) or []:
         full = os.path.join(repo, rel)
-        if skip and os.path.realpath(full) == skip and not os.path.islink(full):
+        if skip & set([os.path.abspath(full), os.path.realpath(full)]):
             continue
         names, ids = scan_file(full, rel, rx, size, max(overlap, 2 * max([len(b) for b in banned] or [0])))
         if names or ids:
@@ -216,6 +237,64 @@ class IdentifierScannerTests(unittest.TestCase):
         self.assertEqual(identifier_hits([("a", "at /ho" + "me/someXone-x/data")], [ident]), [])
         mail = "a.b" + "@c-d.example"
         self.assertEqual(identifier_hits([("a", "mail " + mail.upper() + ".")], [mail]), [("a", mail)])
+
+
+class Round2ScannerTests(unittest.TestCase):
+    def test_project_style_keys_with_hyphens_match(self):
+        for s in ("sk-" + "proj-" + "A" * 40, "sk-" + "proj-" + "Ab1_" * 12, "sk-" + "ant-" + "api03-" + "Zz9" * 10):
+            self.assertTrue(scan_text("key = '%s'" % s), s)
+        self.assertIn("api key", scan_text("sk-" + "proj-" + "A" * 40))
+        for s in ("task-" + "A" * 50, "ask-" + "proj-" + "A" * 40, "sk-" + "learn-is-a-lowercase-kebab-case-name-here",
+                  "sk-" + "proj-" + "A" * 10, "_sk-" + "proj-" + "A" * 40):
+            self.assertEqual(scan_text(s), [], s)
+
+    def tmpfile(self, data):
+        d = tempfile.mkdtemp(prefix="ovr-hyg-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "f.txt")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_a_chunk_edge_is_not_a_token_boundary(self):
+        ident = "sun" + "beam"
+        rx = [(ident, id_regex(ident))]
+        # `sunbeam` ends exactly at the first edge, and the file goes on with `s`
+        p = self.tmpfile(b" " * (CHUNK - len(ident)) + (ident + "s").encode())
+        self.assertEqual(scan_file(p, "doc.txt", rx), ([], []))
+        # the same word whole, with a space after the edge, is found
+        p = self.tmpfile(b" " * (CHUNK - len(ident)) + (ident + " tail").encode())
+        self.assertEqual(scan_file(p, "doc.txt", rx), ([], [ident]))
+        # a word that starts exactly at the edge of the second buffer and continues a longer word
+        p = self.tmpfile(b"x" * 899 + b"a" + (ident).encode() + b" " * 200)
+        self.assertEqual(scan_file(p, "doc.txt", rx, size=1000, overlap=100)[1], [])
+        p = self.tmpfile(b"x" * 899 + b" " + (ident).encode() + b" " * 200)
+        self.assertEqual(scan_file(p, "doc.txt", rx, size=1000, overlap=100)[1], [ident])
+
+    def test_a_credential_split_by_an_edge(self):
+        tok = "sk-" + "ant-" + "Q" * 30
+        # preceded by a letter: the second buffer begins exactly at the token and must not match it
+        p = self.tmpfile(b"x" * 899 + b"a" + tok.encode() + b" " * 200)
+        self.assertEqual(scan_file(p, "f", size=1000, overlap=100)[0], [])
+        # a real token cut by the edge is still found whole in the next buffer
+        for cut in (905, 920, 930, 960):
+            p = self.tmpfile(b"x" * (cut - 4) + b" " + tok.encode() + b" " * 300)
+            self.assertIn("anthropic key", scan_file(p, "f", size=1000, overlap=100)[0], cut)
+
+    def test_a_symlinked_identifier_list_is_skipped(self):
+        d = os.path.realpath(tempfile.mkdtemp(prefix="ovr-hyg-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        ident = "planted" + "linkid"
+        os.makedirs(os.path.join(d, "repo"))
+        real = os.path.join(d, "elsewhere-" + ident + ".txt")
+        with open(real, "w") as f:
+            f.write(ident + "\n")
+        link = os.path.join(d, "repo", "ids.txt")
+        os.symlink(real, link)
+        subprocess.run(["git", "init", "-q"], cwd=os.path.join(d, "repo"), check=True)
+        self.assertEqual(scan_repo(os.path.join(d, "repo"), [ident], skip=link), {})
+        self.assertEqual(scan_repo(os.path.join(d, "repo"), [ident], skip=real), {})
+        self.assertTrue(scan_repo(os.path.join(d, "repo"), [ident]))  # without a skip the link target string matches
 
 
 class TreeTests(unittest.TestCase):
