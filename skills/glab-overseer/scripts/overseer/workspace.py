@@ -94,6 +94,11 @@ def prohibited_name(path):
             or b.endswith(".key") or b.startswith("id_rsa"))
 
 
+def caps_of(plan):
+    """Caps with U1's defaults for any that the plan does not set."""
+    return dict(X.P.CAP_MAX, **(plan.get("caps") or {}))
+
+
 def declared_outputs(unit):
     return set(o["path"] if isinstance(o, dict) else o for o in unit.get("outputs") or [])
 
@@ -165,7 +170,7 @@ def dispatch_code(root, plan_id, unit, after_quota=False):
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)
-    X.check_slots(root, plan_id, plan["caps"]["workers"])
+    X.check_slots(root, plan_id, caps_of(plan)["workers"])
     target = check_branch_name(plan["target_branch"])
     try:
         git(root, "fetch", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (target, target), timeout=FETCH_TIMEOUT)
@@ -195,6 +200,56 @@ def dispatch_code(root, plan_id, unit, after_quota=False):
     if backend == "slurm":
         return slurm.launch(root, plan_id, uid, n, "author", None, wt, prepare=prepare)
     return X.launch_invocation(root, plan_id, uid, n, "author", None, wt, prepare=prepare)
+
+
+MAX_FIX_PROMPT = 100000
+
+
+def fixer_text(unit, prompt):
+    """The fixer's task: the orchestrator's prompt, then the unit's scope, test command and rules."""
+    return "\n".join(["# Fix: %s" % unit["title"], "", prompt.strip(), "", "## Scope",
+                      "Change only files matching these repository-relative globs:"]
+                     + ["- %s" % g for g in unit["scope"]]
+                     + ["", "## Test command", "Run it and make it pass before you finish:", "```", unit["test_command"], "```",
+                        "", "## Rules",
+                        "- Work only inside the current working directory, which is a git worktree.",
+                        "- Stay within the scope above; never push, never change remotes, never rewrite or delete commits.", ""])
+
+
+def dispatch_fixer(root, plan_id, unit, prompt):
+    """Launch a fixer in the unit's current attempt worktree with the host family's code model."""
+    approval.require_approval(root, plan_id)
+    plan = approval.effective_plan(root, plan_id)
+    uid = unit["id"]
+    cache = models.load_valid(root)
+    roles = models.roles_for(cache, cache["host"]) if cache else None
+    if roles is None:
+        raise WorkspaceError("models.json is missing, malformed or lacks the host family; run `overseer.py models --host claude|google`")
+    st = approval.load_unit_state(root, plan_id, uid)
+    n = st["counters"]["attempts"]
+    if not X._int(n):
+        raise WorkspaceError("unit %s has no attempt to fix" % uid)
+    if st["closure"].get("state") in approval.CLOSED_STATES:
+        raise WorkspaceError("unit %s is %s" % (uid, st["closure"]["state"]))
+    adir = paths.attempt_dir(root, plan_id, uid, n)
+    wt = load_workspace(adir)["worktree"]
+    if not os.path.isdir(wt):
+        raise WorkspaceError("worktree %s is missing" % wt)
+    busy = X.active_invocations(root, plan_id, uid, True)
+    if busy:
+        raise WorkspaceError("invocation %s of %s is %s" % (busy[0]["seq"], uid, busy[0]["status"]["state"]))
+    backend = slurm.choose_backend(root)
+    if backend == "slurm":
+        slurm.preflight(root, plan, unit)
+    X.check_slots(root, plan_id, caps_of(plan)["workers"])
+    survey = _survey(root)
+    text = fixer_text(unit, prompt)
+
+    def prepare(inv):
+        p = adapters.prepare(cache["host"], "author", roles["code"], text, wt, task_dir=inv, survey=survey)
+        return p["argv"], p["stdin"]
+    launch = slurm.launch if backend == "slurm" else X.launch_invocation
+    return launch(root, plan_id, uid, n, "fixer", None, wt, prepare=prepare)
 
 
 # ---- normalization -----------------------------------------------------------

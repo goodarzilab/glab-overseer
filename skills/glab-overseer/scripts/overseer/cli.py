@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, execution, judge, models, paths, plan as P, slurm, store, survey
+from . import approval, execution, judge, models, paths, plan as P, review, slurm, store, survey
 
 from . import github as _github  # noqa: E402
 
@@ -143,12 +143,15 @@ register("abort", "abort a unit's active invocations", execution.configure_abort
 register("judge", "judge an attempt against its evidence", judge.configure_judge, judge.run_judge)
 register("resolve", "resolve an UNCERTAIN attempt as done or failed (orchestrator decision)",
          judge.configure_resolve, judge.run_resolve)
+register("review", "run a cross-family review round of a judged candidate", review.configure_review, review.run_review_cmd)
+register("reproduce", "reproduce a review finding in a disposable worktree",
+         review.configure_reproduce, review.run_reproduce)
+register("dispositions", "record finding dispositions, an orchestrator decision, or show eligibility",
+         review.configure_dispositions, review.run_dispositions)
+register("fix", "launch a fixer in the unit's worktree", review.configure_fix, review.run_fix)
+register("nonvacuous", "check that the tests fail without the non-test changes",
+         review.configure_nonvacuous, review.run_nonvacuous)
 for _name, _help in [
-    ("review", "run a cross-family review (U6)"),
-    ("reproduce", "reproduce a review finding (U6)"),
-    ("dispositions", "record finding dispositions (U6)"),
-    ("fix", "run a fixer for review findings (U6)"),
-    ("nonvacuous", "check that tests fail without the change (U6)"),
     ("merge", "merge an approved pull request (U8)"),
     ("next", "print the next action (U8)"),
     ("report", "write the evidence report (U9)"),
