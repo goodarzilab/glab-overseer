@@ -22,6 +22,8 @@ CLASH = (OWN + 'case $U in ub) printf "l1\\nl2\\nM3\\nl4\\nl5\\nl6\\nl7\\n";; *)
 
 MERGE_BLOCK = '''
 if a[0] == "repo" and a[1] == "view":
+    if "-R" in a or len(a) < 3 or a[2].startswith("-"):  # the real gh takes the repository positionally
+        die("unknown shorthand flag: 'R' in -R")
     out(json.dumps({"defaultBranchRef": {"name": st.get("default", "main")}}))
 if a[0] == "pr" and a[1] == "merge":
     p = st["prs"][int(a[2]) - 1]

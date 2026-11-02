@@ -434,7 +434,7 @@ def set_tracker(root, plan_id, unit_id, **fields):
 
 
 def default_branch(repo):
-    d = _read(["repo", "view", "-R", repo, "--json", "defaultBranchRef"], "repo view", dict)
+    d = _read(["repo", "view", repo, "--json", "defaultBranchRef"], "repo view", dict)  # repo view takes no -R
     ref = d.get("defaultBranchRef")
     if not (isinstance(ref, dict) and isinstance(ref.get("name"), str) and ref["name"]):
         raise GithubError("repo view returned no default branch")

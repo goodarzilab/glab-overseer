@@ -185,6 +185,7 @@ evidence the attempt is UNCERTAIN.
 | P13 | `agy -p` takes the next argument as its prompt value; a flag placed there is consumed as the prompt and agy exits 2. `claude -p` is a boolean flag and reads the prompt positionally or from stdin. |
 | P14 | `overseer.py probe-transport` (U2) measured: claude stdin and schema both work; agy schema works and agy has no plain-text stdin transport. |
 | P15 | `sbatch` exited 1 with `Batch job submission failed: Socket timed out on send/recv operation`, yet the job had been submitted and ran to completion. A non-zero sbatch exit is therefore not proof of rejection. |
+| P16 | `gh repo view` takes the repository as a positional argument and rejects `-R` (gh 2.97). The unit-test shim accepted `-R`, so the explicit issue close on a non-default target failed live in U10 acceptance Run 1; the merge itself succeeded and the tracker stayed pending, as designed. |
 
 ### Committee decisions
 
