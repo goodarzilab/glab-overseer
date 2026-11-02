@@ -16,12 +16,13 @@ OV="python3 <installed skill dir>/scripts/overseer.py"
 PROJ=<shared-storage dir, one per run; never /tmp, /var/tmp or $TMPDIR>
 REPO=goodarzilab/<throwaway>         # one private throwaway repository for all runs
 TGT=run1                             # one target branch per run: run1, d3, run2, run3
+PLAN=accept-run1                     # one plan id per run: accept-run1, accept-d3, accept-run2, accept-run3
 ```
 
 Needs `gh` with rights on the throwaway repository, `claude` (and `agy` for Run 3) logged in by subscription, and no `*_API_KEY` variable. Pass site values on the command line; none is committed here.
 
 ```
-python3 $ACC/make_fixture.py $PROJ --plan-id accept-run1 --target $TGT --repo $REPO --partition $PART [--account $ACCT] --time 00:30:00 --mem 8G --cpus 2
+python3 $ACC/make_fixture.py $PROJ --plan-id $PLAN --target $TGT --repo $REPO --partition $PART [--account $ACCT] --time 00:30:00 --mem 8G --cpus 2
 gh repo create $REPO --private --add-readme      # once, before the first run; orchestrator step, covered by O8
 cd $PROJ && git remote add origin https://github.com/$REPO.git && git push -u origin $TGT
 ```
@@ -35,9 +36,9 @@ Work in an interactive allocation on shared storage, never on a login node. Star
 1. `$OV survey --probe-auth`. Evidence: `.overseer/survey.json` (Slurm usable, gh authenticated, auth by subscription).
 2. `$OV models --host claude`. Evidence: `.overseer/models.json` (author sonnet, reviewer newest Google flash).
 3. `$OV probe-transport | tee .overseer/acceptance-probe.txt`.
-4. `$OV plan validate plan.json`; show the user the plan and the three issue titles; `$OV plan approve plan.json --approver NAME`. Evidence: `plans/accept-run1/{plan,approval}.json`.
-5. `$OV issues file --plan accept-run1` (`--dry-run` first). Evidence: `plans/accept-run1/issues.json`; paste `gh issue list -R $REPO`.
-6. `$OV slurm-handshake --plan accept-run1`. It needs the approved plan, so it follows step 4. Evidence: `.overseer/handshake/*/reply.json`.
+4. `$OV plan validate plan.json`; show the user the plan and the three issue titles; `$OV plan approve plan.json --approver NAME`. Evidence: `plans/$PLAN/{plan,approval}.json`.
+5. `$OV issues file --plan $PLAN` (`--dry-run` first). Evidence: `plans/$PLAN/issues.json`; paste `gh issue list -R $REPO`.
+6. `$OV slurm-handshake --plan $PLAN`. It needs the approved plan, so it follows step 4. Evidence: `.overseer/handshake/*/reply.json`.
 7. `$OV dispatch --unit slug` and `$OV dispatch --unit count` back to back. Paste `$OV status` showing two RUNNING authors. Evidence: `units/{slug,count}/attempts/a1/inv/01-author/{intent,launch,start,exit}.json`; claim `overlap` reads `start.json` and `exit.json`.
 8. `$OV wait` (repeat on exit 3) until both exit.
 9. `$OV judge slug`, `$OV judge count`. Evidence: `attempts/a1/judgment.json` (DONE, outputs ok). On FAILED, `dispatch --unit U` starts attempt 2; note why.
@@ -46,10 +47,10 @@ Work in an interactive allocation on shared storage, never on a login node. Star
 12. `$OV nonvacuous slug`, `$OV nonvacuous count`. The prompts ask for `tests/test_*_extra.py`, so PASS is expected; NOT_APPLICABLE is accepted but weaker; note it in the report. Evidence: `attempts/a1/nonvacuous.json`.
 13. `$OV pr slug`; `$OV merge slug`. Evidence: `units/slug/{pr,merge}.json` (`pr_head`, `merge_commit`); paste `gh pr view`.
 14. `$OV pr count`; `$OV merge count`. The target advanced, so this merge integrates it. Evidence: `units/count/attempts/a1/integration.json`, `judgment.json` with `integrated: true`, `merge.json` with `integration_base`, and the `integration_*` lines of `events.jsonl`. A new review round after integration needs `review` and `nonvacuous` again.
-15. `$OV next`, then `$OV dispatch --unit summarize`, `$OV wait`, `$OV judge summarize` (sbatch). Evidence: `units/summarize/attempts/a1/inv/01-job/{intent,launch,start,exit,evidence}.json`; `evidence.json` shows which of squeue, scontrol and sacct answered, and `sacct_ever_answered`.
+15. `$OV next`, then `$OV dispatch --unit summarize`, `$OV wait`, `$OV judge summarize` (sbatch). Evidence: `units/summarize/attempts/a1/inv/01-job/{intent,launch,start,exit,evidence}.json`; `evidence.json` shows which of squeue, scontrol and sacct answered, and `sacct_ever_answered`. The supervisor runs the job with `OVERSEER_OUT` (the output directory) and runs each output validator with `OVERSEER_OUTPUT` (the path of one output file).
 16. `$OV issues close summarize --comment "result.csv validated"`. Evidence: `units/summarize/unit.json` tracker closed. Paste `gh issue list -R $REPO --state all` (all three closed).
 17. `$OV report --public` (and private, unshared). Evidence: `.overseer/report/public/{report.md,report.json}`.
-18. `expect.json`: `{"run": "run1", "backend": "slurm", "job_sources": ["scontrol", "wrapper"], "sacct": "any"}`, then `check_run`. If sacct answered, rerun with `"sacct": "answered"` to record it; if it never answered that claim is INCOMPLETE and Section 2 supplies the fallback proof (D3).
+18. `expect.json`: `{"run": "run1", "backend": "slurm", "job_sources": ["scontrol", "wrapper"], "sacct": "any", "author_family": "claude", "reviewer_family": "google"}`, then `check_run`. The two family keys default to these values for `run1` and `run2` (and to author google, reviewer claude for `run3`); a review round from any other family is FAIL. If sacct answered, rerun with `"sacct": "answered"` to record it; if it never answered that claim is INCOMPLETE and Section 2 supplies the fallback proof (D3).
 
 ## 2. Accounting fallback (D3, O9)
 
@@ -59,7 +60,7 @@ A job-only plan in its own project and repository, in an allocation:
 python3 $ACC/make_fixture.py $PROJ2 --job-only --plan-id accept-d3 --target d3 --repo $REPO --partition $PART [--account $ACCT] --time 00:10:00 --mem 4G --cpus 1
 ```
 
-1. Run 1 steps 1, 4 and 6 for `accept-d3` (survey on the full PATH, so `survey.json` records Slurm usable).
+1. Run 1 steps 1, 4 and 6 with `PLAN=accept-d3` (survey on the full PATH, so `survey.json` records Slurm usable).
 2. `$OV dispatch --plan accept-d3`; `$OV wait` until both jobs exit.
 3. A PATH without `sacct`:
 
@@ -102,8 +103,8 @@ export OVERSEER_DISABLE_SLURM=1 PATH=$BIN:$SH
 ```
 
 Any Slurm call by the supervisor or a worker lands in `slurm-calls.log`.
-2. Run 1 steps 1 to 14, 16 and 17 (no handshake). The job dispatches locally in step 15. Evidence: `survey.json` Slurm usable false; every `inv/*/intent.json` has `"backend": "local"`; no `evidence.json`, job id or `.overseer/handshake`.
-3. `slurm-calls.log` is empty (`wc -c`).
+2. Run 1 steps 1 to 5 and 7 to 17 with `PLAN=accept-run2` (only the handshake, step 6, is skipped). The job dispatches locally in step 15. Evidence: `survey.json` Slurm usable false; every `inv/*/intent.json` has `"backend": "local"`; no `evidence.json`, job id or `.overseer/handshake`.
+3. `slurm-calls.log` is empty (`wc -c`). `check_run` reports `no_slurm` PASS only when the named log exists and is empty; a missing log is INCOMPLETE.
 4. `expect.json`: `{"run": "run2", "backend": "local", "shim_log": "slurm-calls.log"}`.
 
 ## 4. Run 3: Antigravity host
@@ -113,11 +114,11 @@ Any Slurm call by the supervisor or a worker lands in `slurm-calls.log`.
 3. Start the orchestrator as an `agy -p` session given SKILL.md and the Run 1 step list. The prompt must directly follow `-p` (P13):
 
 ```
-agy -p "$(cat <skill dir>/SKILL.md; echo; sed -n '/^## 1\./,/^## 2\./p' $ACC/RUNBOOK.md)" --model <argon-tier> --dangerously-skip-permissions --output-format json > $PROJ4/orchestrator.json
+agy -p "$(echo 'PLAN=accept-run3; all --plan values below use it'; cat <skill dir>/SKILL.md; echo; sed -n '/^## 1\./,/^## 2\./p' $ACC/RUNBOOK.md)" --model <argon-tier> --dangerously-skip-permissions --output-format json > $PROJ4/orchestrator.json
 ```
 
 `--sandbox` mounts `.git` read-only (P5), which blocks `pr` and `merge`, so the orchestrator runs without it; the supervisor keeps it for workers.
-4. `expect.json`: `{"run": "run3", "backend": "slurm"}` (`local` off-cluster). Author family google, reviewer Claude haiku.
+4. `expect.json`: `{"run": "run3", "backend": "slurm", "author_family": "google", "reviewer_family": "claude"}` (`local` off-cluster). Author family google, reviewer Claude haiku; these two keys are the defaults for `run3`, and any other family is FAIL.
 5. If the agy session cannot drive the loop, record Run 3 INCOMPLETE with the transcript tail from `orchestrator.json`, then run the same steps from Claude Code with `models --host google` as the partial path. The report states who drove each step.
 
 ## 5. Recovery: kill between `gh pr merge` and its record
@@ -141,7 +142,7 @@ PATH=$SHD:$PATH $OV merge slug; echo "exit $?"        # SIGKILL, exit 137
 
 2. Evidence: `units/slug/merge.json` state `intent` while `gh pr view` says MERGED (paste both); `gh.log` has one `pr merge` line and `KILLED`.
 3. Resume in a new shell (a dead holder's lock: `$OV unlock --force --reason "acceptance recovery"`): `PATH=$SHD:$PATH $OV status`, then `PATH=$SHD:$PATH $OV merge slug`. Expected: it reads the pull request back, sees MERGED, records the merge, closes the tracker, and makes no second `pr merge` call. Evidence: `merge.json` merged with `merge_commit`; `gh.log` still holds exactly one `pr merge` line; one `merged` event for `slug` in `events.jsonl`.
-4. `expect.json` addition: `"recovery": {"unit": "slug", "merge_log": "gh.log"}`.
+4. `expect.json` addition: `"recovery": {"unit": "slug", "merge_log": "gh.log"}`. The claim passes only when `gh.log` has exactly one `pr merge` line followed by `KILLED`, `merge.json` is merged with a `merge_commit`, and `events.jsonl` has one `merged` event for the unit; a log without `KILLED` is INCOMPLETE (recovery not exercised).
 
 ## 6. Allocation loss
 

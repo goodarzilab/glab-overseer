@@ -287,6 +287,8 @@ class CheckRunTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.root, True))
         build_tree(self.root, backend="local")
         exp = {"backend": "local", "shim_log": "shim.log"}
+        self.assertEqual(self.chk(exp)[1]["no_slurm"], "INCOMPLETE")  # named log absent
+        open(os.path.join(self.root, "shim.log"), "w").close()
         self.assertEqual(self.chk(exp)[1]["no_slurm"], "PASS")
         self.assertEqual(self.chk({"backend": "local"})[1]["no_slurm"], "INCOMPLETE")
         with open(os.path.join(self.root, "shim.log"), "w") as f:
@@ -299,6 +301,9 @@ class CheckRunTests(unittest.TestCase):
         self.assertEqual(self.chk(exp)[1]["recovery.slug"], "INCOMPLETE")
         with open(os.path.join(self.root, "gh.log"), "w") as f:
             f.write("gh pr view 5\ngh pr merge 5 --squash\ngh pr view 5\n")
+        self.assertEqual(self.chk(exp)[1]["recovery.slug"], "INCOMPLETE")  # no KILLED: not exercised
+        with open(os.path.join(self.root, "gh.log"), "w") as f:
+            f.write("gh pr view 5\ngh pr merge 5 --squash\nKILLED 77\ngh pr view 5\n")
         self.assertEqual(self.chk(exp)[1]["recovery.slug"], "PASS")
         with open(os.path.join(self.root, "gh.log"), "a") as f:
             f.write("gh pr merge 5 --squash\n")
@@ -314,6 +319,161 @@ class CheckRunTests(unittest.TestCase):
         self.assertEqual((r.returncode, d["counts"]["PASS"]), (0, len(d["claims"])))
         r = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
         self.assertTrue(all(len(l.split()) >= 3 and l.split()[0] in ("PASS", "FAIL", "INCOMPLETE") for l in r.stdout.splitlines()))
+
+
+class ReviewRound1Tests(unittest.TestCase):
+    """One test per round-1 review finding (F1 to F12); see .swarm/u10-review-r1.txt."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, True))
+        build_tree(self.root)
+
+    def u(self, u, *rest):
+        return os.path.join(self.root, ".overseer", UNITS, u, *rest)
+
+    def claims(self, expect=None):
+        s = C.evaluate(self.root, PID, {"backend": "slurm"} if expect is None else expect)
+        return dict((c["id"], c) for c in s["claims"]), s
+
+    def st(self, cid, expect=None):
+        return self.claims(expect)[0][cid]["status"]
+
+    def test_F1_overlap_counts_earlier_attempts(self):
+        a, b = self.u("slug", "attempts", "a1"), self.u("slug", "attempts", "a2")
+        shutil.copytree(a, b)
+        wj(os.path.join(a, "judgment.json"), {"status": "FAILED"})
+        wj(os.path.join(b, "inv/01-author/start.json"), {"time": "2026-11-01T10:10:00Z"})
+        wj(os.path.join(b, "inv/01-author/exit.json"), {"rc": 0, "end_time": "2026-11-01T10:15:00Z"})
+        self.assertEqual(self.st("overlap"), "PASS")
+        os.unlink(os.path.join(a, "inv/01-author/exit.json"))  # an earlier attempt lost its record
+        self.assertEqual(self.st("overlap"), "INCOMPLETE")  # no complete overlapping pair, a record missing
+        wj(os.path.join(a, "inv/01-author/exit.json"), {"rc": 0, "end_time": "2026-11-01T09:01:00Z"})
+        wj(os.path.join(a, "inv/01-author/start.json"), {"time": "2026-11-01T09:00:00Z"})
+        self.assertEqual(self.st("overlap"), "FAIL")  # complete records, no pair overlaps
+
+    def test_F2_missing_shim_log_is_incomplete(self):
+        shutil.rmtree(self.root)
+        self.root = tempfile.mkdtemp()
+        build_tree(self.root, backend="local")
+        self.assertEqual(self.st("no_slurm", {"backend": "local", "shim_log": "missing.log"}), "INCOMPLETE")
+        os.mkdir(os.path.join(self.root, "dir.log"))  # unreadable as a log
+        self.assertEqual(self.st("no_slurm", {"backend": "local", "shim_log": "dir.log"}), "INCOMPLETE")
+        open(os.path.join(self.root, "empty.log"), "w").close()
+        self.assertEqual(self.st("no_slurm", {"backend": "local", "shim_log": "empty.log"}), "PASS")
+
+    def test_F3_sacct_unavailable_needs_evidence(self):
+        a = self.u("summarize", "attempts", "a1")
+        exp = {"sacct": "unavailable"}
+        self.assertEqual(self.st("summarize.sacct", exp), "PASS")
+        for n in ("evidence.json", "exit.json"):
+            os.unlink(os.path.join(a, "inv", "01-job", n))
+        wj(os.path.join(a, "judgment.json"), {"status": "DONE", "outputs": [{"path": "result.csv", "ok": True}],
+                                              "orchestrator_resolved": True, "reason": "inspected", "evidence": "output"})
+        self.assertEqual(self.st("summarize.sacct", exp), "INCOMPLETE")
+        wj(os.path.join(a, "inv", "01-job", "evidence.json"), {"sources": {"scontrol": {"outcome": "known"}}})  # no sacct_ever_answered
+        self.assertEqual(self.st("summarize.sacct", exp), "INCOMPLETE")
+
+    def test_F4_later_fallback_round_fails(self):
+        wj(self.u("slug", "attempts/a1/reviews/r2/round.json"), {"state": "complete", "reviewer_family": "claude",
+                                                                "same_family_fallback": True, "calls": [{"state": "ok", "family": "claude"}]})
+        c = self.claims()[0]["slug.review"]
+        self.assertEqual(c["status"], "FAIL")
+        self.assertIn("r2", c["evidence"])
+        # a fallback in an earlier attempt also fails
+        shutil.copytree(self.u("slug", "attempts/a1"), self.u("slug", "attempts/a2"))
+        shutil.rmtree(self.u("slug", "attempts/a2/reviews/r2"))
+        self.assertEqual(self.st("slug.review"), "FAIL")
+
+    def test_F5_run_identity_families(self):
+        self.assertEqual(self.st("slug.review", {"run": "run3"}), "FAIL")  # claude author, google reviewer
+        self.assertEqual(self.st("slug.review", {"run": "run1"}), "PASS")
+        self.assertEqual(self.st("slug.review", {"run": "run2"}), "PASS")
+        self.assertEqual(self.st("slug.review", {"author_family": "google"}), "FAIL")
+        self.assertEqual(self.st("slug.review", {"reviewer_family": "claude"}), "FAIL")
+        self.assertEqual(self.st("slug.review", {"author_family": "claude", "reviewer_family": "google"}), "PASS")
+        for u in ("slug", "count"):
+            wj(self.u(u, "attempts/a1/inv/01-author/intent.json"), {"argv": ["/usr/bin/agy"], "backend": "slurm"})
+            wj(self.u(u, "attempts/a1/reviews/r1/round.json"), {"state": "complete", "reviewer_family": "claude", "same_family_fallback": False,
+                                                              "calls": [{"state": "ok", "family": "claude"}]})
+        self.assertEqual(self.st("slug.review", {"run": "run3"}), "PASS")
+        self.assertEqual(self.st("slug.review", {"run": "run1"}), "FAIL")
+
+    def test_F6_recovery_needs_kill(self):
+        exp = {"recovery": {"unit": "slug", "merge_log": "gh.log"}}
+
+        def log(text):
+            with open(os.path.join(self.root, "gh.log"), "w") as f:
+                f.write(text)
+        log("gh pr view 5\ngh pr merge 5 --squash\ngh pr view 5\n")
+        self.assertEqual(self.st("recovery.slug", exp), "INCOMPLETE")
+        log("gh pr merge 5 --squash\nKILLED 9\ngh pr view 5\n")
+        self.assertEqual(self.st("recovery.slug", exp), "PASS")
+        log("KILLED 9\ngh pr merge 5 --squash\n")
+        self.assertEqual(self.st("recovery.slug", exp), "FAIL")
+        log("gh pr merge 5 --squash\nKILLED 9\ngh pr merge 5 --squash\n")
+        self.assertEqual(self.st("recovery.slug", exp), "FAIL")
+        log("gh pr merge 5 --squash\nKILLED 9\n")
+        wj(self.u("slug", "merge.json"), {"state": "merged", "pr_head": A, "merge_commit": None})
+        self.assertEqual(self.st("recovery.slug", exp), "FAIL")
+
+    def test_F7_F8_runbook_text(self):
+        with open(os.path.join(ACC, "RUNBOOK.md")) as f:
+            text = f.read()
+        run2 = text[text.index("## 3. Run 2"):text.index("## 4. Run 3")]
+        self.assertIn("steps 1 to 5 and 7 to 17", run2)
+        self.assertNotIn("1 to 14, 16", run2)
+        steps = text[text.index("## 1. Run 1"):text.index("## 2. ")]
+        self.assertNotIn("accept-run1", steps)
+        self.assertIn("$PLAN", steps)
+        self.assertIn("--plan-id $PLAN", text)
+        run3 = text[text.index("## 4. Run 3"):text.index("## 5. ")]
+        self.assertIn("PLAN=accept-run3", run3)
+
+    def test_F9_job_only_plan_has_no_overlap_claim(self):
+        pd = os.path.join(self.root, ".overseer", "plans", PID)
+        wj(os.path.join(pd, "plan.json"), {"units": [{"id": "summarize", "kind": "job"}]})
+        shutil.rmtree(self.u("slug"))
+        shutil.rmtree(self.u("count"))
+        cl, s = self.claims()
+        self.assertNotIn("overlap", cl)
+        self.assertEqual(s["counts"]["INCOMPLETE"] + s["counts"]["FAIL"], 0, s["claims"])
+
+    def test_F10_missing_unit_json_is_incomplete_merge(self):
+        os.unlink(self.u("slug", "unit.json"))
+        cl = self.claims()[0]
+        self.assertEqual((cl["slug.merge"]["status"], cl["slug.tracker"]["status"]), ("INCOMPLETE", "INCOMPLETE"))
+        with open(self.u("slug", "unit.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(self.st("slug.merge"), "INCOMPLETE")
+
+    def test_F11_job_variables_documented(self):
+        with open(os.path.join(ACC, "RUNBOOK.md")) as f:
+            text = f.read()
+        self.assertIn("OVERSEER_OUT", text)
+        self.assertIn("OVERSEER_OUTPUT", text)
+        line = [l for l in text.splitlines() if "OVERSEER_OUTPUT" in l][0]
+        self.assertIn("OVERSEER_OUT", line.replace("OVERSEER_OUTPUT", ""))  # one sentence names both
+
+    def test_F12_malformed_records_never_crash(self):
+        p = self.u("slug", "attempts/a1/judgment.json")
+        wj(p, {"status": "DONE", "orchestrator_resolved": False, "outputs": ["textkit/slug.py"]})
+        self.assertEqual(self.st("slug.judgment"), "INCOMPLETE")
+        self.assertIn("outputs entry", self.claims()[0]["slug.judgment"]["detail"])
+        wj(p, {"status": "DONE", "outputs": "textkit/slug.py"})
+        self.assertEqual(self.st("slug.judgment"), "INCOMPLETE")
+        wj(self.u("slug", "unit.json"), {"closure": "merged", "tracker": 5})
+        cl, s = self.claims({"backend": "slurm", "job_sources": 3, "uncertain_units": 7, "sacct": "unavailable"})
+        self.assertEqual(cl["slug.merge"]["status"], "FAIL")
+        self.assertEqual(cl["slug.tracker"]["status"], "INCOMPLETE")
+        for k in ("slug.review", "count.review", "summarize.sources"):
+            self.assertIn(cl[k]["status"], ("PASS", "FAIL", "INCOMPLETE"))
+        for name, val in (("round.json", {"state": "complete", "calls": 5}), ("nonvacuous.json", {"status": []})):
+            wj(self.u("slug", "attempts/a1/reviews/r1" if name == "round.json" else "attempts/a1", name), val)
+            self.claims()
+        wj(self.u("count", "attempts/a1/inv/01-author/intent.json"), {"argv": [5]})
+        wj(self.u("summarize", "attempts/a1/inv/01-job/evidence.json"), {"sources": [1], "sacct_ever_answered": "x"})
+        self.assertTrue(self.claims({"overlap": [1, 2], "recovery": {"unit": "slug", "merge_log": 4}, "integration_units": [9]})[1]["claims"])
 
 
 if __name__ == "__main__":
