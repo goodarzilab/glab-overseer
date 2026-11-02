@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from . import approval, controller, execution, judge, models, paths, plan as P, review, slurm, store, survey
+from . import approval, controller, execution, judge, models, paths, plan as P, report, review, slurm, store, survey
 
 from . import github as _github  # noqa: E402
 
@@ -154,7 +154,7 @@ register("nonvacuous", "check that the tests fail without the non-test changes",
 register("merge", "integrate the target, push, squash-merge the pull request and close the unit",
          controller.configure_merge, controller.run_merge)
 register("next", "print the eligible actions derived from disk (no network)", controller.configure_next, controller.run_next)
-register("report", "write the evidence report (U9)")
+register("report", "write the evidence report (report.md and report.json)", report.configure, report.run)
 _github.register_commands(register)
 
 
