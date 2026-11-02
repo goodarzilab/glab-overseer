@@ -336,9 +336,9 @@ def file_issues(root, plan_id, dry_run=False, out=print):
 def _blocked_by(repo, number):
     path = "repos/%s/issues/%d/dependencies/blocked_by?per_page=100" % (repo, number)
     items = _read(["api", path], "blocked_by read", list)
-    if not all(isinstance(i, dict) and _is_int(i.get("number")) for i in items):
+    if not all(isinstance(i, dict) and _is_int(i.get("id")) for i in items):
         raise GithubError("blocked_by read returned a malformed entry")
-    return set(i["number"] for i in items)
+    return set(i["id"] for i in items)  # global ids: a same-numbered issue of another repository does not count
 
 
 def _comments(repo, number):
@@ -377,14 +377,14 @@ def ensure_comment(root, repo, number, text, marker):
 def _link(root, repo, blocked, blocker):
     """Native blocked-by link, else (API missing, HTTP 404) a marked comment. Returns the mode."""
     try:
-        if blocker in _blocked_by(repo, blocked):
-            return "native"
         bid = _read(["api", "repos/%s/issues/%d" % (repo, blocker)], "issue read", dict).get("id")
         if not _is_int(bid):
             raise GithubError("issue #%d has no numeric id" % blocker)
+        if bid in _blocked_by(repo, blocked):
+            return "native"
         _write(root, "blocked_by", ["api", "-X", "POST", "repos/%s/issues/%d/dependencies/blocked_by" % (repo, blocked),
                                     "-F", "issue_id=%d" % bid], blocked=blocked, blocker=blocker)
-        if blocker not in _blocked_by(repo, blocked):
+        if bid not in _blocked_by(repo, blocked):
             raise Ambiguous("link #%d blocked by #%d is not visible after writing; rerun to reconcile"
                             % (blocked, blocker))
         return "native"
@@ -462,10 +462,23 @@ def readback_pr(number, repo):
             "closing_issues": sorted(c["number"] for c in cr), "title": d["title"], "body": d["body"]}
 
 
-def _prs_for_branch(repo, branch):
-    items = _read(["pr", "list", "-R", repo, "--head", branch, "--state", "all", "--limit", "100",
-                   "--json", "number,state,headRefName,baseRefName"], "pr list", list)
-    return [i for i in items if isinstance(i, dict) and i.get("headRefName") == branch and _is_int(i.get("number"))]
+def _prs_for_branch(repo, branch, base=None):
+    """Same-repository pull requests whose head is `branch` (forks are ignored); OPEN ones against
+    `base` only when `base` is given."""
+    items = _read(["pr", "list", "-R", repo, "--head", branch, "--state", "all", "--limit", "100", "--json",
+                   "number,state,headRefName,baseRefName,body,isCrossRepository,headRepositoryOwner"], "pr list", list)
+    owner = repo.split("/")[0].lower()
+    out = []
+    for i in items:
+        if not (isinstance(i, dict) and i.get("headRefName") == branch and _is_int(i.get("number"))):
+            continue
+        ho = i.get("headRepositoryOwner")
+        if i.get("isCrossRepository") is not False or not isinstance(ho, dict) \
+                or not isinstance(ho.get("login"), str) or ho["login"].lower() != owner:
+            continue
+        if base is None or (i.get("state") == "OPEN" and i.get("baseRefName") == base):
+            out.append(i)
+    return out
 
 
 def push_argv(branch, sha):
@@ -506,8 +519,8 @@ def push_branch(root, wt, branch, candidate):
     return "pushed"
 
 
-def pr_body(unit, issue, j):
-    lines = []
+def pr_body(unit, issue, j, marker):
+    lines = [marker, ""]
     if issue is not None:
         lines += ["Closes #%d" % issue, ""]
     lines += ["## Claims"] + ["- %s" % c for c in unit.get("claims", [])] + ["",
@@ -529,16 +542,20 @@ def open_pr(root, plan_id, unit):
     ws = W.load_workspace(paths.attempt_dir(root, plan_id, unit["id"], n))
     branch, wt, cand = ws["branch"], ws["worktree"], j["candidate"]
     issue = (store.read_json(_issues_path(root, plan_id)).get("filed") or {}).get(unit["id"])
-    body = pr_body(unit, issue, j)
-    existing = _prs_for_branch(repo, branch)  # inspected before any write (push, edit or create)
-    if len(existing) > 1:
-        raise GithubError("ambiguous: pull requests %s share head %s" % (", ".join("#%d" % i["number"] for i in existing), branch))
-    for e in existing:
+    marker = marker_for(root, plan_id, unit["id"])
+    body = pr_body(unit, issue, j, marker)
+    # inspected before any write (push, edit or create); only same-repository OPEN pull requests count
+    opens = [e for e in _prs_for_branch(repo, branch) if e.get("state") == "OPEN"]
+    for e in opens:
         if e.get("baseRefName") != target:
             raise GithubError("pull request #%d for %s has base %r, not %r; refusing to touch it"
                               % (e["number"], branch, e.get("baseRefName"), target))
-        if e.get("state") != "OPEN":
-            raise GithubError("pull request #%d for %s is %s; not editing it" % (e["number"], branch, e.get("state")))
+        if not has_marker(e.get("body") or "", marker):
+            raise GithubError("pull request #%d for %s does not carry this project's marker; refusing to edit it"
+                              % (e["number"], branch))
+    if len(opens) > 1:
+        raise GithubError("ambiguous: open pull requests %s share head %s" % (", ".join("#%d" % i["number"] for i in opens), branch))
+    existing = opens
     pushed = push_branch(root, wt, branch, cand)
     with _bodyfile(root, body) as bf:
         if existing:
@@ -551,7 +568,8 @@ def open_pr(root, plan_id, unit):
             if m:
                 num = int(m.group(1))
             else:
-                found = _prs_for_branch(repo, branch)  # reconcile by head branch before any retry
+                found = [f for f in _prs_for_branch(repo, branch, target)  # reconcile by head before any retry
+                         if has_marker(f.get("body") or "", marker)]
                 if len(found) != 1:
                     raise Ambiguous("creating the pull request for %s has an unknown outcome (%d match the head); "
                                     "rerun 'pr' to reconcile" % (unit["id"], len(found)))

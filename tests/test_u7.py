@@ -81,14 +81,17 @@ if a[0] == "api":
         i["blockers"].append(int(a[a.index("-F") + 1].split("=")[1]))
         out("{}")
     if m.group(2):
-        out(json.dumps([{"number": b - 1000, "id": b} for b in i["blockers"]]))
+        extra = [{"number": 1, "id": 99999}] if faults.get("foreign_blocker") else []
+        out(json.dumps(extra + [{"number": b - 1000, "id": b} for b in i["blockers"]]))
     out(json.dumps({"number": i["number"], "id": i["id"]}))
 def pr_json(p):
     p["headRefOid"] = faults.get("wrong_head") or subprocess.check_output(
         ["git", "--git-dir", st["origin"], "rev-parse", "refs/heads/" + p["headRefName"]]).decode().strip()
     return p
 if a[0] == "pr" and a[1] == "list":
-    out(json.dumps([{k: p[k] for k in ("number", "state", "headRefName", "baseRefName")} for p in st["prs"] if p["headRefName"] == opt("--head")]))
+    out(json.dumps([dict({k: p.get(k) for k in ("number", "state", "headRefName", "baseRefName", "body")},
+                         isCrossRepository=p.get("cross", False), headRepositoryOwner={"login": p.get("owner", "lab-org")})
+                    for p in st["prs"] if p["headRefName"] == opt("--head")]))
 if a[0] == "pr" and a[1] == "create":
     n = len(st["prs"]) + 1
     st["prs"].append({"number": n, "state": "OPEN", "headRefName": opt("--head"), "baseRefName": opt("--base"),
@@ -403,6 +406,12 @@ class Links(GhCase):
         self.assertEqual(self.cli("issues", "file")[0], 0)
         self.assertEqual(len([c for c in self.gh_state()["calls"] if c[:3] == ["api", "-X", "POST"]]), 1)
 
+    def test_a_same_numbered_blocker_from_another_repository_does_not_count(self):
+        self.three_units()
+        self.fault(foreign_blocker=True)  # blocked_by already lists issue number 1 with a foreign global id
+        self.assertEqual(self.cli("issues", "file")[0], 0)
+        self.assertEqual(self.gh_state()["issues"][2]["blockers"], [1001])
+
     def test_missing_api_falls_back_to_one_marked_comment(self):
         self.three_units()
         self.fault(deps_404=True)
@@ -481,7 +490,7 @@ class PullRequest(GhCase):
         self.assertEqual(sh(self.origin, "rev-parse", "refs/heads/" + branch), j["candidate"])
         self.assertEqual((rec["number"], rec["head_oid"], rec["base_ref"], rec["closing_issues"]), (1, j["candidate"], "main", [1]))
         pr = self.gh_state()["prs"][0]
-        self.assertTrue(pr["body"].startswith("Closes #1\n"))
+        self.assertIn("\nCloses #1\n", pr["body"])
         for needle in ("alpha works", "base: " + j["base"], "candidate: " + j["candidate"], "test rc: 0"):
             self.assertIn(needle, pr["body"])
         create = self.calls("pr", "create")[0]
@@ -493,11 +502,53 @@ class PullRequest(GhCase):
         self.done_unit()
         self.assertEqual(self.cli("pr", "alpha")[0], 0)
         st = self.gh_state()
-        st["prs"][0]["body"] = "stale"
+        st["prs"][0]["body"] = self.mk("alpha") + "\nstale"
         self.gh_state(st)
         self.assertEqual(self.cli("pr", "alpha")[0], 0)
         self.assertEqual((len(self.gh_state()["prs"]), len(self.calls("pr", "create")), len(self.calls("pr", "edit"))), (1, 1, 1))
-        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("Closes #1"))
+        self.assertIn("Closes #1", self.gh_state()["prs"][0]["body"])
+
+    def seed_pr(self, **kw):
+        st = self.gh_state()
+        st["prs"].append(dict({"number": len(st["prs"]) + 1, "state": "OPEN", "headRefName": "overseer/demo/alpha/a1",
+                               "baseRefName": "main", "title": "t", "body": "orig", "mergeCommit": None}, **kw))
+        self.gh_state(st)
+
+    def test_pr_without_our_project_marker_is_never_edited(self):
+        self.done_unit()
+        self.seed_pr(body="another project's body")
+        rc, _, err = self.cli("pr", "alpha")
+        self.assertEqual(rc, 1)
+        self.assertIn("project's marker", err)
+        self.assertEqual(self.gh_state()["prs"][0]["body"], "another project's body")
+        self.assertEqual(self.calls("pr", "edit") + self.calls("pr", "create"), [])
+        self.assertEqual(sh(self.origin, "branch", "--list", "overseer/*"), "")
+
+    def test_pr_body_carries_the_project_marker(self):
+        self.done_unit()
+        self.assertEqual(self.cli("pr", "alpha")[0], 0)
+        self.assertIn(self.mk("alpha"), self.gh_state()["prs"][0]["body"].splitlines())
+
+    def test_fork_pr_with_the_same_head_name_is_ignored(self):
+        self.done_unit()
+        marked = self.mk("alpha") + "\nfork"
+        self.seed_pr(cross=True, owner="lab-org", body=marked)
+        self.seed_pr(owner="someone-else", body=marked)
+        self.assertEqual(self.cli("pr", "alpha")[0], 0)
+        prs = self.gh_state()["prs"]
+        self.assertEqual((len(prs), prs[0]["body"], prs[1]["body"]), (3, marked, marked))
+        self.assertEqual(len(self.calls("pr", "edit")), 0)
+
+    def test_one_open_plus_closed_prs_is_not_ambiguous_but_two_open_is(self):
+        self.done_unit()
+        self.assertEqual(self.cli("pr", "alpha")[0], 0)
+        self.seed_pr(state="CLOSED", body=self.mk("alpha") + "\nold")
+        self.seed_pr(state="MERGED", body=self.mk("alpha") + "\nold")
+        self.assertEqual(self.cli("pr", "alpha")[0], 0)
+        self.assertEqual((len(self.gh_state()["prs"]), len(self.calls("pr", "edit"))), (3, 1))
+        self.seed_pr(body=self.mk("alpha") + "\nsecond")
+        rc, _, err = self.cli("pr", "alpha")
+        self.assertEqual((rc, "open pull requests #1, #4" in err), (1, True))
 
     def test_pr_without_filed_issue_omits_closes(self):
         self.approve()
