@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from unittest import mock
 
@@ -251,7 +252,8 @@ class ChoiceAndRefusals(SlurmCase):
             S.check_handshake(self.root)
 
     def test_tmp_root_refused_before_any_submission(self):
-        with mock.patch.object(S, "TMP_ROOTS", ("/tmp", "/var/tmp")):
+        # The case tmpdir is under /tmp on Linux and under /var/folders on macOS.
+        with mock.patch.object(S, "TMP_ROOTS", ("/tmp", "/var/tmp", tempfile.gettempdir())):
             self.assertIn("private", S.root_problem(os.path.join(self.tmp, "x"), {}))
             with self.assertRaisesRegex(S.SlurmError, "private to each Slurm job"):
                 self.dispatch()

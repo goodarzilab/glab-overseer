@@ -82,8 +82,50 @@ def _ps_exe():
     return None
 
 
-def proc_start(pid, allow_zombie=False):
-    """Start identity of `pid` (Linux: /proc stat starttime; macOS: ps lstart), else None."""
+_UNUSABLE = object()  # sysctl cannot be used here; callers fall back to ps
+_KINFO_PROC_SIZE = 648  # sizeof(struct kinfo_proc) on 64-bit macOS
+
+
+def _darwin_start(pid):
+    """(zombie, "sec.usec") from sysctl KERN_PROC_PID on macOS, None if there is no such
+    process, or _UNUSABLE when sysctl cannot be called or returns a layout not known here.
+
+    `ps -o lstart` has one-second resolution, so a pid reused within the same second as the
+    recorded start would pass as the recorded process. kinfo_proc.kp_proc begins with the
+    p_starttime timeval (16 bytes on 64-bit), and p_stat is the char at offset 36.
+    """
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        buf = ctypes.create_string_buffer(1024)
+        size = ctypes.c_size_t(ctypes.sizeof(buf))
+        if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            return _UNUSABLE
+    except (OSError, AttributeError, TypeError, OverflowError):
+        return _UNUSABLE
+    if size.value == 0:
+        return None
+    if size.value != _KINFO_PROC_SIZE:
+        return _UNUSABLE
+    sec = int.from_bytes(buf.raw[0:8], sys.byteorder, signed=True)
+    usec = int.from_bytes(buf.raw[8:12], sys.byteorder, signed=True)
+    if sec <= 0 or not 0 <= usec < 1000000:
+        return _UNUSABLE
+    return buf.raw[36] == 5, "%d.%06d" % (sec, usec)  # SZOMB is 5
+
+
+SYSCTL_START_RE = re.compile(r"^[0-9]+\.[0-9]{6}$")
+
+
+def proc_start(pid, allow_zombie=False, like=None):
+    """Start identity of `pid` (Linux: /proc stat starttime; macOS: sysctl p_starttime in
+    microseconds; elsewhere: ps lstart), else None.
+
+    `like` is a recorded identity to compare against: on macOS its format picks the source,
+    so an identity recorded by ps (older code, or a lookup where sysctl was unusable) is
+    still checked with ps. A sysctl record cannot be checked by ps; such a lookup does not
+    match, which reads as "not the recorded process" and never leads to a signal."""
     if not _int(pid):
         return None
     if os.path.isdir("/proc/self"):
@@ -96,6 +138,12 @@ def proc_start(pid, allow_zombie=False):
             return rest[19]
         except (OSError, ValueError, IndexError):
             return None
+    if sys.platform == "darwin" and (like is None or SYSCTL_START_RE.match(like)):
+        got = _darwin_start(pid)
+        if got is None:
+            return None
+        if got is not _UNUSABLE:
+            return None if got[0] and not allow_zombie else got[1]
     ps = _ps_exe()
     if ps is None:
         return None
@@ -117,7 +165,7 @@ def identified_alive(pid, start):
     if not (_int(pid) and isinstance(start, str) and start):
         return False
     _reap(pid)
-    return proc_start(pid) == start
+    return proc_start(pid, like=start) == start
 
 
 def find_by_script(script):

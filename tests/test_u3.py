@@ -55,6 +55,10 @@ class Crash(Exception):
     pass
 
 
+def sysctl_usable():
+    return sys.platform == "darwin" and isinstance(X._darwin_start(os.getpid()), tuple)
+
+
 class Case(TmpCase):
     def setUp(self):
         super().setUp()
@@ -116,6 +120,13 @@ class Case(TmpCase):
                 return st
             time.sleep(0.05)
         self.fail("timeout; last status %r" % (X.invocation_status(inv),))
+
+    def wait_file(self, path, timeout=10):
+        end = time.monotonic() + timeout
+        while not os.path.exists(path):
+            if time.monotonic() > end:
+                self.fail("timeout waiting for %s" % path)
+            time.sleep(0.02)
 
     def rec(self, inv, name):
         with open(os.path.join(inv, name)) as f:
@@ -512,8 +523,7 @@ class CommandTests(Case):
     def test_abort_cooperative(self):
         ready = os.path.join(self.tmp, "ready")
         rec = self.launch("j1", [self.script("rd", "echo > %s; sleep 30" % ready)])
-        while not os.path.exists(ready):
-            time.sleep(0.02)
+        self.wait_file(ready)
         rc, out, _ = self.run_cli("abort", "j1", "--grace", "5")
         self.assertEqual(rc, 0, out)
         st = X.invocation_status(rec["dir"])
@@ -529,8 +539,7 @@ class CommandTests(Case):
     def test_abort_escalates_and_frees_slot_only_after_confirmation(self):
         ready = os.path.join(self.tmp, "ready")
         rec = self.launch("j1", [self.script("stubborn", "trap '' TERM; echo > %s; sleep 30" % ready)])
-        while not os.path.exists(ready):  # TERM must arrive after the payload ignores it
-            time.sleep(0.02)
+        self.wait_file(ready)  # TERM must arrive after the payload ignores it
         seen = []
 
         def spy(_):
@@ -547,11 +556,11 @@ class CommandTests(Case):
         self.assertEqual(kinds, ["cancel_requested", "cancel_confirmed"])
         self.assertFalse(os.path.exists(os.path.join(rec["dir"], "exit.json")))  # SIGKILL skips the trap
 
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "finding a payload after its wrapper dies needs /proc")
     def test_abort_waits_for_whole_process_group(self):
         ready = os.path.join(self.tmp, "ready")
         rec = self.launch("j1", [self.script("kid", "trap '' TERM; echo > %s; sleep 30" % ready)])
-        while not os.path.exists(ready):
-            time.sleep(0.02)
+        self.wait_file(ready)
         os.kill(rec["launch"]["pid"], signal.SIGKILL)  # the wrapper dies, its payload group lives on
         self.assertEqual(self.wait_for(rec["dir"], ("UNCERTAIN",))["state"], "UNCERTAIN")
         seen = []
@@ -589,9 +598,59 @@ class CommandTests(Case):
         ln = self.rec(rec["dir"], "launch.json")
         ln.update(pid=decoy.pid, pgid=decoy.pid)
         store.write_json_atomic(os.path.join(rec["dir"], "launch.json"), ln)
-        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=1), "CANCELLED")
+        have_proc = os.path.isdir("/proc/self")
+        # Without /proc the orphaned payload cannot be found, so the honest answer is UNIDENTIFIED.
+        want = "CANCELLED" if have_proc else "UNIDENTIFIED"
+        self.assertEqual(X.abort_invocation(self.root, rec["dir"], grace=1), want)
         self.assertIsNone(decoy.poll())
-        self.assertEqual(X._token_pids(self.rec(rec["dir"], "intent.json")["token"]), [])
+        if have_proc:
+            self.assertEqual(X._token_pids(self.rec(rec["dir"], "intent.json")["token"]), [])
+
+    def test_start_identity_separates_processes_started_in_the_same_second(self):
+        if sys.platform == "darwin" and not sysctl_usable():
+            self.skipTest("the ps lstart fallback has one-second resolution")
+        while time.time() % 1 > 0.5:  # start both well inside one wall-clock second
+            time.sleep(0.01)
+        a = self.start_decoy()
+        time.sleep(0.05)
+        b = self.start_decoy()
+        sa, sb = X.proc_start(a.pid), X.proc_start(b.pid)
+        self.assertTrue(sa and sb, (sa, sb))
+        self.assertNotEqual(sa, sb)
+        self.assertFalse(X.identified_alive(b.pid, sa))
+        a.kill()
+        a.wait()
+        self.assertIsNone(X.proc_start(a.pid))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS sysctl path")
+    def test_darwin_start_skips_zombies_unless_allowed(self):
+        p = subprocess.Popen([shutil.which("sleep"), "30"])
+        self.addCleanup(p.wait)
+        start = X.proc_start(p.pid)
+        p.kill()
+        end = time.time() + 5
+        while X.proc_start(p.pid) is not None and time.time() < end:  # killed, not yet reaped
+            time.sleep(0.02)
+        self.assertIsNone(X.proc_start(p.pid))
+        self.assertEqual(X.proc_start(p.pid, allow_zombie=True), start)
+
+    def test_unusable_sysctl_falls_back_to_ps(self):
+        p = self.start_decoy()
+        with mock.patch.object(X, "_darwin_start", return_value=X._UNUSABLE):
+            start = X.proc_start(p.pid)
+            self.assertTrue(start)
+            self.assertTrue(X.identified_alive(p.pid, start))
+        if sysctl_usable():
+            self.assertRegex(X.proc_start(p.pid), X.SYSCTL_START_RE)
+            self.assertTrue(X.identified_alive(p.pid, start))  # a ps-recorded identity still matches
+
+    def test_recorded_sysctl_identity_is_not_checked_with_ps(self):
+        p = self.start_decoy()
+        if not sysctl_usable():
+            self.skipTest("needs the macOS sysctl identity")
+        start = X.proc_start(p.pid)
+        with mock.patch.object(X, "_ps_exe", side_effect=AssertionError("ps used")):
+            self.assertTrue(X.identified_alive(p.pid, start))
 
     def test_abort_without_proc_and_dead_wrapper_is_unidentified(self):
         rec = self.launch("j1", [self.script("pl", "sleep 30")])
@@ -603,10 +662,14 @@ class CommandTests(Case):
         self.assertNotIn("confirmed_at", self.rec(rec["dir"], "cancel.json"))
         self.assertEqual(X.slots_in_use(self.root), 1)
 
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "finding a payload after its wrapper dies needs /proc")
     def test_outstanding_abort_holds_slot_after_exit_json(self):
         rec = self.launch("j1", [self.script("bg", "sleep 30 &")])  # wrapper exits, a child survives
         self.wait_for(rec["dir"])
         token = self.rec(rec["dir"], "intent.json")["token"]
+        end = time.monotonic() + 5  # exit.json lands while the wrapper may still be exiting
+        while len(X._token_pids(token)) != 1 and time.monotonic() < end:
+            time.sleep(0.05)
         self.assertEqual(len(X._token_pids(token)), 1)
         store.write_json_atomic(os.path.join(rec["dir"], "cancel.json"),
                                 {"token": token, "requested_at": store.utc_now()})
@@ -654,12 +717,12 @@ class CommandTests(Case):
             self.assertEqual(X.find_by_script("/ab/run.sh"), [456])
 
     @unittest.skipIf(os.getuid() == 0, "root can read every environ")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "prctl(PR_SET_DUMPABLE) and /proc are Linux-only")
     def test_abort_not_confirmed_while_an_undumpable_payload_may_run(self):
         ready = os.path.join(self.tmp, "ready")
         code = "import ctypes,time;ctypes.CDLL(None).prctl(4,0);open(%r,'w').close();time.sleep(30)" % ready
         rec = self.launch("j1", [self.script("ud", "exec '%s' -c \"%s\"" % (sys.executable, code))])
-        while not os.path.exists(ready):
-            time.sleep(0.02)
+        self.wait_file(ready)
         os.kill(rec["launch"]["pid"], signal.SIGKILL)  # wrapper gone; the payload hides its environ
         self.wait_for(rec["dir"], ("UNCERTAIN",))
         token = self.rec(rec["dir"], "intent.json")["token"]
@@ -673,8 +736,7 @@ class CommandTests(Case):
     def test_without_proc_surviving_group_member_blocks_confirmation(self):
         ready = os.path.join(self.tmp, "ready")
         rec = self.launch("j1", [self.script("kid", "(trap '' TERM; echo > %s; exec sleep 30) & wait" % ready)])
-        while not os.path.exists(ready):
-            time.sleep(0.02)
+        self.wait_file(ready)
         with mock.patch.object(X, "_token_pids", return_value=None):
             res = X.abort_invocation(self.root, rec["dir"], grace=0.3, confirm_wait=0.3)
         self.assertEqual(res, "UNCONFIRMED")  # the wrapper exits on TERM; its child lives in the group
