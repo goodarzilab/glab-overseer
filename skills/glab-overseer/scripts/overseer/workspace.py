@@ -51,7 +51,7 @@ _OPT_WITH_VALUE = ("-c", "-C", "--git-dir", "--work-tree", "--namespace")
 _ALLOWED_SUBCOMMANDS = frozenset((
     "add", "branch", "cat-file", "checkout", "clone", "commit", "diff", "diff-tree", "fetch", "ls-files", "ls-remote",
     "ls-tree", "merge", "merge-base", "patch-id", "push", "reset", "rev-list", "rev-parse", "rm", "status",
-    "symbolic-ref", "update-ref", "worktree"))
+    "symbolic-ref", "worktree"))  # no update-ref: the supervisor never moves a ref by hand
 _FORCE_LONG = ("--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune", "--delete")
 
 

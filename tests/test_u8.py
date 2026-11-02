@@ -57,7 +57,7 @@ class MergeCase(GhCase):
         mock.patch.object(C, "POLL_INTERVAL", 0.01).start()
         mock.patch.object(C, "POLL_SECONDS", 0.05).start()
 
-    def plan(self, target="main", shared=False, caps=None, ua_test=None):
+    def plan(self, target="main", shared=False, caps=None, ua_test=None, ub_test=None):
         p = plan_copy()
         p.update(plan_id="demo", scope=["src/**", "tests/**"], target_branch=target)
         if caps:
@@ -70,6 +70,8 @@ class MergeCase(GhCase):
                                            "outputs": ["result.txt"], "needs": ["ua", "ub"]}]
         if ua_test:
             p["units"][0]["test_command"] = ua_test
+        if ub_test:
+            p["units"][1]["test_command"] = ub_test
         approval.approve_plan(self.root, p, "me")
         self.assertEqual(self.cli("issues", "file")[0], 0)
         return p
@@ -597,6 +599,176 @@ class Round1(MergeCase):
         rc, _, err = self.cli("merge", "ub")
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.merged_count(), 2)
+
+
+class Round2(MergeCase):
+    CFG_UB = 'read -r v < src/cfg.txt; [ "$v" = off ] && [ -f src/ub.py ]'
+
+    def advance_target(self, rel, text):
+        """Push a commit to origin/main from a separate clone: the project repo's tracking ref is not refreshed."""
+        d = os.path.join(self.tmp, "adv%d" % len(os.listdir(self.tmp)))
+        sh(self.tmp, "clone", "-q", self.origin, d)
+        self.put(rel, text, base=d)
+        sh(d, "add", "-A")
+        sh(d, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "adv " + rel)
+        sh(d, "push", "-q", "origin", "HEAD:main")
+
+    def seed_cfg(self):
+        self.put("src/cfg.txt", "off\n")
+        sh(self.root, "add", "-A")
+        sh(self.root, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "cfg")
+        sh(self.root, "push", "-q", "origin", "main")
+
+    def interrupted(self, where="_merge_in", **kw):
+        self.seed_cfg()
+        self.plan(**kw)
+        self.dispatch_both()
+        self.ready("ua")
+        self.ready("ub")
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        target = (C, where) if where == "_merge_in" else (C.J, where)
+        with mock.patch.object(target[0], target[1], side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("merge", "ub")
+        self.assertTrue(os.path.exists(os.path.join(paths.attempt_dir(self.root, "demo", "ub", 1), "integration_intent.json")))
+
+    def test_f1_resume_integrates_the_advanced_target_and_tests_the_combination(self):
+        self.interrupted(ub_test=self.CFG_UB)
+        self.advance_target("src/cfg.txt", "on\n")  # B's test needs cfg=off; the project tracking ref is stale
+        rc, _, err = self.cli("merge", "ub")
+        self.assertEqual((rc, self.merged_count()), (1, 1), err)
+        self.assertIn("FAILED", err)
+
+    def test_f1_integrated_candidate_is_integrated_again_when_the_target_moved(self):
+        self.interrupted(where="rejudge_integrated", ub_test=self.CFG_UB)  # merge-in done, judgment missing
+        self.advance_target("src/cfg.txt", "on\n")
+        rc, _, err = self.cli("merge", "ub")
+        self.assertEqual((rc, self.merged_count()), (1, 1), err)
+
+    def test_f1_target_advancing_before_the_pr_merge_is_refused_then_integrated(self):
+        self.seed_cfg()
+        self.plan()
+        self.dispatch_both()
+        self.ready("ua")
+        real = C.G.open_pr
+
+        def advance(*a, **k):
+            self.advance_target("src/late.txt", "x\n")
+            return real(*a, **k)
+        with mock.patch.object(C.G, "open_pr", side_effect=advance):
+            rc, _, err = self.cli("merge", "ua")
+        self.assertEqual((rc, "advanced" in err, self.merged_count()), (1, True, 0), err)
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+        self.assertEqual(sh(self.origin, "show", "refs/heads/main:src/late.txt"), "x")
+
+    def test_f2_resume_after_the_tracking_ref_moved_merges_the_current_target(self):
+        self.interrupted()
+        prev = self.head("ub")
+        self.advance_target("src/other.txt", "o\n")
+        sh(self.root, "fetch", "-q", "origin")  # origin/main now differs from the intent's base
+        rc, _, err = self.cli("merge", "ub")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sh(self.wtree("ub"), "rev-parse", "HEAD^"), prev)  # one integration, against the retargeted intent
+        main = sh(self.origin, "show", "refs/heads/main:src/other.txt")
+        self.assertEqual((main, self.merged_count()), ("o", 2))
+        self.assertEqual(sh(self.wtree("ub"), "rev-parse", "HEAD^2"), sh(self.root, "rev-parse", "refs/remotes/origin/main"))
+
+    def test_f2_merge_in_uses_the_recorded_commit_not_the_tracking_ref(self):
+        self.interrupted()
+        intent = jload(os.path.join(paths.attempt_dir(self.root, "demo", "ub", 1), "integration_intent.json"))
+        self.advance_target("src/other.txt", "o\n")
+        sh(self.root, "fetch", "-q", "origin")  # the ref now names a newer commit than the intent
+        with mock.patch.object(C, "_fetch_target", return_value=intent["integration_base"]):
+            rc, _, err = self.cli("merge", "ub")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sh(self.wtree("ub"), "rev-parse", "HEAD^2"), intent["integration_base"])
+
+    def test_f3_dispatch_all_skips_a_full_unit_and_launches_the_rest(self):
+        a = plan_copy()
+        a.update(plan_id="demo", scope=["src/**"], target_branch="main")
+        a["units"] = [{"id": "j1", "kind": "job", "title": "J1", "command": "true", "outputs": ["r"], "needs": []}]
+        b = plan_copy()
+        b.update(plan_id="zeta", scope=["src/**"], target_branch="main")
+        b["units"] = [{"id": "k1", "kind": "job", "title": "K1", "command": "true", "outputs": ["y"], "needs": []}]
+        approval.approve_plan(self.root, a, "me")
+        approval.approve_plan(self.root, b, "me")
+        real = X.dispatch_job
+
+        def full(root, pid, unit, *args):
+            if unit["id"] == "j1":
+                raise X.SlotsFull("plan demo has 1 of its 1 worker slots in use")
+            return real(root, pid, unit, *args)
+        with mock.patch.object(X, "dispatch_job", side_effect=full):
+            rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["k1"]), err)
+        self.assertIn("skipped j1", err)
+
+    def test_f4_decision_must_name_the_exact_candidate_and_follow_the_fail(self):
+        adir = os.path.join(self.tmp, "att")
+        nv, dec = os.path.join(adir, "nonvacuous.json"), os.path.join(adir, "reviews", "orchestrator_decision.json")
+        store.write_json_atomic(nv, {"candidate": "c2", "status": "FAIL"})
+        rs = {"orchestrator_decision": True}
+
+        def decide(cand, delta):
+            store.write_json_atomic(dec, {"orchestrator_decision": True, "candidate": cand, "text": "t"})
+            t = os.stat(nv).st_mtime + delta
+            os.utime(dec, (t, t))
+        decide("c1", 5)  # a carried decision for another candidate, even a later one
+        self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c2", rs))
+        decide("c2", -5)  # right candidate, recorded before the FAIL
+        self.assertIn("non-vacuity FAIL", C.nonvacuity_problem(adir, "c2", rs))
+        decide("c2", 5)
+        self.assertIsNone(C.nonvacuity_problem(adir, "c2", rs))
+
+    def test_f3_retry_needs_a_free_slot_and_dispatch_continues_to_other_plans(self):
+        a = plan_copy()
+        a.update(plan_id="demo", scope=["src/**"], target_branch="main", caps={"workers": 1, "attempts": 2, "review_rounds": 3})
+        a["units"] = [{"id": "j1", "kind": "job", "title": "J1", "command": "true", "outputs": ["result.txt"], "needs": []},
+                      {"id": "j2", "kind": "job", "title": "J2", "command": "while :; do :; done", "outputs": ["x"], "needs": []}]
+        b = plan_copy()
+        b.update(plan_id="zeta", scope=["src/**"], target_branch="main")
+        b["units"] = [{"id": "k1", "kind": "job", "title": "K1", "command": "true", "outputs": ["y"], "needs": []}]
+        approval.approve_plan(self.root, a, "me")
+        approval.approve_plan(self.root, b, "me")
+        self.assertEqual(self.cli("dispatch", "--unit", "j1")[0], 0)
+        self.wait_done("j1")
+        self.assertEqual(self.cli("judge", "j1")[0], 1)
+        self.assertEqual(self.cli("dispatch", "--unit", "j2")[0], 0)  # plan demo is now at its one-worker cap
+        try:
+            acts = [(x["unit"], x["action"]) for x in json.loads(self.cli("next", "--json")[1])]
+            self.assertNotIn(("j1", "retry"), acts)
+            self.assertIn(("k1", "dispatch"), acts)
+            rc, out, err = self.cli("dispatch")
+            self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["k1"]), err)
+        finally:
+            self.cli("abort", "j2")
+
+    def test_f4_a_carried_decision_does_not_accept_a_new_nonvacuity_fail(self):
+        self.seed_cfg()
+        self.plan(caps={"workers": 3, "attempts": 2, "review_rounds": 1},
+                  ua_test='read -r v < src/cfg.txt; [ "$v" = on ] || [ -f src/ua.py ]')
+        self.dispatch_both()
+        self.assertEqual(self.ready("ua")["status"], "PASS")
+        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "accept the review finding")[0], 0)
+        self.advance_target("src/cfg.txt", "on\n")
+        rc, _, err = self.cli("merge", "ua")
+        self.assertEqual((rc, "non-vacuity FAIL" in err, self.merged_count()), (1, True, 0), err)
+        self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "accept the new FAIL too")[0], 0)
+        self.assertEqual(self.cli("merge", "ua")[0], 0)
+
+    def test_f5_update_ref_cannot_move_the_target_backward(self):
+        repo = os.path.join(self.tmp, "refrepo")
+        os.makedirs(repo)
+        sh(repo, "init", "-q", "-b", "main")
+        for i in (1, 2):
+            self.put("f.txt", "v%d\n" % i, base=repo)
+            sh(repo, "add", "-A")
+            sh(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "c%d" % i)
+        head, old = sh(repo, "rev-parse", "HEAD"), sh(repo, "rev-parse", "HEAD~1")
+        for argv in (["update-ref", "refs/heads/main", old], ["update-ref", "-d", "refs/heads/main"]):
+            with self.assertRaises(W.DestructiveGit, msg=argv):
+                W.git(repo, *argv)
+        self.assertEqual(sh(repo, "rev-parse", "main"), head)
 
 
 if __name__ == "__main__":

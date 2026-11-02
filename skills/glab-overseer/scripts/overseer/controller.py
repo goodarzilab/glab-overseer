@@ -24,6 +24,7 @@ from . import approval, execution as X, github as G, judge as J, paths, plan as 
 POLL_SECONDS = 60.0
 POLL_INTERVAL = 3.0
 MERGE_TIMEOUT = 180
+MAX_INTEGRATIONS = 3  # integrations per merge call when the target keeps advancing
 
 
 class ControllerError(X.ExecutionError):
@@ -104,13 +105,28 @@ def _dict(path):
     return d
 
 
+def _decision_after(adir, cand):
+    """An orchestrator decision recorded for exactly `cand`, after the current non-vacuity record was written.
+
+    A decision carried forward by patch id (another candidate) or made before the FAIL never accepts it."""
+    dpath = os.path.join(adir, "reviews", "orchestrator_decision.json")
+    dec = _dict(dpath)
+    if not (dec and dec.get("orchestrator_decision") is True and dec.get("candidate") == cand):
+        return False
+    try:
+        return os.stat(os.path.join(adir, "nonvacuous.json")).st_mtime_ns <= os.stat(dpath).st_mtime_ns
+    except OSError:
+        return False
+
+
 def nonvacuity_problem(adir, cand, review_state):
     nv = _dict(os.path.join(adir, "nonvacuous.json"))
     if nv is None:
         return "no non-vacuity record (run `nonvacuous`)"
     if nv.get("candidate") != cand:  # never carried across an integration: the target may have changed what the tests need
         return "the non-vacuity record is for another candidate"
-    if nv.get("status") in ("PASS", "NOT_APPLICABLE") or (nv.get("status") == "FAIL" and review_state["orchestrator_decision"]):
+    if nv.get("status") in ("PASS", "NOT_APPLICABLE") or (
+            nv.get("status") == "FAIL" and review_state["orchestrator_decision"] and _decision_after(adir, cand)):
         return None
     return "non-vacuity %s: the tests pass without the change" % nv.get("status")
 
@@ -150,11 +166,12 @@ def _fetch_target(wt, target):
 def _merge_in(root, plan_id, unit, wt, adir, target, pend):
     if W.git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", ok=(0, 1))["rc"] == 0:
         W.git(wt, "merge", "--abort")  # our own interrupted merge: the tree was clean when it began
-    r = W.git(wt, *(W.SUPERVISOR + ("merge", "--no-edit", "--no-ff", "origin/" + target)), ok=(0, 1))
+    # the commit recorded in the intent, never the mutable origin/<target> ref
+    r = W.git(wt, *(W.SUPERVISOR + ("merge", "--no-edit", "--no-ff", pend["integration_base"])), ok=(0, 1))
     if r["rc"] == 0:
         return
     if W.git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", ok=(0, 1))["rc"] != 0:
-        raise ControllerError("git merge of origin/%s failed without a merge in progress: %s" % (target, r["stderr"].strip()[:200]))
+        raise ControllerError("git merge of %s failed without a merge in progress: %s" % (pend["integration_base"][:12], r["stderr"].strip()[:200]))
     files = W.zsplit(W.git(wt, "diff", "--name-only", "--diff-filter=U", "-z", raw=True)["stdout"])
     W.git(wt, "merge", "--abort")
     os.unlink(os.path.join(adir, "integration_intent.json"))
@@ -162,13 +179,14 @@ def _merge_in(root, plan_id, unit, wt, adir, target, pend):
     store.write_json_atomic(os.path.join(paths.unit_dir(root, plan_id, unit["id"]), "stop.json"),
                             dict(detail, kind="INTEGRATION_CONFLICT", time=store.utc_now()))
     store.append_event(root, "INTEGRATION_CONFLICT", plan_id=plan_id, unit_id=unit["id"], **detail)
-    raise Conflict("INTEGRATION_CONFLICT: origin/%s does not merge into %s (%s); the merge was aborted"
-                   % (target, unit["id"], ", ".join(files) or "no file list"))
+    raise Conflict("INTEGRATION_CONFLICT: origin/%s (%s) does not merge into %s (%s); the merge was aborted"
+                   % (target, pend["integration_base"][:12], unit["id"], ", ".join(files) or "no file list"))
 
 
 def _integrate(root, plan_id, unit, wt, adir, target, j):
     """Merge the fetched target into the unit branch when the candidate lacks it. Returns (judgment, base, pend)."""
     ipath = os.path.join(adir, "integration_intent.json")
+    base = _fetch_target(wt, target)  # on every entry, first or resumed
     pend = _dict(ipath)
     if pend is not None:
         for k in ("integration_base", "previous_candidate", "previous_base"):
@@ -179,8 +197,11 @@ def _integrate(root, plan_id, unit, wt, adir, target, j):
         dirty = J._worktree_problems(wt, W.rev(wt, "HEAD"), "supervisor")  # same cleanliness rule as first entry
         if dirty:
             raise NotReady("the worktree is not clean: " + "; ".join(dirty))
+        if W.rev(wt, "HEAD") == pend["previous_candidate"] and pend["integration_base"] != base:
+            pend = dict(pend, integration_base=base, time=store.utc_now())  # merge-in not done: retarget the intent
+            store.write_json_atomic(ipath, pend)
+            store.append_event(root, "integration_intent", plan_id=plan_id, unit_id=unit["id"], **pend)
     else:
-        base = _fetch_target(wt, target)
         if W.git(wt, "merge-base", "--is-ancestor", base, j["candidate"], ok=(0, 1))["rc"] == 0:
             return j, base, None
         dirty = J._worktree_problems(wt, j["candidate"], "supervisor")
@@ -323,13 +344,20 @@ def merge_unit(root, plan_id, unit):
         raise NotReady("; ".join(problems))
     base = None
     if pend is not None or j:
-        j, base, pend = _integrate(root, plan_id, unit, wt, adir, target, j or {})
-        if pend is not None:
+        for _ in range(MAX_INTEGRATIONS):  # each pass fetches; stop once the candidate contains the fetched target
+            j, base, pend = _integrate(root, plan_id, unit, wt, adir, target, j or {})
+            if pend is None:
+                break
             j, problems = gate_problems(root, plan_id, unit, fresh=True)
             if problems:
                 raise NotReady("after integration: " + "; ".join(problems))
+        else:
+            raise NotReady("origin/%s advanced during %d integrations; rerun merge" % (target, MAX_INTEGRATIONS))
     rec = G.open_pr(root, plan_id, unit)  # plain push, create or re-body, and the read-back head must equal the candidate
     cand = j["candidate"]
+    latest = _fetch_target(wt, target)  # the race between this fetch and GitHub's merge is an accepted limit
+    if W.git(wt, "merge-base", "--is-ancestor", latest, cand, ok=(0, 1))["rc"] != 0:
+        raise NotReady("origin/%s advanced to %s after the integration; rerun merge to integrate it" % (target, latest[:12]))
     intent = {"state": "intent", "number": rec["number"], "candidate": cand, "pr_head": rec["head_oid"],
               "integration_base": base, "target": target, "time": store.utc_now()}
     store.write_json_atomic(mpath, intent)
@@ -392,6 +420,8 @@ def _unit_action(root, plan, u, st, free):
     if j["status"] == "FAILED":
         if n >= plan["caps"]["attempts"]:
             return "stop", "attempt a%d FAILED at the attempts cap" % n
+        if not (free[0] > 0 and free[1] > 0):  # a retry needs a plan slot and a project slot, like a dispatch
+            return None
         return "retry", "attempt a%d FAILED: %s" % (n, (j.get("reasons") or ["no reason"])[0])
     if u["kind"] == "job":
         return None
@@ -478,9 +508,9 @@ def dispatch_ready(root, plan_id=None):
                     rec = W.dispatch_code(root, a["plan"], u)
                 else:
                     rec = X.dispatch_job(root, a["plan"], u)
-            except X.SlotsFull as e:
-                sys.stderr.write("stopped: %s\n" % e)
-                break
+            except X.SlotsFull as e:  # skip this unit; other plans or units may still have a slot
+                sys.stderr.write("skipped %s: %s\n" % (a["unit"], e))
+                continue
             except X.ExecutionError as e:
                 sys.stderr.write("error: %s: %s\n" % (a["unit"], e))
                 rc = 1
