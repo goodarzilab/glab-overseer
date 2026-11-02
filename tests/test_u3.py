@@ -667,6 +667,9 @@ class CommandTests(Case):
         rec = self.launch("j1", [self.script("bg", "sleep 30 &")])  # wrapper exits, a child survives
         self.wait_for(rec["dir"])
         token = self.rec(rec["dir"], "intent.json")["token"]
+        end = time.monotonic() + 5  # exit.json lands while the wrapper may still be exiting
+        while len(X._token_pids(token)) != 1 and time.monotonic() < end:
+            time.sleep(0.05)
         self.assertEqual(len(X._token_pids(token)), 1)
         store.write_json_atomic(os.path.join(rec["dir"], "cancel.json"),
                                 {"token": token, "requested_at": store.utc_now()})
