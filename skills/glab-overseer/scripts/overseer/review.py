@@ -12,6 +12,7 @@ around state writes (intent before the model call, result after). A round whose 
 unknown is never re-run silently: it needs `--retry`, once.
 """
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -393,14 +394,18 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
 # ---- dispositions and eligibility --------------------------------------------
 
 def _evidence_ok(adir, ref):
+    """An existing regular file under the attempt root; a reproduction record must parse with valid true."""
     try:
         full = paths.safe_relpath(adir, ref)
     except paths.UnsafePath:
         return False
     if not os.path.isfile(full):
         return False
+    is_rep = re.match(r"^rep-[0-9]+\.json$", os.path.basename(full)) is not None
     rec = X._load(full) if full.endswith(".json") else None
-    return not (isinstance(rec, dict) and rec.get("valid") is False)
+    if is_rep or (isinstance(rec, dict) and rec.get("kind") == "reproduce"):
+        return isinstance(rec, dict) and rec.get("valid") is True
+    return True
 
 
 def record_dispositions(root, plan_id, unit, data):
@@ -505,7 +510,11 @@ def review_state(root, plan_id, unit):
 
 def _judged_state(wt):
     ref = W.git(wt, "symbolic-ref", "-q", "HEAD", ok=(0, 1))["stdout"].strip()
-    return (W.rev(wt, "HEAD"), ref, W.rev(wt, ref) if ref else None)
+    h = hashlib.sha256()
+    h.update(W.git(wt, "status", "--porcelain=v1", "-z", "--ignored", raw=True)["stdout"])
+    h.update(b"\0diff\0")
+    h.update(W.git(wt, "diff", "--no-ext-diff", "--binary", "HEAD", raw=True)["stdout"])
+    return (W.rev(wt, "HEAD"), ref, W.rev(wt, ref) if ref else None, h.hexdigest())
 
 
 @contextlib.contextmanager
@@ -521,7 +530,7 @@ def disposable(wt, commit):
     try:
         W.git(parent, "clone", "--quiet", "--shared", "--no-checkout", wt, d)
         W.git(d, "checkout", "--quiet", "--detach", commit)
-        yield d, lambda: None if _judged_state(wt) == before else "the judged worktree's HEAD or branch ref changed"
+        yield d, lambda: None if _judged_state(wt) == before else "the judged worktree changed (HEAD, branch ref, status or tracked content)"
     finally:
         shutil.rmtree(parent, ignore_errors=True)
 
@@ -572,13 +581,17 @@ def nonvacuous(root, plan_id, unit, timeout=J.TEST_TIMEOUT):
     if not tests or not others:
         rec.update(status="NOT_APPLICABLE", reason="no test file changed" if not tests else "no non-test file changed")
     else:
+        def run(d):
+            return E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=d)
+        with disposable(wt, cand) as (d, check):  # the baseline gets its own clone: its artifacts must not reach the revert run
+            r0 = run(d)
+            problem = check()
+        if problem:
+            raise ReviewError("%s; no non-vacuity record written" % problem)
+        if r0["timed_out"] or r0["rc"] != 0:
+            raise ReviewError("baseline does not pass at the candidate (%s); no non-vacuity record written"
+                              % ("timeout" if r0["timed_out"] else "rc %s" % r0["rc"]))
         with disposable(wt, cand) as (d, check):
-            def run():
-                return E.run_tool(["bash", "-c", unit["test_command"]], E.worker_env(), timeout, cwd=d)
-            r0 = run()
-            if r0["timed_out"] or r0["rc"] != 0:
-                raise ReviewError("baseline does not pass at the candidate (%s); no non-vacuity record written"
-                                  % ("timeout" if r0["timed_out"] else "rc %s" % r0["rc"]))
             todo = []
             for s_, p in others:
                 if s_ == "A":  # added since base: drop it from the index and the tree together
@@ -587,7 +600,7 @@ def nonvacuous(root, plan_id, unit, timeout=J.TEST_TIMEOUT):
                     todo.append(p)
             for i in range(0, len(todo), 100):
                 W.git(d, "--literal-pathspecs", "checkout", base, "--", *todo[i:i + 100])
-            r = run()
+            r = run(d)
             problem = check()
         if problem:
             raise ReviewError("%s; no non-vacuity record written" % problem)
@@ -709,6 +722,9 @@ def run_fix(args):
 
 
 def configure_nonvacuous(p):
+    p.description = ("Run the tests with every non-test change reverted. Limit: a repository with an initialized, "
+                     "unchanged submodule makes the clone baseline fail, so it cannot be evaluated; the orchestrator "
+                     "records a decision at the round cap.")
     _plan_arg(p)
     p.add_argument("--timeout", type=float, default=J.TEST_TIMEOUT, metavar="S")
 

@@ -648,5 +648,39 @@ class Round2Fixes(Case):
         self.assertIn("session id", st["reasons"][0])
 
 
+class Round3Fixes(Case):
+    def test_q1_baseline_artifacts_do_not_reach_the_reverted_run(self):
+        self.done(unit={"test_command": "[ -e .artifact ] && exit 0; touch .artifact; test -f src/alpha.py"})
+        self.assertEqual(json.loads(self.cli("nonvacuous", "alpha")[1])["status"], "PASS")
+
+    def test_q2_content_edits_of_the_judged_worktree_invalidate_the_record(self):
+        self.done()
+        self.reviewer("agy", agy_out(fail()))
+        self.review()
+        for cmd in ("echo x >> %s/src/alpha.py", "rm %s/src/alpha.py", "touch %s/stray.txt"):
+            n = len([x for x in os.listdir(os.path.join(self.attempt_dir(), "evidence"))] if os.path.isdir(
+                os.path.join(self.attempt_dir(), "evidence")) else [])
+            rc, out, err = self.cli("reproduce", "alpha", "--finding", "f1", "--command", cmd % self.wt())
+            self.assertEqual(rc, 1, cmd)
+            self.assertIn("invalid", err)
+            rec = jload(os.path.join(self.attempt_dir(), "evidence", "rep-%d.json" % (n + 1)))
+            self.assertFalse(rec["valid"])
+            self.assertIn("judged worktree changed", rec["problem"])
+
+    def test_q3_reproduction_records_must_parse_and_be_valid(self):
+        self.done()
+        ev = os.path.join(self.attempt_dir(), "evidence")
+        os.makedirs(ev)
+        for name, text, want in (("rep-1.json", "{", False), ("rep-2.json", '{"kind": "reproduce"}', False),
+                                 ("rep-3.json", '{"kind": "reproduce", "valid": true}', True),
+                                 ("rep-4.json", '{"valid": true}', True), ("other.json", "{", True),
+                                 ("note.txt", "free text", True)):
+            with open(os.path.join(ev, name), "w") as f:
+                f.write(text)
+            self.assertEqual(R._evidence_ok(self.attempt_dir(), "evidence/" + name), want, name)
+        self.assertFalse(R._evidence_ok(self.attempt_dir(), "evidence"))
+        self.assertFalse(R._evidence_ok(self.attempt_dir(), "evidence/missing.json"))
+
+
 if __name__ == "__main__":
     unittest.main()
