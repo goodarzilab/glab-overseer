@@ -132,7 +132,7 @@ agy -p "$(echo 'PLAN=accept-run3; all --plan values below use it'; cat <skill di
 ```
 
 `--sandbox` mounts `.git` read-only (P5), which blocks `pr` and `merge`, so the orchestrator runs without it; the supervisor keeps it for workers.
-4. `expect.json`: `{"run": "run3", "backend": "slurm", "author_family": "google", "reviewer_family": "claude"}` (`local` off-cluster). Author family google, reviewer Claude haiku; these two keys are the defaults for `run3`, and any other family is FAIL.
+4. `expect.json`: `{"run": "run3", "backend": "slurm", "author_family": "google", "reviewer_family": "claude"}` (on the cluster Run 3 uses the Slurm backend, as written; off-cluster use `"backend": "local"` and omit `shim_log`, so no `no_slurm` claim is made, because only Run 2 builds the logging shims). Author family google, reviewer Claude haiku; these two keys are the defaults for `run3`, and any other family is FAIL.
 5. If the agy session cannot drive the loop, record Run 3 INCOMPLETE with the transcript tail from `orchestrator.json`, then run the same steps from Claude Code with `models --host google` as the partial path. The report states who drove each step.
 
 ## 5. Recovery: kill between `gh pr merge` and its record

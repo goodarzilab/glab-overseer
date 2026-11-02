@@ -203,7 +203,7 @@ class CheckRunTests(unittest.TestCase):
         self.assertTrue(all(not os.path.isabs(c["evidence"]) for c in s["claims"]))
 
     def test_overlap(self):
-        self.upd(self.a1("count", "inv", "01-author", "start.json"), time="2026-11-01T10:05:00Z")
+        self.upd(self.a1("count", "inv", "01-author", "start.json"), time="2026-11-01T10:08:00Z")
         self.assertEqual(self.chk()[1]["overlap"], "FAIL")
         os.unlink(self.a1("count", "inv", "01-author", "exit.json"))
         self.assertEqual(self.chk()[1]["overlap"], "INCOMPLETE")
@@ -291,7 +291,7 @@ class CheckRunTests(unittest.TestCase):
         self.assertEqual(self.chk(exp)[1]["no_slurm"], "INCOMPLETE")  # named log absent
         open(os.path.join(self.root, "shim.log"), "w").close()
         self.assertEqual(self.chk(exp)[1]["no_slurm"], "PASS")
-        self.assertEqual(self.chk({"backend": "local"})[1]["no_slurm"], "INCOMPLETE")
+        self.assertNotIn("no_slurm", self.chk({"backend": "local"})[1])  # no shim_log named: no claim
         with open(os.path.join(self.root, "shim.log"), "w") as f:
             f.write("sbatch --version\n")
         self.assertEqual(self.chk(exp)[1]["no_slurm"], "FAIL")
@@ -579,6 +579,115 @@ class ReviewRound2Tests(unittest.TestCase):
         for tool in ("tee", "node", "readlink", "tr", "awk"):
             self.assertIn(tool, loop)
         self.assertIn("PATH=$BIN:$SH claude --version && PATH=$BIN:$SH agy --version", sec)
+
+
+class ReviewRound3Tests(unittest.TestCase):
+    """One test per round-3 review finding (F1 to F8); see .swarm/u10-review-r3.txt."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.root, True))
+        build_tree(self.root)
+
+    def u(self, u, *rest):
+        return os.path.join(self.root, ".overseer", UNITS, u, *rest)
+
+    def claims(self, expect=None):
+        s = C.evaluate(self.root, PID, {"backend": "slurm"} if expect is None else expect)
+        return dict((c["id"], c) for c in s["claims"]), s
+
+    def st(self, cid, expect=None):
+        return self.claims(expect)[0][cid]["status"]
+
+    def test_F1_plan_without_units_is_incomplete(self):
+        pj = os.path.join(self.root, ".overseer", "plans", PID, "plan.json")
+        for body in ({}, {"units": []}, {"units": "x"}):
+            wj(pj, body)
+            cl, s = self.claims({"run": "run1", "backend": "slurm"})
+            self.assertEqual(cl["plan"]["status"], "INCOMPLETE", body)
+            self.assertGreater(s["counts"]["INCOMPLETE"], 0)
+
+    def test_F2_unjudged_newest_attempt_is_not_covered_by_an_older_review(self):
+        os.unlink(self.u("slug", "merge.json"))
+        a1, a2 = self.u("slug", "attempts/a1"), self.u("slug", "attempts/a2")
+        shutil.copytree(a1, a2)
+        os.unlink(os.path.join(a2, "judgment.json"))
+        shutil.rmtree(os.path.join(a2, "reviews"))
+        c = self.claims({"run": "run1"})[0]["slug.review"]
+        self.assertEqual(c["status"], "INCOMPLETE")
+        self.assertIn("a2", c["detail"])
+
+    def test_F3_judgment_needs_the_declared_outputs(self):
+        pd = os.path.join(self.root, ".overseer", "plans", PID)
+        wj(os.path.join(pd, "plan.json"), M.template(PID, False))
+        p = self.u("summarize", "attempts/a1/judgment.json")
+        wj(p, {"status": "DONE", "outputs": [{"path": "unrelated.csv", "ok": True}]})
+        c = self.claims({})[0]["summarize.judgment"]
+        self.assertEqual(c["status"], "FAIL")
+        self.assertIn("result.csv", c["detail"])
+        wj(p, {"status": "DONE", "outputs": [{"path": "unrelated.csv", "ok": True}, {"path": "result.csv", "ok": True}]})
+        self.assertEqual(self.claims({})[0]["summarize.judgment"]["status"], "PASS")
+        wj(os.path.join(pd, "plan.json"), {"units": [{"id": "slug", "kind": "code", "outputs": ["textkit/slug.py", {"path": "t.py"}]},
+                                                    {"id": "count", "kind": "code"}, {"id": "summarize", "kind": "job"}]})
+        self.assertEqual(self.claims({})[0]["slug.judgment"]["status"], "FAIL")  # t.py not recorded
+
+    def test_F4_sacct_any_reports_the_claim(self):
+        exp = {"run": "run1", "backend": "slurm", "sacct": "any"}
+        self.assertEqual(self.st("summarize.sacct", exp), "INCOMPLETE")  # never answered
+        build_tree(self.root, sacct=True)
+        self.assertEqual(self.st("summarize.sacct", exp), "PASS")
+        self.assertNotIn("summarize.sacct", self.claims({"backend": "slurm"})[0])  # key absent: no claim
+
+    def test_F5_touching_seconds_are_undecidable(self):
+        for u, a, b in (("slug", "00", "01"), ("count", "01", "02")):
+            wj(self.u(u, "attempts/a1/inv/01-author/start.json"), {"time": "2026-11-01T10:00:%sZ" % a})
+            wj(self.u(u, "attempts/a1/inv/01-author/exit.json"), {"rc": 0, "end_time": "2026-11-01T10:00:%sZ" % b})
+        c = self.claims()[0]["overlap"]
+        self.assertEqual(c["status"], "INCOMPLETE")
+        self.assertIn("one-second", c["detail"])
+        wj(self.u("count", "attempts/a1/inv/01-author/start.json"), {"time": "2026-11-01T10:00:02Z"})
+        wj(self.u("count", "attempts/a1/inv/01-author/exit.json"), {"rc": 0, "end_time": "2026-11-01T10:00:03Z"})
+        self.assertEqual(self.st("overlap"), "FAIL")
+        wj(self.u("count", "attempts/a1/inv/01-author/start.json"), {"time": "2026-11-01T10:00:00Z"})
+        self.assertEqual(self.st("overlap"), "PASS")
+
+    def test_F6_no_slurm_claim_needs_a_shim_log(self):
+        shutil.rmtree(self.root)
+        self.root = tempfile.mkdtemp()
+        build_tree(self.root, backend="local")
+        exp = {"run": "run3", "backend": "local", "author_family": "google", "reviewer_family": "claude"}
+        cl, s = self.claims(exp)
+        self.assertNotIn("no_slurm", cl)
+        self.assertEqual(cl["backend"]["status"], "PASS")
+        wj(self.u("slug", "attempts/a1/inv/01-author/launch.json"), {"job_id": "9"})  # Slurm trace still fails
+        self.assertEqual(self.st("no_slurm", exp), "FAIL")
+        with open(os.path.join(ACC, "RUNBOOK.md")) as f:
+            book = f.read()
+        run3 = book[book.index("## 4. Run 3"):book.index("## 5. ")]
+        self.assertIn("omit `shim_log`", run3)
+
+    def test_F7_overlap_is_existential(self):
+        a, b = self.u("slug", "attempts", "a1"), self.u("slug", "attempts", "a2")
+        shutil.copytree(a, b)
+        os.unlink(os.path.join(a, "inv/01-author/exit.json"))  # a1 lost its record; a2 still overlaps count
+        self.assertEqual(self.st("overlap"), "PASS")
+
+    def test_F8_family_check_uses_the_current_attempt(self):
+        a1, a2 = self.u("slug", "attempts", "a1"), self.u("slug", "attempts", "a2")
+        shutil.copytree(a1, a2)
+        wj(os.path.join(a1, "inv/01-author/intent.json"), {"argv": ["/usr/bin/claude"], "backend": "slurm"})
+        for a in (a2, self.u("count", "attempts", "a1")):
+            wj(os.path.join(a, "inv/01-author/intent.json"), {"argv": ["/usr/bin/agy"], "backend": "slurm"})
+            wj(os.path.join(a, "reviews/r1/round.json"), {"state": "complete", "reviewer_family": "claude", "same_family_fallback": False,
+                                                          "calls": [{"state": "ok", "family": "claude"}]})
+        wj(os.path.join(a1, "reviews/r1/round.json"), {"state": "complete", "reviewer_family": "google", "same_family_fallback": False,
+                                                      "calls": [{"state": "ok", "family": "google"}]})
+        wj(os.path.join(a1, "judgment.json"), {"status": "FAILED"})
+        self.assertEqual(self.st("slug.review", {"run": "run3"}), "PASS")
+        # a same-family fallback in the older attempt still fails
+        wj(os.path.join(a1, "reviews/r2/round.json"), {"state": "complete", "reviewer_family": "claude", "same_family_fallback": True,
+                                                      "calls": [{"state": "ok", "family": "claude"}]})
+        self.assertEqual(self.st("slug.review", {"run": "run3"}), "FAIL")
 
 
 if __name__ == "__main__":

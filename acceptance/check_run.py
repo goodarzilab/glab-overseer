@@ -8,14 +8,21 @@ Prints `PASS|FAIL|INCOMPLETE <claim id> <evidence path>` per claim, or a JSON su
 
 Expectation keys (all optional): run; backend ("slurm"|"local"); code_units, job_units; overlap;
 integration_units; job_sources (squeue,
-scontrol, sacct, wrapper); sacct ("answered"|"unavailable"|"any"); uncertain_units; recovery {unit,
-merge_log}; shim_log (file under the project root of logged Slurm calls); author_family and
+scontrol, sacct, wrapper); sacct ("answered"|"unavailable"|"any"; absent means no sacct claim, "any"
+reports PASS when sacct ever answered and INCOMPLETE when it never did); uncertain_units; recovery {unit,
+merge_log}; shim_log (file under the project root of logged Slurm calls; the `no_slurm` claim is made
+only when it is given, or when Slurm traces are found in the state, which is FAIL; omit it off-cluster); author_family and
 reviewer_family ("claude"|"google"): the model families the run must use, defaulting by `run` to
 author claude and reviewer google for run1 and run2, author google and reviewer claude for run3;
 any other family in a review round is FAIL.
 
 Claims: `overlap` is emitted only when the plan has two or more code units (a job-only plan has nothing
-to overlap, so no claim is made and the exit code is unaffected). A record that is missing is
+to overlap, so no claim is made and the exit code is unaffected). It is existential: PASS when one pair of
+complete author records of two code units, across all attempts, strictly overlaps, even if other records
+are missing; INCOMPLETE when no pair strictly overlaps and a record is missing or two intervals only touch
+at one second (undecidable at the one-second resolution of the receipts); FAIL otherwise. A plan whose
+`units` is missing, not a list or empty is a `plan` claim INCOMPLETE. `<unit>.judgment` passes only when
+every output the plan declares for the unit is in the judgment with ok true. A record that is missing is
 INCOMPLETE; so is one whose JSON has the wrong type, with the reason in the detail; check_run never
 raises on a malformed record.
 """
@@ -170,13 +177,27 @@ def check_overlap(run, code):
             missing.append("%s: no author invocation" % u)
     pairs = [(a, b) for i, a in enumerate(ids) for b in ids[i + 1:]
              if any(x[0] < y[1] and y[0] < x[1] for x in wins[a] for y in wins[b])]
+    touching = [(a, b) for i, a in enumerate(ids) for b in ids[i + 1:]
+                if any(x[0] <= y[1] and y[0] <= x[1] for x in wins[a] for y in wins[b])]
     span = ", ".join("%s %s" % (u, ["%d..%d" % w for w in wins[u]]) for u in ids)
     if pairs:
         run.add("overlap", PASS, evidence, "overlapping %s; %s" % (pairs, span))
+    elif touching:
+        run.add("overlap", INCOMPLETE, evidence, "undecidable at one-second resolution: %s touch at an equal second; %s" % (touching, span))
     elif missing:
         run.add("overlap", INCOMPLETE, evidence, "; ".join(missing))
     else:
         run.add("overlap", FAIL, evidence, "no two author runs overlapped; " + span)
+
+
+def declared_outputs(run, uid):
+    """Output paths the plan declares for the unit (strings or objects with a path)."""
+    plan = run.load(run.pdir, "plan.json") or {}
+    for u in plan.get("units") if isinstance(plan.get("units"), list) else []:
+        if isinstance(u, dict) and u.get("id") == uid and isinstance(u.get("outputs"), list):
+            return [o if isinstance(o, str) else o.get("path") for o in u["outputs"]
+                    if isinstance(o, str) or (isinstance(o, dict) and isinstance(o.get("path"), str))]
+    return []
 
 
 def check_judgment(run, uid, kind):
@@ -193,12 +214,16 @@ def check_judgment(run, uid, kind):
         run.add(cid, INCOMPLETE, path, "malformed record: an outputs entry is not an object")
         return j
     bad = [o.get("path") for o in outs if o.get("ok") is not True]
+    have = set(o.get("path") for o in outs if o.get("ok") is True)
+    absent = [p for p in declared_outputs(run, uid) if p not in have]
     if j.get("status") != "DONE":
         run.add(cid, FAIL if j.get("status") == "FAILED" else INCOMPLETE, path, "status %s" % j.get("status"))
     elif kind == "code" and j.get("orchestrator_resolved") is True:
         run.add(cid, FAIL, path, "a code unit is DONE only by orchestrator resolution")
     elif bad or not outs:
         run.add(cid, FAIL, path, "outputs failing or not recorded: %s" % (bad or "none"))
+    elif absent:
+        run.add(cid, FAIL, path, "declared outputs not recorded as ok: %s" % absent)
     else:
         run.add(cid, PASS, path, "DONE, %d outputs ok" % len(outs))
     return j
@@ -206,7 +231,7 @@ def check_judgment(run, uid, kind):
 
 def current_attempt(run, uid):
     """The attempt whose judgment is current: the one holding merge.json's candidate when merged, else the
-    latest attempt that has a judgment, else the latest attempt."""
+    highest-numbered attempt."""
     atts = run.attempts(uid)
     if not atts:
         return run.adir(uid)
@@ -215,8 +240,7 @@ def current_attempt(run, uid):
         hit = [a for a in atts if (run.load(a, "judgment.json") or {}).get("candidate") == m["candidate"]]
         if hit:
             return hit[-1]
-    judged = [a for a in atts if run.load(a, "judgment.json")]
-    return (judged or atts)[-1]
+    return atts[-1]
 
 
 def check_review(run, uid):
@@ -226,9 +250,10 @@ def check_review(run, uid):
         da, dr = RUN_FAMILIES[run.expect["run"]]
         want_a, want_r = want_a or da, want_r or dr
     cur = current_attempt(run, uid)
-    rounds, fams = [], [author_family(run, a) for a in run.attempts(uid)]
-    unit_fam = next((f for f in fams if f), None)
-    for adir, afam in zip(run.attempts(uid), fams):
+    rounds, cur_fam = [], author_family(run, cur)
+    atts = run.attempts(uid)
+    for adir in atts:
+        afam = author_family(run, adir)
         base = os.path.join(adir, "reviews")
         try:
             names = sorted((x for x in os.listdir(base) if re.match(r"^r[1-9][0-9]*$", x)), key=lambda s: (len(s), s))
@@ -240,18 +265,21 @@ def check_review(run, uid):
                 calls = rd.get("calls") if isinstance(rd.get("calls"), list) else []
                 ok = [c for c in calls if isinstance(c, dict) and c.get("state") == "ok"]
                 rounds.append({"name": "%s/%s" % (os.path.basename(adir), n), "family": (ok[-1] if ok else {}).get("family") or rd.get("reviewer_family"),
-                               "fallback": rd.get("same_family_fallback") is True, "author": afam or unit_fam, "current": adir == cur,
+                               "fallback": rd.get("same_family_fallback") is True, "author": afam or cur_fam, "current": adir == cur,
                                "path": os.path.join(base, n, "round.json")})
-    if not rounds or unit_fam is None:
-        return run.add(cid, INCOMPLETE, base_ev, "no completed review round" if not rounds else "author family not in inv/*/intent.json")
+    if not run.load(cur, "judgment.json"):
+        return run.add(cid, INCOMPLETE, os.path.join(cur, "judgment.json"), "current attempt %s has no judgment" % os.path.basename(cur))
+    if cur_fam is None:
+        return run.add(cid, INCOMPLETE, base_ev, "author family not in the current attempt's inv/*/intent.json")
+    if not rounds:
+        return run.add(cid, INCOMPLETE, base_ev, "no completed review round")
     for r in rounds:
         if r["fallback"] or (r["family"] and r["family"] == r["author"]):
             return run.add(cid, FAIL, r["path"], "round %s is a same-family fallback (reviewer %s, author %s)" % (r["name"], r["family"], r["author"]))
-    wrong = [f for f in fams if f and want_a and f != want_a]
-    if wrong:
-        return run.add(cid, FAIL, base_ev, "author family %s, run requires %s" % (wrong[0], want_a))
+    if want_a and cur_fam != want_a:
+        return run.add(cid, FAIL, base_ev, "author family %s, run requires %s" % (cur_fam, want_a))
     for r in rounds:
-        if want_r and r["family"] and r["family"] != want_r:
+        if r["current"] and want_r and r["family"] and r["family"] != want_r:
             return run.add(cid, FAIL, r["path"], "round %s reviewer family %s, run requires %s" % (r["name"], r["family"], want_r))
     now = [r for r in rounds if r["current"]]
     if not now:
@@ -374,6 +402,9 @@ def check_job(run, uid):
     mode, done = run.expect.get("sacct", "any"), (j or {}).get("status") == "DONE"
     if mode == "answered":
         run.add("%s.sacct" % uid, PASS if sacct else INCOMPLETE, inv, "sacct answered" if sacct else "sacct never answered: the sacct-judged item is incomplete (D3)")
+    elif mode == "any" and "sacct" in run.expect:
+        run.add("%s.sacct" % uid, PASS if sacct else INCOMPLETE, inv,
+                "sacct answered" if sacct else "sacct never answered: the accounting claim is incomplete; the fallback is proved by the D3 run")
     elif mode == "unavailable":
         ok = done and silent and bool(set(answered) - {"sacct"})
         run.add("%s.sacct" % uid, PASS if ok else INCOMPLETE, inv,
@@ -425,8 +456,10 @@ def check_backend(run):
     ev = sp or os.path.join(run.state, "events.jsonl")
     if hits:
         run.add("no_slurm", FAIL, ev, "Slurm traces: %s" % hits)
+    elif "shim_log" not in run.expect:
+        return  # no shim log named (an off-cluster run): no no_slurm claim
     elif sp is None:
-        run.add("no_slurm", INCOMPLETE, ev, "state shows no Slurm use; no shim_log proves no call was attempted")
+        run.add("no_slurm", INCOMPLETE, ev, "shim_log is not a relative path under the project root")
     elif calls is None:
         run.add("no_slurm", INCOMPLETE, ev, "shim_log %s is missing or unreadable" % run.expect["shim_log"])
     else:
@@ -478,8 +511,11 @@ def evaluate(root, plan_id, expect):
     if not os.path.isdir(run.pdir):
         run.add("plan", INCOMPLETE, run.pdir, "no state for plan %s" % plan_id)
         return summary(run)
-    if run.load(run.pdir, "plan.json") in (None, False):
+    plan = run.load(run.pdir, "plan.json")
+    if plan in (None, False):
         run.add("plan", INCOMPLETE, os.path.join(run.pdir, "plan.json"), "plan.json missing or unreadable: units not known from the plan")
+    elif not isinstance(plan.get("units"), list) or not plan["units"]:
+        run.add("plan", INCOMPLETE, os.path.join(run.pdir, "plan.json"), "plan.json has no units list: units not known from the plan")
     code = guarded(run, "units", Run.unit_ids, "code_units", "code") or []
     jobs = guarded(run, "units", Run.unit_ids, "job_units", "job") or []
     guarded(run, "overlap", check_overlap, code)
