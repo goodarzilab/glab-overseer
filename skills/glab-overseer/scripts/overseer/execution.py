@@ -115,15 +115,6 @@ def _darwin_start(pid):
     return buf.raw[36] == 5, "%d.%06d" % (sec, usec)  # SZOMB is 5
 
 
-def _darwin_sysctl_usable():
-    """True when sysctl answers for this process with the known layout (computed once)."""
-    global _DARWIN_OK
-    if _DARWIN_OK is None:
-        _DARWIN_OK = sys.platform == "darwin" and isinstance(_darwin_start(os.getpid()), tuple)
-    return _DARWIN_OK
-
-
-_DARWIN_OK = None
 SYSCTL_START_RE = re.compile(r"^[0-9]+\.[0-9]{6}$")
 
 
@@ -132,8 +123,9 @@ def proc_start(pid, allow_zombie=False, like=None):
     microseconds; elsewhere: ps lstart), else None.
 
     `like` is a recorded identity to compare against: on macOS its format picks the source,
-    so an identity recorded by ps (older code, or an interpreter whose sysctl probe failed)
-    is still checked with ps."""
+    so an identity recorded by ps (older code, or a lookup where sysctl was unusable) is
+    still checked with ps. A sysctl record cannot be checked by ps; such a lookup does not
+    match, which reads as "not the recorded process" and never leads to a signal."""
     if not _int(pid):
         return None
     if os.path.isdir("/proc/self"):
@@ -146,11 +138,12 @@ def proc_start(pid, allow_zombie=False, like=None):
             return rest[19]
         except (OSError, ValueError, IndexError):
             return None
-    if _darwin_sysctl_usable() and (like is None or SYSCTL_START_RE.match(like)):
+    if sys.platform == "darwin" and (like is None or SYSCTL_START_RE.match(like)):
         got = _darwin_start(pid)
-        if not isinstance(got, tuple) or (got[0] and not allow_zombie):
+        if got is None:
             return None
-        return got[1]
+        if got is not _UNUSABLE:
+            return None if got[0] and not allow_zombie else got[1]
     ps = _ps_exe()
     if ps is None:
         return None

@@ -55,6 +55,10 @@ class Crash(Exception):
     pass
 
 
+def sysctl_usable():
+    return sys.platform == "darwin" and isinstance(X._darwin_start(os.getpid()), tuple)
+
+
 class Case(TmpCase):
     def setUp(self):
         super().setUp()
@@ -603,7 +607,7 @@ class CommandTests(Case):
             self.assertEqual(X._token_pids(self.rec(rec["dir"], "intent.json")["token"]), [])
 
     def test_start_identity_separates_processes_started_in_the_same_second(self):
-        if sys.platform == "darwin" and not X._darwin_sysctl_usable():
+        if sys.platform == "darwin" and not sysctl_usable():
             self.skipTest("the ps lstart fallback has one-second resolution")
         while time.time() % 1 > 0.5:  # start both well inside one wall-clock second
             time.sleep(0.01)
@@ -630,20 +634,19 @@ class CommandTests(Case):
         self.assertIsNone(X.proc_start(p.pid))
         self.assertEqual(X.proc_start(p.pid, allow_zombie=True), start)
 
-    def test_unusable_sysctl_falls_back_to_ps_for_every_call(self):
+    def test_unusable_sysctl_falls_back_to_ps(self):
         p = self.start_decoy()
-        with mock.patch.object(X, "_DARWIN_OK", None), \
-                mock.patch.object(X, "_darwin_start", return_value=X._UNUSABLE):
+        with mock.patch.object(X, "_darwin_start", return_value=X._UNUSABLE):
             start = X.proc_start(p.pid)
             self.assertTrue(start)
             self.assertTrue(X.identified_alive(p.pid, start))
-        if X._darwin_sysctl_usable():
+        if sysctl_usable():
             self.assertRegex(X.proc_start(p.pid), X.SYSCTL_START_RE)
             self.assertTrue(X.identified_alive(p.pid, start))  # a ps-recorded identity still matches
 
     def test_recorded_sysctl_identity_is_not_checked_with_ps(self):
         p = self.start_decoy()
-        if not X._darwin_sysctl_usable():
+        if not sysctl_usable():
             self.skipTest("needs the macOS sysctl identity")
         start = X.proc_start(p.pid)
         with mock.patch.object(X, "_ps_exe", side_effect=AssertionError("ps used")):
