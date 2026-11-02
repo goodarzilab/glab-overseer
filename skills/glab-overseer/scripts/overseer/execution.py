@@ -82,8 +82,35 @@ def _ps_exe():
     return None
 
 
+def _darwin_start(pid):
+    """(zombie, "sec.usec") from sysctl KERN_PROC_PID on macOS; None if absent or unreadable.
+
+    `ps -o lstart` has one-second resolution, so a pid reused within the same second as the
+    recorded start would pass as the recorded process. kinfo_proc.kp_proc begins with the
+    p_starttime timeval (16 bytes on 64-bit), and p_stat is the char at offset 36.
+    """
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        buf = ctypes.create_string_buffer(1024)  # sizeof(struct kinfo_proc) is 648
+        size = ctypes.c_size_t(ctypes.sizeof(buf))
+        if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            return None
+    except (OSError, AttributeError):
+        return None
+    if size.value != 648:  # 0: no such pid; anything else: a layout this code does not know
+        return None
+    sec = int.from_bytes(buf.raw[0:8], sys.byteorder, signed=True)
+    usec = int.from_bytes(buf.raw[8:12], sys.byteorder, signed=True)
+    if sec <= 0 or not 0 <= usec < 1000000:
+        return None
+    return buf.raw[36] == 5, "%d.%06d" % (sec, usec)  # SZOMB is 5
+
+
 def proc_start(pid, allow_zombie=False):
-    """Start identity of `pid` (Linux: /proc stat starttime; macOS: ps lstart), else None."""
+    """Start identity of `pid` (Linux: /proc stat starttime; macOS: sysctl p_starttime in
+    microseconds; elsewhere: ps lstart), else None."""
     if not _int(pid):
         return None
     if os.path.isdir("/proc/self"):
@@ -96,6 +123,11 @@ def proc_start(pid, allow_zombie=False):
             return rest[19]
         except (OSError, ValueError, IndexError):
             return None
+    if sys.platform == "darwin":
+        got = _darwin_start(pid)
+        if got is None or (got[0] and not allow_zombie):
+            return None
+        return got[1]
     ps = _ps_exe()
     if ps is None:
         return None

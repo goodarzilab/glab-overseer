@@ -51,7 +51,7 @@ class Case(U5.Case):
         out = os.path.join(self.tmp, name + ".out")
         with open(out, "w") as f:
             f.write(payload if isinstance(payload, str) else json.dumps(payload))
-        self.author('echo "%s|$PWD|$*|$(ls -A | wc -l)" >> %s; cat %s; exit %d' % (name, self.log, out, rc), name)
+        self.author('echo "%s|$PWD|$*|$(($(ls -A | wc -l)))" >> %s; cat %s; exit %d' % (name, self.log, out, rc), name)
 
     def calls(self):
         try:

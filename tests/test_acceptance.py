@@ -74,7 +74,7 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(rj(os.path.join(out, "plan.json"))["target_branch"], "run1")
         r = validate(os.path.join(out, "plan.json"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.make("g", "--target", "Bad/Branch")
 
     def test_tests_fail_at_base(self):

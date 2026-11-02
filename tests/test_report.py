@@ -333,7 +333,8 @@ class PrivateCompletenessTests(ReportCase):
         got = self.files()
         self.assertEqual(set(got), want)
         for rel, e in got.items():
-            data = open(os.path.join(base, rel), "rb").read()
+            with open(os.path.join(base, rel), "rb") as f:
+                data = f.read()
             self.assertEqual((e["size"], e["sha256"]), (len(data), hashlib.sha256(data).hexdigest()), rel)
         log = got["plans/demo/units/alpha/attempts/a1/inv/01-author/stdout.log"]
         self.assertEqual(log["text"], "unique-worker-log-canary\n")

@@ -13,12 +13,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        python-version: ["3.9", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - name: Configure git for tests
         run: |
           git config --global --add safe.directory '*'
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+  test-macos:
+    # macOS has no /proc: this job exercises the sysctl start identity and the ps fallbacks.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Configure git for tests
+        run: |
           git config --global user.name ci
           git config --global user.email ci@localhost
       - name: Run tests

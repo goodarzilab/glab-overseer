@@ -12,6 +12,12 @@ from test_u7 import GhCase, SHIM
 
 from overseer import approval, controller as C, execution as X, github as G, paths, review as R, store, workspace as W
 
+
+def rd(path, mode="r"):
+    with open(path, mode) as f:
+        return f.read()
+
+
 DONE_JSON = "echo '[{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"s\"}]'"
 OWN = 'case "$PWD" in */units/ub/*) U=ub;; *) U=ua;; esac; '
 AUTHOR = OWN + 'mkdir -p src tests; echo $U > src/$U.py; echo t > tests/test_$U.py; git add src tests; %s; %s' % (COMMIT, DONE_JSON)
@@ -571,7 +577,7 @@ class Round1(MergeCase):
                      ["totally-unknown"]):
             with self.assertRaises(W.DestructiveGit, msg=argv):
                 W.git(repo, *argv)
-        self.assertEqual((sh(repo, "rev-parse", "HEAD"), open(os.path.join(repo, "f.txt")).read()), (head, "dirty\n"))
+        self.assertEqual((sh(repo, "rev-parse", "HEAD"), rd(os.path.join(repo, "f.txt"))), (head, "dirty\n"))
         for argv in (["status", "--porcelain=v1"], ["-c", "user.name=x", "rev-parse", "HEAD"], ["--literal-pathspecs", "ls-files"]):
             self.assertIsNone(W.destructive_reason(argv), argv)
 
@@ -592,7 +598,7 @@ class Round1(MergeCase):
         self.put("src/ub.py", "tampered\n", base=self.wtree("ub"))
         rc, _, err = self.cli("merge", "ub")
         self.assertEqual((rc, "not clean" in err, self.head("ub")), (1, True, before), err)
-        self.assertEqual(open(os.path.join(self.wtree("ub"), "src/ub.py")).read(), "tampered\n")
+        self.assertEqual(rd(os.path.join(self.wtree("ub"), "src/ub.py")), "tampered\n")
 
     def test_f7_resume_aborts_its_own_half_done_merge_then_completes(self):
         self.interrupted_integration()
@@ -710,7 +716,7 @@ class Round2(MergeCase):
         adir = os.path.join(self.tmp, "att")
         nv, dec = os.path.join(adir, "nonvacuous.json"), os.path.join(adir, "reviews", "orchestrator_decision.json")
         store.write_json_atomic(nv, {"candidate": "c2", "status": "FAIL"})
-        digest = hashlib.sha256(open(nv, "rb").read()).hexdigest()
+        digest = hashlib.sha256(rd(nv, "rb")).hexdigest()
         rs = {"orchestrator_decision": True}
 
         def decide(cand, dig):
@@ -777,7 +783,7 @@ class Round3(MergeCase):
         self.assertEqual((rc, "non-vacuity FAIL" in err, self.merged_count()), (1, True, 0), err)
         self.assertEqual(self.cli("dispositions", "ua", "--orchestrator-decision", "after the FAIL")[0], 0)
         self.assertEqual(jload(os.path.join(adir, "reviews", "orchestrator_decision.json"))["nonvacuous_sha256"],
-                         hashlib.sha256(open(nv, "rb").read()).hexdigest())
+                         hashlib.sha256(rd(nv, "rb")).hexdigest())
         self.assertEqual(self.cli("merge", "ua")[0], 0)
 
     def one_job_plan(self, pid="demo", uid="j1"):
