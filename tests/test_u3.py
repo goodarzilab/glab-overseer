@@ -118,9 +118,9 @@ class Case(TmpCase):
         self.fail("timeout; last status %r" % (X.invocation_status(inv),))
 
     def wait_file(self, path, timeout=10):
-        end = time.time() + timeout
+        end = time.monotonic() + timeout
         while not os.path.exists(path):
-            if time.time() > end:
+            if time.monotonic() > end:
                 self.fail("timeout waiting for %s" % path)
             time.sleep(0.02)
 
@@ -627,6 +627,16 @@ class CommandTests(Case):
             time.sleep(0.02)
         self.assertIsNone(X.proc_start(p.pid))
         self.assertEqual(X.proc_start(p.pid, allow_zombie=True), start)
+
+    def test_unusable_sysctl_falls_back_to_ps_for_every_call(self):
+        p = self.start_decoy()
+        with mock.patch.object(X, "_DARWIN_OK", None), \
+                mock.patch.object(X, "_darwin_start", return_value=X._UNUSABLE):
+            start = X.proc_start(p.pid)
+            self.assertTrue(start)
+            self.assertTrue(X.identified_alive(p.pid, start))
+        if sys.platform == "darwin":  # sysctl usable: the identity carries microseconds
+            self.assertRegex(X.proc_start(p.pid), r"^[0-9]+\.[0-9]{6}$")
 
     def test_abort_without_proc_and_dead_wrapper_is_unidentified(self):
         rec = self.launch("j1", [self.script("pl", "sleep 30")])
