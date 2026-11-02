@@ -39,7 +39,7 @@ An output is a path string or an object `{"path", "min_bytes", "sha256", "valida
   "scope": ["src/**", "tests/**", "docs/*.md", "workflow/**"],
   "caps": {"workers": 3, "attempts": 2, "review_rounds": 3},
   "test_globs": ["tests/**", "test_*.py"],
-  "slurm": {"partition": "cpu_batch", "account": "lab", "time": "02:00:00", "cpus": 4, "mem": "16G"},
+  "slurm": {"partition": "batch-cpu", "account": "lab", "time": "02:00:00", "cpus": 4, "mem": "16G"},
   "units": [
     {
       "id": "counter",
