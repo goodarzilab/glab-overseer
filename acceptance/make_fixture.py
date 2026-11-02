@@ -18,6 +18,7 @@ import sys
 
 PLACEHOLDERS = ("__REPO__", "__PARTITION__", "__ACCOUNT__", "__TIME__", "__MEM__", "__CPUS__")
 PLAN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+TARGET_RE = PLAN_ID_RE
 
 FILES = {
     ".gitignore": "__pycache__/\n*.pyc\n.pytest_cache/\nplan.json\nplan.template.json\nexpect*.json\nresult.csv\n",
@@ -102,11 +103,11 @@ COUNT_PROMPT = (
     "Do not push.")
 
 
-def template(plan_id, no_slurm, job_only=False):
+def template(plan_id, no_slurm, job_only=False, target="main"):
     plan = {
         "plan_id": plan_id,
         "repo": "__REPO__",
-        "target_branch": "main",
+        "target_branch": target,
         "scope": ["textkit/**", "tests/**", "CHANGELOG.md", "scripts/**"],
         "caps": {"workers": 3, "attempts": 2, "review_rounds": 3},
         "test_globs": ["tests/**"],
@@ -179,7 +180,7 @@ def values_from(args):
             "__TIME__": args.time, "__MEM__": args.mem, "__CPUS__": args.cpus}
 
 
-def make(out, plan_id, no_slurm, values, job_only=False):
+def make(out, plan_id, no_slurm, values, job_only=False, target="main"):
     if os.path.exists(out) and os.listdir(out):
         raise SystemExit("%s exists and is not empty" % out)
     os.makedirs(out, exist_ok=True)
@@ -189,10 +190,10 @@ def make(out, plan_id, no_slurm, values, job_only=False):
         with open(p, "w", encoding="utf-8") as f:
             f.write(text)
     git(out, "init", "-q")
-    git(out, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(out, "symbolic-ref", "HEAD", "refs/heads/" + target)
     git(out, "add", "-A")
     git(out, "commit", "-q", "-m", "Initial fixture: two failing tasks and one job")
-    tmpl = template(plan_id, no_slurm, job_only)
+    tmpl = template(plan_id, no_slurm, job_only, target)
     write_json(os.path.join(out, "plan.template.json"), tmpl)
     write_json(os.path.join(out, "plan.json"), render(tmpl, values))
 
@@ -205,6 +206,8 @@ def main(argv=None):
     ap.add_argument("--job-only", action="store_true", help="plan with two job units and no code units")
     ap.add_argument("--plan-only", action="store_true", help="re-render plan.json from plan.template.json; no git")
     ap.add_argument("--repo", help="owner/name")
+    ap.add_argument("--target", default="main",
+                    help="target branch, default main; one branch per run lets runs share one repository")
     ap.add_argument("--partition")
     ap.add_argument("--account")
     ap.add_argument("--time", help="finite walltime, e.g. 00:30:00")
@@ -213,6 +216,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.plan_id is not None and not PLAN_ID_RE.match(a.plan_id):
         ap.error("--plan-id must match ^[a-z0-9][a-z0-9_-]{0,63}$")
+    if not TARGET_RE.match(a.target):
+        ap.error("--target must match ^[a-z0-9][a-z0-9_-]{0,63}$")
     out = os.path.abspath(a.out_dir)
     vals = values_from(a)
     if a.plan_only:
@@ -224,7 +229,7 @@ def main(argv=None):
             tmpl.pop("slurm", None)
         write_json(os.path.join(out, "plan.json"), render(tmpl, vals))
     else:
-        make(out, a.plan_id or "accept-run1", a.no_slurm, vals, a.job_only)
+        make(out, a.plan_id or "accept-run1", a.no_slurm, vals, a.job_only, a.target)
     print("wrote %s" % os.path.join(out, "plan.json"))
     return 0
 

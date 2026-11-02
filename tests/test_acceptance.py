@@ -68,6 +68,15 @@ class FixtureTests(unittest.TestCase):
         self.assertNotIn("account", plan["slurm"])
         self.assertEqual([u["kind"] for u in plan["units"]], ["code", "code", "job"])
 
+    def test_target_branch(self):
+        out = self.make("f", "--plan-id", "run-b", "--target", "run1")
+        self.assertEqual(git(out, "symbolic-ref", "--short", "HEAD").stdout.strip(), b"run1")
+        self.assertEqual(rj(os.path.join(out, "plan.json"))["target_branch"], "run1")
+        r = validate(os.path.join(out, "plan.json"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with self.assertRaises(SystemExit):
+            self.make("g", "--target", "Bad/Branch")
+
     def test_tests_fail_at_base(self):
         out = self.make()
         for pat in ("test_slug.py", "test_count.py"):

@@ -14,17 +14,19 @@ python3 $ACC/check_run.py $PROJ PLAN_ID --expect $PROJ/expect.json [--json]
 ACC=<checkout>/acceptance
 OV="python3 <installed skill dir>/scripts/overseer.py"
 PROJ=<shared-storage dir, one per run; never /tmp, /var/tmp or $TMPDIR>
-REPO=goodarzilab/<throwaway>-r1      # one throwaway repository per run (-r2, -r3)
+REPO=goodarzilab/<throwaway>         # one private throwaway repository for all runs
+TGT=run1                             # one target branch per run: run1, d3, run2, run3
 ```
 
 Needs `gh` with rights on the throwaway repository, `claude` (and `agy` for Run 3) logged in by subscription, and no `*_API_KEY` variable. Pass site values on the command line; none is committed here.
 
 ```
-python3 $ACC/make_fixture.py $PROJ --plan-id accept-run1 --repo $REPO --partition $PART [--account $ACCT] --time 00:30:00 --mem 8G --cpus 2
-cd $PROJ && gh repo create $REPO --private --source=. --remote=origin --push     # orchestrator step, covered by O8
+python3 $ACC/make_fixture.py $PROJ --plan-id accept-run1 --target $TGT --repo $REPO --partition $PART [--account $ACCT] --time 00:30:00 --mem 8G --cpus 2
+gh repo create $REPO --private --add-readme      # once, before the first run; orchestrator step, covered by O8
+cd $PROJ && git remote add origin https://github.com/$REPO.git && git push -u origin $TGT
 ```
 
-Evidence: `plan.json`; one commit on `main`. The job needs both code units, so it runs last. Both code units add a line to `CHANGELOG.md` in separate sections, so the second merge integrates cleanly.
+Evidence: `plan.json`; one commit on `$TGT`. The target is not the repository's default branch, so `Closes #N` does not auto-close issues; `merge` closes them explicitly, which the tracker claims check. The job needs both code units, so it runs last. Both code units add a line to `CHANGELOG.md` in separate sections, so the second merge integrates cleanly.
 
 ## 1. Run 1: Claude Code on the cluster, Slurm backend
 
@@ -54,7 +56,7 @@ Work in an interactive allocation on shared storage, never on a login node. Star
 A job-only plan in its own project and repository, in an allocation:
 
 ```
-python3 $ACC/make_fixture.py $PROJ2 --job-only --plan-id accept-d3 --repo $REPO --partition $PART [--account $ACCT] --time 00:10:00 --mem 4G --cpus 1
+python3 $ACC/make_fixture.py $PROJ2 --job-only --plan-id accept-d3 --target d3 --repo $REPO --partition $PART [--account $ACCT] --time 00:10:00 --mem 4G --cpus 1
 ```
 
 1. Run 1 steps 1, 4 and 6 for `accept-d3` (survey on the full PATH, so `survey.json` records Slurm usable).
@@ -84,7 +86,7 @@ Evidence: `judgment.json` UNCERTAIN; `$OV status` shows the slot held. If a fini
 
 ## 3. Run 2: Slurm hidden, local backend
 
-Inside an allocation, with `python3 $ACC/make_fixture.py $PROJ3 --no-slurm --plan-id accept-run2 --repo $REPO ...`.
+Inside an allocation, with `python3 $ACC/make_fixture.py $PROJ3 --no-slurm --plan-id accept-run2 --target run2 --repo $REPO ...`.
 
 The login-node guard refuses a local agent launch only when `sbatch` resolves on `PATH` and `SLURM_JOB_ID` is unset. Inside an allocation `SLURM_JOB_ID` is set, so the guard allows the launch whatever `PATH` holds; with Slurm tools removed from `PATH`, `sbatch` does not resolve and there is nothing to refuse. `OVERSEER_DISABLE_SLURM=1` makes the backend local even when a cached `survey.json` said Slurm was usable.
 
@@ -106,7 +108,7 @@ Any Slurm call by the supervisor or a worker lands in `slurm-calls.log`.
 
 ## 4. Run 3: Antigravity host
 
-1. `make_fixture.py $PROJ4 --plan-id accept-run3 --repo $REPO ...` as in Section 0 (`--no-slurm` off-cluster).
+1. `make_fixture.py $PROJ4 --plan-id accept-run3 --target run3 --repo $REPO ...` as in Section 0 (`--no-slurm` off-cluster).
 2. `$OV models --host google`. Evidence: `models.json` (argon-tier author at high, Claude `haiku` reviewer, dated).
 3. Start the orchestrator as an `agy -p` session given SKILL.md and the Run 1 step list. The prompt must directly follow `-p` (P13):
 
