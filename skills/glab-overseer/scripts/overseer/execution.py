@@ -116,8 +116,7 @@ def _darwin_start(pid):
 
 
 def _darwin_sysctl_usable():
-    """True when sysctl answers for this process with the known layout; computed once, so a
-    host never mixes sysctl and ps identities between recording and checking."""
+    """True when sysctl answers for this process with the known layout (computed once)."""
     global _DARWIN_OK
     if _DARWIN_OK is None:
         _DARWIN_OK = sys.platform == "darwin" and isinstance(_darwin_start(os.getpid()), tuple)
@@ -125,11 +124,16 @@ def _darwin_sysctl_usable():
 
 
 _DARWIN_OK = None
+SYSCTL_START_RE = re.compile(r"^[0-9]+\.[0-9]{6}$")
 
 
-def proc_start(pid, allow_zombie=False):
+def proc_start(pid, allow_zombie=False, like=None):
     """Start identity of `pid` (Linux: /proc stat starttime; macOS: sysctl p_starttime in
-    microseconds; elsewhere: ps lstart), else None."""
+    microseconds; elsewhere: ps lstart), else None.
+
+    `like` is a recorded identity to compare against: on macOS its format picks the source,
+    so an identity recorded by ps (older code, or an interpreter whose sysctl probe failed)
+    is still checked with ps."""
     if not _int(pid):
         return None
     if os.path.isdir("/proc/self"):
@@ -142,7 +146,7 @@ def proc_start(pid, allow_zombie=False):
             return rest[19]
         except (OSError, ValueError, IndexError):
             return None
-    if _darwin_sysctl_usable():
+    if _darwin_sysctl_usable() and (like is None or SYSCTL_START_RE.match(like)):
         got = _darwin_start(pid)
         if not isinstance(got, tuple) or (got[0] and not allow_zombie):
             return None
@@ -168,7 +172,7 @@ def identified_alive(pid, start):
     if not (_int(pid) and isinstance(start, str) and start):
         return False
     _reap(pid)
-    return proc_start(pid) == start
+    return proc_start(pid, like=start) == start
 
 
 def find_by_script(script):
