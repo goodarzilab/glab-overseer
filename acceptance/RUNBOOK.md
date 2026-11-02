@@ -103,7 +103,7 @@ The login-node guard refuses a local agent launch only when `sbatch` resolves on
 
 ```
 BIN=$PROJ3/.bin; SH=$PROJ3/.shims; export SHIM_LOG=$PROJ3/slurm-calls.log; mkdir -p $BIN $SH; : > $SHIM_LOG
-for t in python3 git gh claude agy node bash env sh date hostname uname cat head tail wc test grep sed awk tr tee mv cp rm mkdir ls find mktemp readlink dirname basename sleep ps kill id stat xargs; do
+for t in python3 git gh claude agy node bash env sh date hostname uname cat head tail wc test grep sed awk tr tee mv cp rm mkdir ls find mktemp readlink dirname basename sleep ps kill id stat xargs chmod touch true false seq cut; do
   p=$(type -P $t) && ln -sf "$p" $BIN/$t; done
 for t in sbatch squeue scontrol sacct sinfo scancel srun salloc; do
   printf '#!/bin/sh\necho "$(date -u +%%FT%%TZ) %s $*" >> "$SHIM_LOG"\nexit 127\n' $t > $SH/$t; chmod +x $SH/$t; done
@@ -161,7 +161,7 @@ PATH=$SHD:$PATH $OV merge slug; echo "exit $?"        # SIGKILL, exit 137
 ## 6. Allocation loss
 
 1. In an allocation with an approved, handshaken Slurm plan: `$OV dispatch --unit slug` (a batch author). Record `inv/01-author/launch.json` and `$OV status`.
-2. End the allocation and the orchestrator session while the author runs (never cancel the batch job). Evidence: `squeue` from elsewhere.
+2. End the allocation and the orchestrator session while the author runs (never cancel the batch job). Evidence: `squeue` from elsewhere. A session cannot end its own allocation, so an equivalent is to run step 1 inside a short launcher batch job (`sbatch` a script that runs `$OV dispatch --unit slug` and `$OV status`, then exits): its allocation ends seconds after the dispatch while the author is queued or running. Evidence: the launcher's start and end times, and `squeue` showing the author after the launcher is gone.
 3. In a new allocation and a new session in the same project: `$OV status`, `$OV next`, `$OV wait`, `$OV judge slug`. Expected: the wrapper's `exit.json`, a DONE judgment, no manual edit. Evidence: `inv/01-author/exit.json`, `judgment.json`, `events.jsonl`.
 4. `check_run` has no claim for this case; the evidence files above are the proof. If the author died with the allocation, report it INCOMPLETE and repeat with a longer walltime.
 

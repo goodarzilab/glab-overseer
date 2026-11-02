@@ -84,6 +84,19 @@ class FixtureTests(unittest.TestCase):
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertNotEqual(r.returncode, 0, pat)
 
+    def test_changelog_check_needs_a_new_bullet(self):
+        # live Run 3 review: a bare `grep -q slugify` matched the existing heading, so it checked nothing
+        out = self.make()
+        plan = rj(os.path.join(out, "plan.json"))
+        for u, word in (("slug", "slugify"), ("count", "word_count")):
+            check = next(x for x in plan["units"] if x["id"] == u)["test_command"].split("&& ", 1)[1]
+            self.assertNotEqual(subprocess.run(["bash", "-c", check], cwd=out).returncode, 0, u)
+            with open(os.path.join(out, "CHANGELOG.md")) as f:
+                text = f.read()
+            with open(os.path.join(out, "CHANGELOG.md"), "w") as f:
+                f.write(text.replace("- package skeleton\n", "- package skeleton\n- add %s\n" % word, 1))
+            self.assertEqual(subprocess.run(["bash", "-c", check], cwd=out).returncode, 0, u)
+
     def test_job_script_and_validator(self):
         out, o = self.make(), os.path.join(self.tmp, "o")
         subprocess.check_call([sys.executable, "scripts/summarize.py"], cwd=out, env=dict(os.environ, OVERSEER_OUT=o))
