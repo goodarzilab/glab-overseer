@@ -11,6 +11,8 @@ import sys
 
 from . import approval, execution, judge, models, paths, plan as P, review, slurm, store, survey
 
+from . import github as _github  # noqa: E402
+
 COMMANDS = {}  # name -> dict(help, configure, run), in registration order
 
 
@@ -150,13 +152,12 @@ register("fix", "launch a fixer in the unit's worktree", review.configure_fix, r
 register("nonvacuous", "check that the tests fail without the non-test changes",
          review.configure_nonvacuous, review.run_nonvacuous)
 for _name, _help in [
-    ("issues", "file issues from an approved plan (U7)"),
-    ("pr", "open a pull request for a judged unit (U7)"),
     ("merge", "merge an approved pull request (U8)"),
     ("next", "print the next action (U8)"),
     ("report", "write the evidence report (U9)"),
 ]:
     register(_name, _help)
+_github.register_commands(register)
 
 
 def _stub(name):
