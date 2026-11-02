@@ -1,6 +1,6 @@
 # Acceptance runbook (U10: O8, D3)
 
-Numbered commands per run, with the evidence to capture after each step. Evidence paths are relative to the run's project root. After a run, evaluate it from state alone:
+Numbered commands per run, with the evidence to capture after each step. Run them in bash: the tool loops use `type -P`, which prints the executable path even where a name is also a shell function, alias or builtin (`command -v` returns the bare name for those, which leaves a broken symlink). Evidence paths are relative to the run's project root. After a run, evaluate it from state alone:
 
 ```
 python3 $ACC/check_run.py $PROJ PLAN_ID --expect $PROJ/expect.json [--json]
@@ -68,7 +68,7 @@ cd $PROJ2 && PLAN=accept-d3 && git remote add origin https://github.com/$REPO.gi
 ```
 mkdir -p $PROJ2/.nosacct
 for t in sbatch squeue scontrol sinfo scancel srun python3 git gh bash env sh date hostname uname cat head wc test; do
-  p=$(command -v $t) && ln -sf "$p" $PROJ2/.nosacct/$t; done
+  p=$(type -P $t) && ln -sf "$p" $PROJ2/.nosacct/$t; done
 ```
 
 4. `PATH=$PROJ2/.nosacct $OV judge summarize` (do not rerun `survey` in this shell). Expected: scontrol no longer knows the job, the sacct query is made and fails because the tool is missing, and the judgment is DONE from the wrapper `exit.json` and the outputs. The claim `sacct` passes only when `evidence.json` has a `sacct` entry showing the query was made and did not answer; if scontrol still answered (the job was polled or judged before `MinJobAge` passed), the entry is null and the claim is INCOMPLETE (report it as printed). Evidence: `inv/01-job/evidence.json` (sacct outcome not answered, `sacct_ever_answered` false), `judgment.json`.
@@ -77,7 +77,7 @@ for t in sbatch squeue scontrol sinfo scancel srun python3 git gh bash env sh da
 ```
 INV=.overseer/plans/accept-d3/units/summarize-lost/attempts/a1/inv/01-job
 mv $INV/exit.json $INV/exit.json.hold
-mkdir -p $PROJ2/.noslurm; for t in python3 git bash env sh date hostname uname cat head wc test; do ln -sf "$(command -v $t)" $PROJ2/.noslurm/$t; done
+mkdir -p $PROJ2/.noslurm; for t in python3 git bash env sh date hostname uname cat head wc test; do ln -sf "$(type -P $t)" $PROJ2/.noslurm/$t; done
 PATH=$PROJ2/.noslurm $OV judge summarize-lost          # exit 4, UNCERTAIN
 ```
 
@@ -103,8 +103,8 @@ The login-node guard refuses a local agent launch only when `sbatch` resolves on
 
 ```
 BIN=$PROJ3/.bin; SH=$PROJ3/.shims; export SHIM_LOG=$PROJ3/slurm-calls.log; mkdir -p $BIN $SH; : > $SHIM_LOG
-for t in python3 git gh claude agy node bash env sh date hostname uname cat head wc test grep sed awk tr tee mv cp rm mkdir ls find mktemp readlink dirname basename sleep ps kill id stat xargs; do
-  p=$(command -v $t) && ln -sf "$p" $BIN/$t; done
+for t in python3 git gh claude agy node bash env sh date hostname uname cat head tail wc test grep sed awk tr tee mv cp rm mkdir ls find mktemp readlink dirname basename sleep ps kill id stat xargs; do
+  p=$(type -P $t) && ln -sf "$p" $BIN/$t; done
 for t in sbatch squeue scontrol sacct sinfo scancel srun salloc; do
   printf '#!/bin/sh\necho "$(date -u +%%FT%%TZ) %s $*" >> "$SHIM_LOG"\nexit 127\n' $t > $SH/$t; chmod +x $SH/$t; done
 export OVERSEER_DISABLE_SLURM=1 PATH=$BIN:$SH
@@ -142,7 +142,7 @@ The controller writes `merge.json` (state `intent`) before `gh pr merge` and rec
 1. At the point before `merge slug` (steps 1 to 13 of Run 1 done up to `pr slug`):
 
 ```
-REAL_GH=$(command -v gh); SHD=$PROJ/.gh-shim; mkdir -p $SHD
+REAL_GH=$(type -P gh); SHD=$PROJ/.gh-shim; mkdir -p $SHD
 cat > $SHD/gh <<'EOF'
 #!/bin/sh
 echo "gh $*" >> "$GH_LOG"
