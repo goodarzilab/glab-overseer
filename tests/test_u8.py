@@ -419,6 +419,16 @@ class Tracker(MergeCase):
                 mock.patch.object(X, "missing_merges", return_value=[("ub", "f" * 40)]):
             with self.assertRaisesRegex(X.ExecutionError, r"shallow, so first `git fetch --unshallow origin`"):
                 X.dispatch_job(shallow, "demo", {"id": "jc"})
+        plan = {"target_branch": "main;touch${IFS}PWNED;true", "units": []}
+        failing = mock.Mock(side_effect=W.GitError("git rev-parse failed (rc 129): unknown option"))
+        with mock.patch.object(X.approval, "effective_plan", return_value=plan), \
+                mock.patch.object(X, "missing_merges", return_value=[("ub", "f" * 40)]), \
+                mock.patch.object(W, "git", failing):  # git < 2.15: no --is-shallow-repository
+            with self.assertRaises(X.ExecutionError) as cm:
+                X.dispatch_job(shallow, "demo", {"id": "jc"})
+        msg = str(cm.exception)
+        self.assertIn("`git pull --ff-only origin 'main;touch${IFS}PWNED;true'`", msg)
+        self.assertNotIn("unshallow", msg)
 
     def test_job_unit_closes_on_done_judgment_not_on_exit(self):
         self.plan()

@@ -674,9 +674,12 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     stale = missing_merges(root, plan_id, plan, unit)
     if stale:
         from . import workspace as W
-        target = plan["target_branch"]
+        target = shlex.quote(plan["target_branch"])  # the advice is meant to be pasted into a shell
         fix = "on branch %s: `git pull --ff-only origin %s`" % (target, target)
-        shallow = W.git(root, "rev-parse", "--is-shallow-repository", ok=(0, 128))["stdout"].strip() == "true"
+        try:  # git before 2.15 has no --is-shallow-repository: the advice then omits unshallow
+            shallow = W.git(root, "rev-parse", "--is-shallow-repository", ok=(0,))["stdout"].strip() == "true"
+        except W.GitError:
+            shallow = False
         if shallow:  # ancestry cannot be shown across a shallow boundary, and pull does not lift it
             fix = "the checkout is shallow, so first `git fetch --unshallow origin`, then " + fix
         raise ExecutionError(
