@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import stat
 
 from . import approval, controller, execution as X, judge as J, paths, plan as P, review as R, store, workspace as W
@@ -21,7 +22,8 @@ WORD_RE = re.compile(r"^[A-Za-z0-9_]{1,40}$")
 MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+)$")
 FAMILY = {"claude": "claude", "agy": "google", "google": "google"}
 BACKENDS = ("local", "slurm")
-LIST_ONLY_DIRS = ("worktree", ".git")  # git checkouts: listed with size and digest, content not inlined
+INLINE_MAX = 16 * 1024 * 1024  # a larger file is copied by streaming into <out>/files/ instead of inlined
+LIST_ONLY_DIRS = ("worktree", ".git")  # committed worktree files and .git: listed with size and digest, recoverable from commits
 
 
 def _int(v):
@@ -114,14 +116,25 @@ def _outputs(root, wt, adir, unit, j, gaps):
                     gaps.add(unit["id"], "output %s changed since judgment" % p)
             out.append(entry)
             continue
+        rec_size, rec_digest = _int(o.get("size")), _sha(o.get("sha256"))
+        cur = None  # (size, digest) of the candidate blob, when the worktree is still here
         try:
             if ok and isinstance(j.get("candidate"), str) and wt:
                 blob = W.git(wt, "--literal-pathspecs", "cat-file", "blob", "%s:%s" % (j["candidate"], p), raw=True)["stdout"]
-                size, digest = len(blob), hashlib.sha256(blob).hexdigest()
+                cur = (len(blob), hashlib.sha256(blob).hexdigest())
         except (OSError, ValueError, W.GitError, X.ExecutionError):
             pass
-        if ok and digest is None:
-            gaps.add(unit["id"], "output %s size and digest unavailable" % p)
+        if ok and rec_size is not None and rec_digest is not None:
+            size, digest = rec_size, rec_digest  # recorded at judgment time: no worktree needed
+            if cur is not None:
+                entry["changed_since_judgment"] = cur != (rec_size, rec_digest)
+                if entry["changed_since_judgment"]:
+                    gaps.add(unit["id"], "output %s changed since judgment" % p)
+        else:
+            if cur is not None:
+                size, digest = cur
+            if ok and digest is None:
+                gaps.add(unit["id"], "output %s size and digest unavailable" % p)
         entry.update(size=size, sha256=digest)
         out.append(entry)
     return out
@@ -313,17 +326,44 @@ def public_report(root):
 
 # ---- private -----------------------------------------------------------------
 
-def _file_entry(f, rel_in_listonly):
-    """One regular file: size and sha256 always, and its whole content (text, parsed JSON or base64)."""
+def _file_entry(f, rel, listed_only, out_dir):
+    """One regular file: size and sha256 (streamed), and its whole content.
+
+    Content up to INLINE_MAX is inlined (text, parsed JSON or base64). A larger file is copied by streaming
+    to <out_dir>/files/<rel> and recorded as `copied_to`; memory stays bounded either way.
+    """
     try:
+        h, n = hashlib.sha256(), 0
         with open(f, "rb") as fh:
-            data = fh.read()
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+                n += len(block)
+        e = {"size": n, "sha256": h.hexdigest()}
+        if listed_only:
+            e["listed_only"] = True
+            return e
+        if n > INLINE_MAX:
+            if out_dir is None:
+                e["copied_to"] = None
+                e["not_copied"] = "no output directory"
+                return e
+            dest = os.path.join(out_dir, "files", rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + ".tmp"
+            h2, n2 = hashlib.sha256(), 0
+            with open(f, "rb") as src, open(tmp, "wb") as dst:
+                for block in iter(lambda: src.read(1 << 20), b""):
+                    h2.update(block)
+                    n2 += len(block)
+                    dst.write(block)
+            os.replace(tmp, dest)
+            e.update(size=n2, sha256=h2.hexdigest(), copied_to=os.path.join("files", rel))
+            return e
+        with open(f, "rb") as fh:
+            data = fh.read(n + 1)  # n <= INLINE_MAX; never preallocate the limit
     except OSError as ex:
         return {"unreadable": str(ex)}
-    e = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-    if rel_in_listonly:
-        e["listed_only"] = True
-        return e
+    e.update(size=len(data), sha256=hashlib.sha256(data).hexdigest())
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -339,14 +379,56 @@ def _file_entry(f, rel_in_listonly):
     return e
 
 
-def private_section(root):
-    """Every regular file under .overseer/ (except the report directory itself) with relative path, size and digest."""
+def _worktree_root(rel_d):
+    """The attempt worktree directory (relative, as a parts list) that rel_d is inside, or None."""
+    parts = rel_d.split(os.sep)
+    for i, part in enumerate(parts):
+        if part == "worktree" and i >= 2 and parts[i - 2] == "attempts":
+            return parts[:i + 1]
+    return None
+
+
+def _dirty_files(wt):
+    """Relative paths of modified or untracked files in a worktree, or an error string."""
+    if not os.path.exists(os.path.join(wt, ".git")):
+        return None, "not a git checkout (no .git)"
+    try:
+        out = W.git(wt, "status", "--porcelain", "-z", "--untracked-files=all", raw=True)["stdout"]
+    except (OSError, ValueError, W.GitError, X.ExecutionError) as ex:
+        return None, str(ex)
+    dirty, entries, i = set(), out.split(b"\0"), 0
+    while i < len(entries):
+        ent = entries[i]
+        i += 1
+        if len(ent) < 4:
+            continue
+        xy, path = ent[:2].decode("ascii", "replace"), ent[3:].decode("utf-8", "replace")
+        if "R" in xy or "C" in xy:
+            i += 1  # the original path follows a rename or copy
+        dirty.add(path)
+    return dirty, None
+
+
+def private_section(root, out_dir=None):
+    """Every regular file under .overseer/ (except the report directory itself) with relative path, size and digest.
+
+    Committed files in an attempt worktree and anything under .git are listed with size and digest only; the
+    modified and untracked files of a worktree are included in full, since no commit holds them.
+    """
     files = {}
     base = paths.state_dir(root)
+    dirty = {}  # worktree rel dir -> set of dirty relative paths (or None)
     for d, dirs, names in os.walk(base):
         rel_d = os.path.relpath(d, base)
         dirs[:] = sorted(x for x in dirs if not (rel_d == "." and x == "report"))
         listonly = any(part in LIST_ONLY_DIRS for part in rel_d.split(os.sep))
+        wroot = _worktree_root(rel_d)
+        if wroot is not None:
+            key = os.sep.join(wroot)
+            if key not in dirty:
+                dirty[key], err = _dirty_files(os.path.join(base, key))
+                if err is not None:
+                    files[key] = {"unreadable": err}
         for x in list(dirs):  # a symlinked directory is recorded, never followed
             if os.path.islink(os.path.join(d, x)):
                 dirs.remove(x)
@@ -367,7 +449,12 @@ def private_section(root):
                 except OSError as ex:
                     files[rel] = {"unreadable": str(ex)}
             elif stat.S_ISREG(mode):
-                files[rel] = _file_entry(f, listonly)
+                lo = listonly
+                if wroot is not None and ".git" not in rel_d.split(os.sep) and n != ".git":
+                    sub = os.path.relpath(f, os.path.join(base, os.sep.join(wroot)))
+                    if dirty.get(os.sep.join(wroot)) and sub in dirty[os.sep.join(wroot)]:
+                        lo = False
+                files[rel] = _file_entry(f, rel, lo, out_dir)
             else:
                 files[rel] = {"special": "not a regular file"}
     try:
@@ -377,11 +464,11 @@ def private_section(root):
     return {"files": files, "events": events}
 
 
-def build(root, public):
+def build(root, public, out_dir=None):
     rep = public_report(root)
     if not public:
         rep["public"] = False
-        rep["private"] = private_section(root)
+        rep["private"] = private_section(root, out_dir)
     return rep
 
 
@@ -447,13 +534,13 @@ def render(rep):
         pv = rep["private"]
         out += ["", "## Private state", "", "%d state files, %d events." % (len(pv["files"]), len(pv["events"]) if isinstance(pv["events"], list) else 0),
                 "The full records are in report.json under `private`.",
-                "Files inside an attempt `worktree/` or any `.git/` directory are listed with size and digest only; they are recoverable from the recorded commits."]
+                "Committed files inside an attempt `worktree/` and everything under any `.git/` are listed with size and digest only (recoverable from the recorded commits); modified and untracked worktree files are included in full. Files over %d MiB are copied to `files/` next to this report." % (INLINE_MAX >> 20)]
     return "\n".join(out) + "\n"
 
 
 def write_report(root, out_dir, public):
-    rep = build(root, public)
     os.makedirs(out_dir, exist_ok=True)
+    rep = build(root, public, out_dir)
     store.write_json_atomic(os.path.join(out_dir, "report.json"), rep)
     text = render(rep)
     tmp = os.path.join(out_dir, ".report.md.tmp")

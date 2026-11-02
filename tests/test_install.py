@@ -193,6 +193,21 @@ class InstallTests(InstallCase):
         r = subprocess.run(["bash", INSTALL, "--only", "agy", "--agy-dir", "a\nb", "--claude-dir", self.c], capture_output=True, text=True, env=self.env())
         self.assertEqual(r.returncode, 2)
 
+    def test_round3_a_predictable_staging_path_is_never_removed(self):
+        for shell in [x for x in ("bash", "dash") if shutil.which(x)]:
+            root = os.path.join(self.tmp, "stage-" + shell)
+            os.makedirs(root)
+            script = ('mkdir -p "$ROOT/.glab-overseer.new.$$"; printf keep > "$ROOT/.glab-overseer.new.$$/important"; '
+                      'exec %s "$INSTALL" --only claude --claude-dir "$ROOT"' % shell)
+            r = subprocess.run([shell, "-c", script], capture_output=True, text=True, timeout=60,
+                               env=dict(self.env(), ROOT=root, INSTALL=INSTALL))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            kept = [os.path.join(dp, f) for dp, _, fs in os.walk(root) for f in fs if f == "important"]
+            self.assertEqual(len(kept), 1, shell)
+            self.assertTrue(os.path.isfile(os.path.join(root, "glab-overseer", MARKER)))
+            leftovers = [x for x in os.listdir(root) if x.startswith(".glab-overseer.new.")]
+            self.assertEqual(len(leftovers), 1, leftovers)  # only the planted one; ours is gone
+
     def test_unknown_flag_and_missing_value(self):
         self.assertEqual(self.run_install("--nope").returncode, 2)
         r = subprocess.run(["bash", INSTALL, "--claude-dir"], capture_output=True, text=True, env=self.env())

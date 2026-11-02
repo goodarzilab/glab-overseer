@@ -73,8 +73,10 @@ class ReportCase(TmpCase):
         wj(os.path.join(a, "judgment.json"), {
             "status": "DONE", "base": BASE, "candidate": self.cand, "test_rc": 0, "orchestrator_resolved": False,
             "secret_note": TOKEN, "reasons": ["see " + HOME],
-            "outputs": [{"path": "src/alpha.py", "ok": True, "problems": []},
-                        {"path": "src/alpha_data.txt", "ok": True, "problems": []},
+            "outputs": [{"path": "src/alpha.py", "ok": True, "problems": [], "size": 9,
+                         "sha256": hashlib.sha256(b"print(1)\n").hexdigest()},
+                        {"path": "src/alpha_data.txt", "ok": True, "problems": [], "size": 2,
+                         "sha256": hashlib.sha256(b"x\n").hexdigest()},
                         {"path": "/" + "etc/passwd", "ok": True, "problems": []}]})
         wj(os.path.join(a, "integration.json"), {"integration_base": IBASE})
         r1 = os.path.join(a, "reviews", "r1")
@@ -112,6 +114,14 @@ class ReportCase(TmpCase):
                              "sha256": hashlib.sha256(b"hello\n").hexdigest()}]
         wj(os.path.join(a, "judgment.json"), j)
         self.unit_state("crunch", counters={"attempts": 1, "review_rounds": 0}, tracker={"issue": 13, "state": "closed"})
+
+    def strip_recorded(self, uid):
+        j = os.path.join(self.adir(uid), "judgment.json")
+        with open(j) as f:
+            d = json.load(f)
+        for o in d["outputs"]:
+            o.pop("size", None), o.pop("sha256", None)
+        wj(j, d)
 
     def build(self, public=True):
         return report.build(self.root, public)
@@ -223,6 +233,7 @@ class StateTests(ReportCase):
 
     def test_output_without_computable_digest_is_incomplete(self):
         self.make_alpha()
+        self.strip_recorded("alpha")  # an older judgment, written before size and digest were recorded
         os.rename(os.path.join(self.adir("alpha"), "worktree"), os.path.join(self.tmp, "gone"))
         rep = self.build()
         self.assertTrue(any("size and digest unavailable" in i["item"] for i in rep["incomplete"]), rep["incomplete"])
@@ -413,6 +424,136 @@ class Round2ReportTests(ReportCase):
         self.assertEqual(self.cli("report", "--public", "--out", os.path.join(self.tmp, "p")).returncode, 0)
         with open(os.path.join(self.tmp, "p", "report.md")) as f:
             self.assertNotIn("listed with size and digest only", f.read())
+
+
+class Round3ReportTests(ReportCase):
+    def put(self, rel, data):
+        p = os.path.join(paths.state_dir(self.root), rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def wtrel(self, uid="alpha"):
+        return os.path.join("plans", self.pid, "units", uid, "attempts", "a1", "worktree")
+
+    # F4
+    def test_f4_uncommitted_worktree_files_are_included_in_full(self):
+        self.make_alpha()
+        wt = os.path.join(self.adir("alpha"), "worktree")
+        with open(os.path.join(wt, "src", "alpha.py"), "w") as f:
+            f.write("print(2)  # modified\n")
+        os.makedirs(os.path.join(wt, "notes"))
+        with open(os.path.join(wt, "notes", "unfinished.txt"), "w") as f:
+            f.write("uncommitted evidence")
+        with open(os.path.join(wt, "src", "with space.txt"), "w") as f:
+            f.write("spaced")
+        got = self.build(False)["private"]["files"]
+        r = self.wtrel()
+        self.assertEqual(got[os.path.join(r, "src", "alpha.py")]["text"], "print(2)  # modified\n")
+        self.assertEqual(got[os.path.join(r, "notes", "unfinished.txt")]["text"], "uncommitted evidence")
+        self.assertEqual(got[os.path.join(r, "src", "with space.txt")]["text"], "spaced")
+        self.assertNotIn("listed_only", got[os.path.join(r, "notes", "unfinished.txt")])
+        clean = got[os.path.join(r, "src", "alpha_data.txt")]  # committed and unmodified
+        self.assertEqual((clean["listed_only"], clean["sha256"]), (True, hashlib.sha256(b"x\n").hexdigest()))
+        self.assertNotIn("text", clean)
+        self.assertTrue([k for k in got if os.sep + ".git" + os.sep in k and got[k].get("listed_only")])
+
+    def test_f4_a_worktree_git_cannot_read_is_listed_as_unreadable(self):
+        self.put(os.path.join(self.wtrel("beta"), "f.txt"), b"x")  # no .git: not a checkout
+        got = self.build(False)["private"]["files"]
+        e = got[self.wtrel("beta")]
+        self.assertIn("unreadable", e)
+        self.assertEqual(got[os.path.join(self.wtrel("beta"), "f.txt")]["listed_only"], True)
+
+    def test_f4_report_md_describes_what_is_listed_only(self):
+        out = os.path.join(self.tmp, "o")
+        self.assertEqual(self.cli("report", "--out", out).returncode, 0)
+        with open(os.path.join(out, "report.md")) as f:
+            md = f.read()
+        self.assertIn("modified and untracked", md)
+        self.assertIn("listed with size and digest only", md)
+
+    # F5
+    def test_f5_recorded_code_output_digests_survive_a_missing_worktree(self):
+        self.make_alpha()
+        os.rename(os.path.join(self.adir("alpha"), "worktree"), os.path.join(self.tmp, "moved"))
+        rep = self.build()
+        outs = dict((o["path"], o) for o in self.units(rep)["alpha"]["attempts"][0]["outputs"])
+        self.assertEqual((outs["src/alpha.py"]["size"], outs["src/alpha.py"]["sha256"]),
+                         (9, hashlib.sha256(b"print(1)\n").hexdigest()))
+        self.assertEqual([i["item"] for i in rep["incomplete"] if i["unit"] == "alpha"],
+                         ["an output record has an invalid path"])  # the planted absolute path, nothing about digests
+
+    def test_f5_present_worktree_that_disagrees_with_the_record_is_flagged(self):
+        self.make_alpha()
+        j = os.path.join(self.adir("alpha"), "judgment.json")
+        with open(j) as f:
+            d = json.load(f)
+        d["outputs"][0]["sha256"] = "e" * 64
+        wj(j, d)
+        rep = self.build()
+        o = [o for o in self.units(rep)["alpha"]["attempts"][0]["outputs"] if o["path"] == "src/alpha.py"][0]
+        self.assertEqual((o["sha256"], o["changed_since_judgment"]), ("e" * 64, True))
+        self.assertIn({"unit": "alpha", "item": "output src/alpha.py changed since judgment"}, rep["incomplete"])
+
+    def test_f5_judge_records_size_and_digest_of_code_outputs(self):
+        wt = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(wt, "src"))
+        git(wt, "init", "-q")
+        with open(os.path.join(wt, "src", "a.py"), "w") as f:
+            f.write("abc\n")
+        git(wt, "add", ".")
+        git(wt, "commit", "-q", "-m", "a")
+        cand = git(wt, "rev-parse", "HEAD")
+        with open(os.path.join(wt, "src", "a.py"), "w") as f:
+            f.write("changed after the commit\n")
+        r = judge.code_outputs(wt, cand, {"outputs": ["src/a.py", "src/missing.py"]})
+        self.assertEqual((r[0]["ok"], r[0]["size"], r[0]["sha256"]), (True, 4, hashlib.sha256(b"abc\n").hexdigest()))
+        self.assertNotIn("sha256", r[1])
+
+    # F6
+    def test_f6_large_files_are_copied_by_streaming_not_inlined(self):
+        old = report.INLINE_MAX
+        report.INLINE_MAX = 1000
+        self.addCleanup(setattr, report, "INLINE_MAX", old)
+        big = os.urandom(5000) + b"unique-tail"
+        self.put("extra/big.bin", big)
+        small = b"s" * 900
+        self.put("extra/small.txt", small)
+        out = os.path.join(self.tmp, "o")
+        self.assertEqual(self.cli("report", "--out", out).returncode, 0)  # CLI uses the module default; copy below
+        rep = report.write_report(self.root, os.path.join(self.tmp, "o2"), False)
+        e = rep["private"]["files"]["extra/big.bin"]
+        self.assertEqual((e["size"], e["sha256"], e["copied_to"]), (len(big), hashlib.sha256(big).hexdigest(), "files/extra/big.bin"))
+        for k in ("text", "content", "json"):
+            self.assertNotIn(k, e)
+        with open(os.path.join(self.tmp, "o2", "files", "extra", "big.bin"), "rb") as f:
+            self.assertEqual(f.read(), big)
+        self.assertEqual(rep["private"]["files"]["extra/small.txt"]["text"], small.decode())
+
+    def test_f6_memory_stays_bounded_for_a_file_over_the_inline_limit(self):
+        import tracemalloc
+        p = self.put("extra/huge.bin", b"")
+        with open(p, "wb") as f:
+            block = b"\0" * (1 << 20)
+            for _ in range(40):
+                f.write(block)
+        tracemalloc.start()
+        try:
+            rep = report.write_report(self.root, os.path.join(self.tmp, "o3"), False)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12 * 1024 * 1024, peak)
+        self.assertEqual(rep["private"]["files"]["extra/huge.bin"]["size"], 40 << 20)
+        self.assertEqual(os.path.getsize(os.path.join(self.tmp, "o3", "files", "extra", "huge.bin")), 40 << 20)
+
+    def test_f6_public_report_has_no_copied_files(self):
+        self.put("extra/big.bin", b"x" * 10)
+        out = os.path.join(self.tmp, "pub")
+        report.write_report(self.root, out, True)
+        self.assertFalse(os.path.exists(os.path.join(out, "files")))
 
 
 class FilesTests(ReportCase):

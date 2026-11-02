@@ -118,7 +118,7 @@ def code_outputs(wt, candidate, unit):
     for o in unit["outputs"]:
         o = o if isinstance(o, dict) else {"path": o}
         p = o["path"]
-        problems = []
+        problems, rec = [], {}
         ls = W.git(wt, "--literal-pathspecs", "ls-tree", "-z", candidate, "--", p, raw=True)["stdout"]
         ent = [t for t in ls.split(b"\0") if t]
         meta = ent[0].split(b"\t", 1)[0].decode().split() if len(ent) == 1 else None
@@ -144,7 +144,8 @@ def code_outputs(wt, candidate, unit):
                 finally:
                     shutil.rmtree(tmp, True)
             problems = _predicate(o, 0, size, blob, run_v)
-        results.append({"path": p, "ok": not problems, "problems": problems})
+            rec = {} if problems else {"size": size, "sha256": hashlib.sha256(blob()).hexdigest()}  # of the candidate blob
+        results.append(dict({"path": p, "ok": not problems, "problems": problems}, **rec))
     return results
 
 

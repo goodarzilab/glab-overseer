@@ -80,6 +80,8 @@ build() {  # $1 destination directory (new), $2 mode
   printf 'glab-overseer install\nmode=%s\n' "$2" > "$1/$MARKER"
 }
 
+staging=""
+trap '[ -z "$staging" ] || rm -rf "$staging"' EXIT
 rc=0
 mode=copy
 [ "$link" -eq 0 ] || mode=link
@@ -121,11 +123,14 @@ while IFS= read -r t; do
   if [ "$dry" -eq 1 ]; then echo "would $verb ($mode): $t"; continue; fi
   parent=$(dirname "$t")
   mkdir -p "$parent"
-  new="$parent/.$NAME.new.$$"
-  rm -rf "$new"
+  # A fresh, private staging directory: nothing that already exists is ever removed here.
+  new=$(mktemp -d "$parent/.$NAME.new.XXXXXX") || die "cannot create a staging directory in $parent"
+  staging=$new
+  chmod u=rwx,go=rx "$new"
   build "$new" "$mode"
   if marked "$t"; then rm -rf "$t"; fi
   mv "$new" "$t"
+  staging=""
   echo "$verb ($mode): $t"
 done <<EOF
 $targets

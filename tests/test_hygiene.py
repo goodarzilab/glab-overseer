@@ -18,8 +18,9 @@ import helpers
 # Every quantifier is bounded so a match is always shorter than OVERLAP and is seen whole in some buffer.
 CREDENTIALS = {
     "anthropic key": re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,512}"),
-    # sk-proj-... and similar: internal hyphen or underscore segments; needs a digit or capital so kebab-case words never match
-    "api key": re.compile(r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{32,512}"),
+    # sk-<48>, sk-proj-<long>, sk-ant-api03-<long>: 32+ token characters holding a hyphen-free run of 20+
+    # (kebab-case slugs of short words never do)
+    "api key": re.compile(r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]{32})(?=[A-Za-z0-9_-]{0,490}?[A-Za-z0-9_]{20})[A-Za-z0-9_-]{32,512}"),
     "google key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
     "github token": re.compile(r"ghp_[A-Za-z0-9]{36}"),
     "github fine-grained token": re.compile(r"github_pat_[A-Za-z0-9_]{22,255}"),
@@ -295,6 +296,24 @@ class Round2ScannerTests(unittest.TestCase):
         self.assertEqual(scan_repo(os.path.join(d, "repo"), [ident], skip=link), {})
         self.assertEqual(scan_repo(os.path.join(d, "repo"), [ident], skip=real), {})
         self.assertTrue(scan_repo(os.path.join(d, "repo"), [ident]))  # without a skip the link target string matches
+
+
+class Round3ScannerTests(unittest.TestCase):
+    def test_lowercase_and_project_style_keys_match(self):
+        for s in ("sk-" + "a" * 32, "sk-" + "a" * 48, "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz" * 2,
+                  "sk-" + "ant-" + "api03-" + "abcdefghij" * 6, "sk-" + "proj-" + "A" * 40,
+                  "sk-" + "proj-" + "ab_cd-" * 3 + "abcdefghijklmnopqrstuvwx"):
+            self.assertIn("api key", scan_text("k = " + s + "\n"), s)
+
+    def test_kebab_case_slugs_do_not_match(self):
+        for s in ("sk-" + "learn-python-machine-learning-library-version-2024", "sk-" + "a" * 31,
+                  "sk-" + "this-is-a-long-kebab-case-slug-with-many-short-words-in-it",
+                  "task-" + "a" * 50, "ask-" + "a" * 50, "_sk-" + "a" * 40, "sk-" + "ant-" + "x" * 19):
+            self.assertNotIn("api key", scan_text(s), s)
+
+    def test_a_run_of_twenty_is_the_threshold(self):
+        self.assertIn("api key", scan_text("sk-" + "a" * 20 + "-" + "b-" * 6))
+        self.assertNotIn("api key", scan_text("sk-" + "a" * 19 + "-" + "b" * 19 + "-" + "c-" * 6))
 
 
 class TreeTests(unittest.TestCase):
