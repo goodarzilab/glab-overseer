@@ -1,12 +1,12 @@
 # glab-overseer v1 acceptance report
 
-Date: 2026-11-02. Code under test: `main` at be004bb (U1 to U9 and the P16 fix, #20); the exceptions are listed under Run facts. Hosts: Claude Code 2.1.316 and Antigravity CLI 1.4.12, both logged in by subscription; every supervisor command ran with all `*_API_KEY` variables unset, and every Claude call reported `apiKeySource: none`. Repository: one private throwaway repository, one target branch per run (`run1`, `d3`, `run2`, `run3`, `alloc`).
+Date: 2026-11-02. Code under test: `main` at be004bb (U1 to U9 and the P16 fix, #20); the exceptions are listed under Run facts. Hosts: Claude Code 2.1.316 and Antigravity CLI 1.4.12, both logged in by subscription; every supervisor command ran with all `*_API_KEY` variables unset, and every Claude call reported `apiKeySource: none`. Repository: one private throwaway repository, one target branch per run (`run1`, `d3`, `run2`, `run3`, `run3a`, `alloc`). Run 3a ran at c674b47, which differs from be004bb only in `acceptance/`.
 
 Statuses are copied from `check_run.py --json` and `report --public` as printed; none is upgraded.
 
 ## Verdict
 
-Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill) passed every applicable claim, and the D3 fallback, allocation loss and recovery passed live. Run 3 passed every claim it checks with Google-family authors and Claude-family review, but an Antigravity session did not drive it: the orchestrator's host refused to launch an unsandboxed autonomous `agy` session, so the "Antigravity session drives the loop" claim is INCOMPLETE pending an owner decision. The `sacct` item is INCOMPLETE in Runs 1 and 3 because `sacct` was never queried there; the D3 run supplies the fallback proof.
+Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill) passed every applicable claim, and the D3 fallback, allocation loss and recovery passed live. Run 3 passed every claim it checks with Google-family authors and Claude-family review, driven from Claude Code. The orchestrator's host first refused to launch an unsandboxed autonomous `agy` session. The owner then allowed exactly that launch, and Run 3a, driven end to end by an Antigravity session, passed the same claims. The `sacct` item is INCOMPLETE in Runs 1, 3 and 3a because `sacct` was never queried there; the D3 run supplies the fallback proof.
 
 | Item | Result |
 |---|---|
@@ -14,7 +14,7 @@ Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill)
 | D3, accounting fallback | key claims PASS; 4 INCOMPLETE by design (simulated loss, no issues filed) |
 | Run 2, Slurm hidden, local backend, recovery | 19 PASS, exit 0 |
 | Run 3, Google authors and Claude review | 17 PASS, 1 INCOMPLETE (`summarize.sacct`, by design) |
-| Run 3, an Antigravity session drives the loop | INCOMPLETE: launch refused by the orchestrator host's safety policy; owner decision pending |
+| Run 3a, an Antigravity session drives the loop | 17 PASS, 1 INCOMPLETE (`summarize.sacct`, by design); 22 minutes, no owner stops, no hand edits |
 | Recovery, kill between `gh pr merge` and its record | PASS (`recovery.slug` in Run 2) |
 | Allocation loss | PASS (evidence below; `check_run` has no claim for it) |
 | Owner laptop test (O5) | pending, not run by the orchestrator |
@@ -115,6 +115,31 @@ Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill)
 | backend | PASS | `.overseer/plans/accept-run3/units` | backends used ['slurm'], expected slurm |
 | orchestrator_items | PASS | `.overseer/plans/accept-run3/units` | none |
 
+### Run 3a: an Antigravity session as orchestrator, Google-family authors, Claude-family reviewer
+
+`check_run.py` counts: FAIL 0, INCOMPLETE 1, PASS 17.
+
+| Claim | Status | Evidence | Detail |
+|---|---|---|---|
+| overlap | PASS | `.overseer/plans/accept-run3a/units/slug/attempts/a1/inv` | overlapping [('slug', 'count')]; slug ['1793634773..1793634999'], count ['1793634777..1793634849'] |
+| slug.judgment | PASS | `.overseer/plans/accept-run3a/units/slug/attempts/a1/judgment.json` | DONE, 2 outputs ok |
+| slug.review | PASS | `.overseer/plans/accept-run3a/units/slug/attempts/a1/reviews/r1/round.json` | 1 round(s), none a fallback; a1/r1 by claude reviewed a google author |
+| slug.nonvacuity | PASS | `.overseer/plans/accept-run3a/units/slug/attempts/a1/nonvacuous.json` | status PASS |
+| slug.merge | PASS | `.overseer/plans/accept-run3a/units/slug/merge.json` | state merged, pr_head 089ba7cf2735, merge_commit 41e8e48ed9ca, closure merged |
+| slug.tracker | PASS | `.overseer/plans/accept-run3a/units/slug/unit.json` | tracker closed, issue 16 |
+| count.judgment | PASS | `.overseer/plans/accept-run3a/units/count/attempts/a1/judgment.json` | DONE, 2 outputs ok |
+| count.review | PASS | `.overseer/plans/accept-run3a/units/count/attempts/a1/reviews/r1/round.json` | 1 round(s), none a fallback; a1/r1 by claude reviewed a google author |
+| count.nonvacuity | PASS | `.overseer/plans/accept-run3a/units/count/attempts/a1/nonvacuous.json` | status PASS |
+| count.merge | PASS | `.overseer/plans/accept-run3a/units/count/merge.json` | state merged, pr_head a90dba38d4cf, merge_commit 26cdbbb63e7c, closure merged |
+| count.tracker | PASS | `.overseer/plans/accept-run3a/units/count/unit.json` | tracker closed, issue 17 |
+| count.integration | PASS | `.overseer/plans/accept-run3a/units/count/attempts/a1/integration.json` | integration base 41e8e48ed9ca rejudged DONE and recorded in the merge |
+| summarize.judgment | PASS | `.overseer/plans/accept-run3a/units/summarize/attempts/a1/judgment.json` | DONE, 1 outputs ok |
+| summarize.sources | PASS | `.overseer/plans/accept-run3a/units/summarize/attempts/a1/inv/01-job` | answered ['scontrol', 'wrapper']; sacct ever answered: false |
+| summarize.sacct | INCOMPLETE | `.overseer/plans/accept-run3a/units/summarize/attempts/a1/inv/01-job` | sacct never answered: the accounting claim is incomplete; the fallback is proved by the D3 run |
+| summarize.tracker | PASS | `.overseer/plans/accept-run3a/units/summarize/unit.json` | tracker closed, issue 18 |
+| backend | PASS | `.overseer/plans/accept-run3a/units` | backends used ['slurm'], expected slurm |
+| orchestrator_items | PASS | `.overseer/plans/accept-run3a/units` | none |
+
 ### Allocation loss
 
 No `check_run` claim covers this case. A session cannot end its own allocation, so the dispatch ran inside a short launcher batch job (the runbook's documented equivalent). The launcher started at 06:15:06Z, dispatched the `slug` author as a batch job and ended at 06:15:07Z with the author still queued. The author started at 06:15:22Z and exited rc 0 at 06:15:46Z, entirely after its launching allocation was gone. A different session then ran `status`, `next`, `wait` and `judge slug` with no manual edit: judgment DONE, test rc 0. Evidence: `units/slug/attempts/a1/inv/01-author/{launch,start,exit}.json`, `judgment.json`, `events.jsonl`, the launcher log.
@@ -127,6 +152,7 @@ No `check_run` claim covers this case. A session cannot end its own allocation, 
 | D3 | Slurm batch | 2 jobs | none (job units) | no issues filed | same session |
 | Run 2 | local (Slurm tools replaced by logging shims, `OVERSEER_DISABLE_SLURM=1`) | Claude `sonnet` (2 overlapping local processes) | Google `gemini-3.8-flash-high`, no fallback | PRs 14, 15; issues 6 to 8 | same session |
 | Run 3 | Slurm batch | Google `gemini-4-argon-high` (sandboxed `agy` batch jobs) | Claude `haiku`, no fallback | PRs 12, 13; issues 9 to 11 | same session, with `models --host google` (runbook fallback path) |
+| Run 3a | Slurm batch | Google `gemini-4-argon-high` (sandboxed `agy` batch jobs) | Claude `haiku`, no fallback | PRs 19, 20; issues 16 to 18 | an Antigravity session (`gemini-4-argon-high`, no sandbox for the orchestrator, P5), launched once under an exact-match permission rule the owner added |
 
 Every run used one attempt per unit and one review round per code unit. Every second code unit merged after an integration: the target had advanced, so the supervisor merged in the recorded target commit, re-judged the integrated candidate, reran non-vacuity, carried the review by unchanged patch id (D2), and squash-merged bound to the head.
 
@@ -140,6 +166,8 @@ What the live runs found and how each was handled:
 - **Run 3's Claude reviewer raised one blocking finding on `slug`.** The finding said the change alters `slugify` output for some inputs, which is the requested fix. The orchestrator reproduced the unit's unchanged specification test passing at the candidate (`evidence/rep-1.json`) and ruled the finding dismissed. Three nonblocking findings were ruled nonblocking. One of them, a CHANGELOG `grep` matching an existing heading, was a real fixture weakness, now fixed in the fixture.
 - **Operator-side tooling in Run 2.** `command -v` returned bare names for `grep`, `find`, `kill` and `test` (shell functions or builtins in the operator's shell), so the first judgments failed on a missing `grep`. The links were remade with `type -P` and the same attempts were re-judged DONE. The runbook now uses `type -P` and lists every tool the steps need.
 
+- **Run 3a, the Antigravity orchestrator's rulings.** The Claude reviewer failed both code units. The Antigravity session reproduced each finding with `reproduce` before ruling (three valid records, rc 0) and dismissed all three with evidence. The `slug` findings argued that the specified behavior change was unproven and that the CHANGELOG check was loose. The `count` finding was about an import convention that the existing tests already share. It raised no owner stops and edited nothing under `.overseer/` by hand.
+
 ## Orchestrator-resolved and simulated items
 
 - **D3 `summarize-lost` (simulation):** the wrapper's `exit.json` was moved aside and the Slurm query tools were hidden. Judgment returned UNCERTAIN (exit 4) and the slot stayed held. The orchestrator inspected `result.csv` (header `name,words,lines` and two rows) and ran `resolve --as done` with that reason and evidence. `report --public` labels the item orchestrator-resolved.
@@ -150,7 +178,6 @@ What the live runs found and how each was handled:
 ## Pending
 
 - **The owner laptop test (O5):** pending, not run by the orchestrator.
-- **Run 3 with an Antigravity session as orchestrator:** pending the owner's decision. Launching `agy -p ... --dangerously-skip-permissions` without `--sandbox` was refused by the orchestrator host's safety policy, and the sandbox cannot be kept because it mounts `.git` read-only (P5).
 
 ## Limits
 
