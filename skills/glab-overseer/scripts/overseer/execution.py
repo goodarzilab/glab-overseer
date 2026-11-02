@@ -673,11 +673,16 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     uid = unit["id"]
     stale = missing_merges(root, plan_id, plan, unit)
     if stale:
+        from . import workspace as W
+        target = plan["target_branch"]
+        fix = "on branch %s: `git pull --ff-only origin %s`" % (target, target)
+        shallow = W.git(root, "rev-parse", "--is-shallow-repository", ok=(0, 128))["stdout"].strip() == "true"
+        if shallow:  # ancestry cannot be shown across a shallow boundary, and pull does not lift it
+            fix = "the checkout is shallow, so first `git fetch --unshallow origin`, then " + fix
         raise ExecutionError(
-            "the project checkout lacks the merge of %s, so job %s would run on pre-merge files; "
-            "bring the checkout up to the target (on branch %s: `git pull --ff-only origin %s`), "
-            "then dispatch again" % (", ".join("%s (%s)" % (u, s[:12]) for u, s in stale), uid,
-                                     plan["target_branch"], plan["target_branch"]))
+            "the project checkout does not contain the merge of %s, so job %s could run on pre-merge "
+            "files; bring the checkout up to the target (%s), then dispatch again"
+            % (", ".join("%s (%s)" % (u, s[:12]) for u, s in stale), uid, fix))
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)  # refuses before any attempt is allocated or sbatch runs

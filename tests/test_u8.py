@@ -394,14 +394,31 @@ class Tracker(MergeCase):
         ub_merge = self.facet("ub", "closure")["merge_commit"]
         rc, out, err = self.cli("dispatch")
         self.assertEqual((rc, out), (1, ""), err)
-        self.assertIn("lacks the merge of ub (%s)" % ub_merge[:12], err)
+        self.assertIn("does not contain the merge of ub (%s)" % ub_merge[:12], err)
         self.assertNotIn("ua (", err)
         self.assertIn("git pull --ff-only origin main", err)
+        self.assertNotIn("unshallow", err)
         self.assertEqual(list(X.iter_invocations(self.root, "demo", "jc")), [])
         self.assertEqual(approval.load_unit_state(self.root, "demo", "jc")["counters"]["attempts"], 0)
         self.pull()
         rc, out, err = self.cli("dispatch")
         self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
+
+    def test_stale_refusal_in_a_shallow_checkout_names_unshallow(self):
+        repo = os.path.join(self.tmp, "deep")
+        sh(self.tmp, "init", "-q", "-b", "main", repo)
+        for n in ("one", "two"):
+            self.put(n, n, base=repo)
+            sh(repo, "add", n)
+            sh(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", n)
+        shallow = os.path.join(self.tmp, "shallow")
+        sh(self.tmp, "clone", "-q", "--depth", "1", "file://" + repo, shallow)
+        self.assertEqual(sh(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        plan = {"target_branch": "main", "units": []}
+        with mock.patch.object(X.approval, "effective_plan", return_value=plan), \
+                mock.patch.object(X, "missing_merges", return_value=[("ub", "f" * 40)]):
+            with self.assertRaisesRegex(X.ExecutionError, r"shallow, so first `git fetch --unshallow origin`"):
+                X.dispatch_job(shallow, "demo", {"id": "jc"})
 
     def test_job_unit_closes_on_done_judgment_not_on_exit(self):
         self.plan()
