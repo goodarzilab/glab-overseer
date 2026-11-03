@@ -430,6 +430,37 @@ class Tracker(MergeCase):
         self.assertIn("`git pull --ff-only origin 'main;touch${IFS}PWNED;true'`", msg)
         self.assertNotIn("unshallow", msg)
 
+    def test_replace_refs_and_grafts_cannot_hide_a_stale_checkout(self):
+        self.plan()
+        self.dispatch_both()
+        for u in ("ua", "ub"):
+            self.ready(u)
+            self.assertEqual(self.cli("merge", u)[0], 0)
+        sh(self.root, "fetch", "-q", "origin")  # merged objects present locally; HEAD is still pre-merge
+        head, merged = sh(self.root, "rev-parse", "HEAD"), sh(self.root, "rev-parse", "origin/main")
+        fake = sh(self.root, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit-tree",
+                  "HEAD^{tree}", "-p", head, "-p", merged, "-m", "looks merged")
+        sh(self.root, "replace", head, fake)
+        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root)
+        self.assertEqual(plain.returncode, 0)  # plain git is fooled
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, out), (1, ""), err)
+        self.assertIn("does not contain the merge of", err)
+        sh(self.root, "replace", "-d", head)
+        with open(os.path.join(self.root, ".git", "info", "grafts"), "w") as f:
+            f.write("%s %s\n" % (head, merged))
+        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root,
+                               stderr=subprocess.DEVNULL)
+        self.assertEqual(plain.returncode, 0)
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, out), (1, ""), err)
+        self.assertIn("does not contain the merge of", err)
+        os.unlink(os.path.join(self.root, ".git", "info", "grafts"))
+        self.assertEqual(list(X.iter_invocations(self.root, "demo", "jc")), [])
+        self.pull()
+        rc, out, err = self.cli("dispatch")
+        self.assertEqual((rc, [json.loads(l)["unit"] for l in out.splitlines()]), (0, ["jc"]), err)
+
     def test_job_unit_closes_on_done_judgment_not_on_exit(self):
         self.plan()
         self.dispatch_both()

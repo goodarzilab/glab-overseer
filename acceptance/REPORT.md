@@ -176,7 +176,7 @@ After #23: 590 tests OK, 3 skipped (all for a missing `/proc` or `prctl`), no wa
 | orchestrator_items | PASS | `.overseer/plans/accept-laptop/units` |
 
 What the laptop run showed beyond the claims:
-- **A job unit runs in the project checkout, not on the merged target.** The local `laptop` branch was still at the fixture commit after both merges. The orchestrator fast-forwarded it (`git merge --ff-only origin/laptop`) before dispatching `summarize`, so the job read the merged files. Without that step the job would have summarized pre-merge files and still passed its output predicate. Follow-up: have `dispatch` refuse, or update, a stale checkout for a job whose `needs` include merged code units.
+- **A job unit runs in the project checkout, not on the merged target.** The local `laptop` branch was still at the fixture commit after both merges. The orchestrator fast-forwarded it (`git merge --ff-only origin/laptop`) before dispatching `summarize`, so the job read the merged files. Without that step the job would have summarized pre-merge files and still passed its output predicate. Fixed after the run in #25: `dispatch` now refuses a job while the checkout lacks the merge commit of any code unit it needs, and names the command that brings the checkout up to date.
 - **The public report shows `closure open` for the DONE job,** while its tracker is closed. A job closes on DONE, so the column is misleading, not wrong.
 - **`LINEAR_API_KEY` reached the orchestrator's shell** although the session was started without it: Claude Code's Bash tool re-sources the user's shell profile. `survey` flagged it; it is not a model key, and the supervisor removes it from workers. No model key appeared.
 - The optional Antigravity leg (step 7 of the laptop steps) was not run.
@@ -220,7 +220,6 @@ What the live runs found and how each was handled:
 ## Pending
 
 - **The laptop Antigravity leg (optional step 7):** not run.
-- **Job units on a stale checkout:** follow-up from the laptop run (above).
 
 ## Limits
 
