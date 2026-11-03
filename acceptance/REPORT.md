@@ -6,7 +6,7 @@ Statuses are copied from `check_run.py --json` and `report --public` as printed;
 
 ## Verdict
 
-Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill) passed every applicable claim, and the D3 fallback, allocation loss and recovery passed live. Run 3 passed every claim it checks with Google-family authors and Claude-family review, driven from Claude Code. The orchestrator's host first refused to launch an unsandboxed autonomous `agy` session. The owner then allowed exactly that launch, and Run 3a, driven end to end by an Antigravity session, passed the same claims. The `sacct` item is INCOMPLETE in Runs 1, 3 and 3a because `sacct` was never queried there; the D3 run supplies the fallback proof. The owner laptop test (O5) on macOS passed every claim after one supervisor fix (#23).
+Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill) passed every applicable claim, and the D3 fallback, allocation loss and recovery passed live. Run 3 passed every claim it checks with Google-family authors and Claude-family review, driven from Claude Code. The orchestrator's host first refused to launch an unsandboxed autonomous `agy` session. The owner then allowed exactly that launch, and Run 3a, driven end to end by an Antigravity session, passed the same claims. The `sacct` item is INCOMPLETE in Runs 1, 3 and 3a because `sacct` was never queried there; the D3 run supplies the fallback proof. The owner laptop test (O5) on macOS passed every claim after one supervisor fix (#23), and its Antigravity leg, driven by a headless Antigravity session, passed the same claims.
 
 | Item | Result |
 |---|---|
@@ -18,6 +18,7 @@ Run 1 (Claude Code host, Slurm) and Run 2 (Slurm hidden, with the recovery kill)
 | Recovery, kill between `gh pr merge` and its record | PASS (`recovery.slug` in Run 2) |
 | Allocation loss | PASS (evidence below; `check_run` has no claim for it) |
 | Owner laptop test (O5), macOS, local backend | 17 PASS, exit 0, after the #23 fixes |
+| O5 Antigravity leg, macOS, local backend | 17 PASS, exit 0 |
 
 ## Claims by run
 
@@ -179,7 +180,38 @@ What the laptop run showed beyond the claims:
 - **A job unit runs in the project checkout, not on the merged target.** The local `laptop` branch was still at the fixture commit after both merges. The orchestrator fast-forwarded it (`git merge --ff-only origin/laptop`) before dispatching `summarize`, so the job read the merged files. Without that step the job would have summarized pre-merge files and still passed its output predicate. Fixed after the run in #25: `dispatch` now refuses a job while the checkout lacks the merge commit of any code unit it needs, and names the command that brings the checkout up to date.
 - **The public report shows `closure open` for the DONE job,** while its tracker is closed. A job closes on DONE, so the column is misleading, not wrong.
 - **`LINEAR_API_KEY` reached the orchestrator's shell** although the session was started without it: Claude Code's Bash tool re-sources the user's shell profile. `survey` flagged it; it is not a model key, and the supervisor removes it from workers. No model key appeared.
-- The optional Antigravity leg (step 7 of the laptop steps) was not run.
+
+### Laptop, Antigravity leg (O5 step 7): macOS, Antigravity host, local backend
+
+Same host as above. Code under test: `main` at f1106af (#26), installed with `./install.sh`. Fixture: `make_fixture.py --no-slurm --plan-id accept-laptop-g --target laptop-g`, branch `laptop-g` of the throwaway repository.
+
+**The run.** A headless Antigravity session (`agy -p`, `gemini-4-argon-high`, `--dangerously-skip-permissions`, no `--sandbox` because of P5) ran in the fixture with the model keys unset. Claude Code's auto mode refused to start that session, as on the cluster, so the owner ran the launcher for both turns. The first turn took the lab-member prompt, ran `survey`, `models --host google`, `probe-transport` and `plan validate`, showed the plan and the three issue titles, and stopped for approval (3 minutes). The owner approved by name, and the same conversation, resumed with that approval, ran to the end in 22 minutes. Authors were Google `gemini-4-argon-high` (sandboxed `agy` local processes) and the reviewer was Claude `haiku` with no fallback. Each review passed with two nonblocking findings, which the session ruled nonblocking with evidence. `count` merged after an integration of `slug`'s merge. Issues 26 to 28 are closed and PRs 29 and 30 are merged. The session ran only `overseer.py` commands and one `git pull --ff-only origin laptop-g` before the job, and its only file writes were two dispositions files in its own scratch directory; it raised no owner stops and edited nothing under `.overseer/` by hand.
+
+`check_run.py` counts: FAIL 0, INCOMPLETE 0, PASS 17.
+
+| Claim | Status | Evidence |
+|---|---|---|
+| overlap | PASS | `.overseer/plans/accept-laptop-g/units/slug/attempts/a1/inv` |
+| slug.judgment | PASS | `.overseer/plans/accept-laptop-g/units/slug/attempts/a1/judgment.json` |
+| slug.review | PASS | `.overseer/plans/accept-laptop-g/units/slug/attempts/a1/reviews/r1/round.json` |
+| slug.nonvacuity | PASS | `.overseer/plans/accept-laptop-g/units/slug/attempts/a1/nonvacuous.json` |
+| slug.merge | PASS | `.overseer/plans/accept-laptop-g/units/slug/merge.json` |
+| slug.tracker | PASS | `.overseer/plans/accept-laptop-g/units/slug/unit.json` |
+| count.judgment | PASS | `.overseer/plans/accept-laptop-g/units/count/attempts/a1/judgment.json` |
+| count.review | PASS | `.overseer/plans/accept-laptop-g/units/count/attempts/a1/reviews/r1/round.json` |
+| count.nonvacuity | PASS | `.overseer/plans/accept-laptop-g/units/count/attempts/a1/nonvacuous.json` |
+| count.merge | PASS | `.overseer/plans/accept-laptop-g/units/count/merge.json` |
+| count.tracker | PASS | `.overseer/plans/accept-laptop-g/units/count/unit.json` |
+| count.integration | PASS | `.overseer/plans/accept-laptop-g/units/count/attempts/a1/integration.json` |
+| summarize.judgment | PASS | `.overseer/plans/accept-laptop-g/units/summarize/attempts/a1/judgment.json` |
+| summarize.sources | PASS | `.overseer/plans/accept-laptop-g/units/summarize/attempts/a1/inv/01-job` |
+| summarize.tracker | PASS | `.overseer/plans/accept-laptop-g/units/summarize/unit.json` |
+| backend | PASS | `.overseer/plans/accept-laptop-g/units` |
+| orchestrator_items | PASS | `.overseer/plans/accept-laptop-g/units` |
+
+What the Antigravity leg showed beyond the claims:
+- **The checkout update before the job came from the skill's guidance.** The session pulled the target before dispatching `summarize`, as SKILL.md now directs (#25), so the refusal itself did not fire.
+- **`LINEAR_API_KEY` reached the orchestrator's shell** although the launcher unset it, so Antigravity's command tool also re-reads the user's shell profile. As in the Claude leg, `survey` flagged it and no model key appeared.
 
 ### Allocation loss
 
@@ -195,6 +227,7 @@ No `check_run` claim covers this case. A session cannot end its own allocation, 
 | Run 3 | Slurm batch | Google `gemini-4-argon-high` (sandboxed `agy` batch jobs) | Claude `haiku`, no fallback | PRs 12, 13; issues 9 to 11 | same session, with `models --host google` (runbook fallback path) |
 | Run 3a | Slurm batch | Google `gemini-4-argon-high` (sandboxed `agy` batch jobs) | Claude `haiku`, no fallback | PRs 19, 20; issues 16 to 18 | an Antigravity session (`gemini-4-argon-high`, no sandbox for the orchestrator, P5), launched once under an exact-match permission rule the owner added |
 | Laptop (O5) | local, macOS | Claude `sonnet` (2 overlapping local processes) | Google `gemini-3.8-flash-high`, no fallback | PRs 24, 25; issues 21 to 23 | a fresh headless Claude Code session (`claude -p`, auto permissions), owner approval relayed into the same session |
+| Laptop, Antigravity leg | local, macOS | Google `gemini-4-argon-high` (2 overlapping sandboxed `agy` local processes) | Claude `haiku`, no fallback | PRs 29, 30; issues 26 to 28 | a headless Antigravity session (`agy -p`, `gemini-4-argon-high`, no sandbox, P5), started by the owner after auto mode refused it, owner approval relayed into the same conversation |
 
 Every run used one attempt per unit and one review round per code unit. Every second code unit merged after an integration: the target had advanced, so the supervisor merged in the recorded target commit, re-judged the integrated candidate, reran non-vacuity, carried the review by unchanged patch id (D2), and squash-merged bound to the head.
 
@@ -219,7 +252,7 @@ What the live runs found and how each was handled:
 
 ## Pending
 
-- **The laptop Antigravity leg (optional step 7):** not run.
+None.
 
 ## Limits
 
