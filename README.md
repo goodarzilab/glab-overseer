@@ -7,7 +7,7 @@ It uses only what every lab member already has: a Claude Code subscription and a
 ## Why use it
 
 - **Parallel work without babysitting.** Up to three agents or jobs run at once, each in its own git worktree or output directory. You approve once and are interrupted only for decisions that are yours.
-- **Nothing closes on an agent's word.** A code change is done only when the supervisor has checked the evidence: the tests pass in a clean checkout of the exact commit, the change stays inside the approved paths, the declared outputs exist, and the tests actually fail without the change. A job is done only when the scheduler or the job's own exit record shows success and every declared output passes its checks.
+- **Nothing closes on an agent's word.** A code change is done only when the supervisor has checked the evidence: the tests pass in a clean checkout of the exact commit, the change stays inside the approved paths, the declared outputs pass their checks, and the tests actually fail without the change. A job is done only when the scheduler or the job's own exit record shows success and every declared output passes its checks.
 - **Cross-family review.** Code written by Claude is reviewed by Gemini, and code written by Gemini is reviewed by Claude. The orchestrator reproduces a finding before it acts on it.
 - **Resumable.** Every fact lives on disk under `.overseer/`. Close the laptop, lose the allocation or switch hosts, then run `overseer.py status` and `overseer.py next` in a new session and carry on.
 - **Shareable record.** `overseer.py report --public` writes a report built from an allowlist: what merged, which tests ran, who reviewed, and every item that is incomplete or uncertain.
@@ -145,7 +145,7 @@ Google model names are resolved from `agy models` and cached with a date (`overs
 
 `overseer.py judge` decides, and a worker exiting decides nothing.
 
-- **Code** is DONE when the worker has ended, the branch and its ancestry are intact, every commit stays inside the unit's scope with no prohibited files, the declared outputs exist at that commit, and the test command passes in a clean checkout of it. Before merging, `nonvacuous` reverts the non-test changes in a scratch copy and requires the tests to fail, so a test that passes without the change does not count.
+- **Code** is DONE when the worker has ended, the branch and its ancestry are intact, every commit stays inside the unit's scope with no prohibited files, the declared outputs pass their checks at that commit, and the test command passes in a clean checkout of it. Before merging, `nonvacuous` reverts the non-test changes in a scratch copy and requires the tests to fail, so a test that passes without the change does not count.
 - **Job** is DONE when the scheduler or the worker's own exit record shows success and every output check passes. Failure evidence always wins. Logs alone never make a job DONE.
 - **UNCERTAIN** means the evidence cannot say how a job ended (for example, the accounting database did not answer). The job keeps its worker slot until the orchestrator inspects the outputs and resolves it with a recorded reason; the report labels it orchestrator-resolved.
 
