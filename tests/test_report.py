@@ -214,6 +214,12 @@ class StateTests(ReportCase):
         self.assertEqual((o["path"], o["ok"], o["size"]), ("result.txt", True, 6))
         self.assertEqual(o["sha256"], hashlib.sha256(b"hello\n").hexdigest())
         self.assertTrue(c["attempts"][0]["judgment"]["orchestrator_resolved"])
+        self.assertEqual(c["facets"]["closure"], "closed")  # closed by the DONE judgment; the stored facet is still open
+
+    def test_job_closure_stays_open_until_done(self):
+        self.make_crunch("FAILED")
+        c = self.units(self.build())["crunch"]
+        self.assertEqual((c["state"], c["facets"]["closure"]), ("failed", "open"))
 
     def test_unreadable_record_is_incomplete_not_skipped(self):
         self.make_alpha()

@@ -235,6 +235,12 @@ def _state(root, pid, u, st, gaps):
     return "UNCERTAIN" if "UNCERTAIN" in states else ("running" if set(states) & set(X.ACTIVE) else "unjudged")
 
 
+def _closure(u, st, state):
+    """The stored closure facet, except a job: its DONE judgment closes it without a write (controller.is_closed)."""
+    c = _word(st["closure"].get("state"))
+    return "closed" if u.get("kind") == "job" and state == "done" and c not in approval.CLOSED_STATES else c
+
+
 def _unit(root, pid, u, st, repo, gaps, effective):
     uid = u["id"]
     n = st["counters"].get("attempts")
@@ -259,7 +265,7 @@ def _unit(root, pid, u, st, repo, gaps, effective):
         "id": uid, "title": u.get("title") if isinstance(u.get("title"), str) else None, "kind": _word(u.get("kind")),
         "state": state, "attempts_used": _int(n),
         "facets": {"authorization": _word(st["authorization"].get("state")), "execution": _word(st["execution"].get("state")),
-                   "closure": _word(st["closure"].get("state")), "tracker": _word(st["tracker"].get("state"))},
+                   "closure": _closure(u, st, state), "tracker": _word(st["tracker"].get("state"))},
         "attempts": attempts,
         "issue": {"number": _int(issue), "url": _url(repo, "issues", issue)} if _int(issue) is not None else None,
         "pr": {"number": _int(pr.get("number")), "url": _url(repo, "pull", pr.get("number")),
