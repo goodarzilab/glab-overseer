@@ -27,7 +27,8 @@ CFG = ("-c", "core.quotepath=off", "-c", "core.hooksPath=/dev/null", "-c", "core
        "-c", "core.autocrlf=false", "-c", "gc.auto=0")
 GIT_SCRUB = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
              "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG",
-             "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_PREFIX")
+             "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_PREFIX",
+             "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 
 
@@ -95,7 +96,9 @@ def git_env():
     env = E.supervisor_env()
     for k in GIT_SCRUB:
         env.pop(k, None)
-    env.update({"LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+    env.update({"LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+                # Replace refs and grafts rewrite history locally: judge, merge and ancestry checks read real objects.
+                "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull})
     return env
 
 
