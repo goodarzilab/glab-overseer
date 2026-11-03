@@ -71,7 +71,7 @@ overseer.py plan approve plan.json --approver "Your Name"
 overseer.py issues file --plan PLAN_ID
 ```
 
-and then repeats `overseer.py next` and acts on each line. You can run any of these yourself; `overseer.py --help` lists every command. The supervisor lives at `~/.claude/skills/glab-overseer/scripts/overseer.py` (or the Antigravity copy).
+and then repeats `overseer.py next` and acts on each line. In this README, `overseer.py COMMAND` is short for `python3 ~/.claude/skills/glab-overseer/scripts/overseer.py COMMAND` (or the same path under `~/.gemini/config/skills/`), run from the project root. You can run any command yourself; `--help` lists them all.
 
 ### On the cluster
 
