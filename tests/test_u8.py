@@ -441,7 +441,8 @@ class Tracker(MergeCase):
         fake = sh(self.root, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit-tree",
                   "HEAD^{tree}", "-p", head, "-p", merged, "-m", "looks merged")
         sh(self.root, "replace", head, fake)
-        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root)
+        bare = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "LC_ALL": "C"}  # nothing inherited
+        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root, env=bare)
         self.assertEqual(plain.returncode, 0)  # plain git is fooled
         rc, out, err = self.cli("dispatch")
         self.assertEqual((rc, out), (1, ""), err)
@@ -449,7 +450,7 @@ class Tracker(MergeCase):
         sh(self.root, "replace", "-d", head)
         with open(os.path.join(self.root, ".git", "info", "grafts"), "w") as f:
             f.write("%s %s\n" % (head, merged))
-        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root,
+        plain = subprocess.run(["git", "merge-base", "--is-ancestor", merged, "HEAD"], cwd=self.root, env=bare,
                                stderr=subprocess.DEVNULL)
         self.assertEqual(plain.returncode, 0)
         rc, out, err = self.cli("dispatch")
