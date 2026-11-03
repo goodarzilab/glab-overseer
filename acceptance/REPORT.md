@@ -178,7 +178,7 @@ After #23: 590 tests OK, 3 skipped (all for a missing `/proc` or `prctl`), no wa
 
 What the laptop run showed beyond the claims:
 - **A job unit runs in the project checkout, not on the merged target.** The local `laptop` branch was still at the fixture commit after both merges. The orchestrator fast-forwarded it (`git merge --ff-only origin/laptop`) before dispatching `summarize`, so the job read the merged files. Without that step the job would have summarized pre-merge files and still passed its output predicate. Fixed after the run in #25: `dispatch` now refuses a job while the checkout lacks the merge commit of any code unit it needs, and names the command that brings the checkout up to date.
-- **The public report shows `closure open` for the DONE job,** while its tracker is closed. A job closes on DONE, so the column is misleading, not wrong.
+- **The public report showed `closure open` for the DONE job,** while its tracker was closed. A job closes on its DONE judgment without a stored closure, so the column was misleading, not wrong. Fixed after the run: the report now derives `closed` for such a job.
 - **`LINEAR_API_KEY` reached the orchestrator's shell** although the session was started without it: Claude Code's Bash tool re-sources the user's shell profile. `survey` flagged it; it is not a model key, and the supervisor removes it from workers. No model key appeared.
 
 ### Laptop, Antigravity leg (O5 step 7): macOS, Antigravity host, local backend
