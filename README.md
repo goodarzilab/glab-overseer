@@ -7,7 +7,7 @@ It uses only what every lab member already has: a Claude Code subscription and a
 ## Why use it
 
 - **Parallel work without babysitting.** Up to three agents or jobs run at once, each in its own git worktree or output directory. You approve once and are interrupted only for decisions that are yours.
-- **Nothing closes on an agent's word.** A unit is done only when the supervisor has checked the evidence: the tests pass in a clean checkout of the exact commit, the change stays inside the approved paths, the declared outputs exist, and the tests actually fail without the change.
+- **Nothing closes on an agent's word.** A code change is done only when the supervisor has checked the evidence: the tests pass in a clean checkout of the exact commit, the change stays inside the approved paths, the declared outputs exist, and the tests actually fail without the change. A job is done only when the scheduler or the job's own exit record shows success and every declared output passes its checks.
 - **Cross-family review.** Code written by Claude is reviewed by Gemini, and code written by Gemini is reviewed by Claude. The orchestrator reproduces a finding before it acts on it.
 - **Resumable.** Every fact lives on disk under `.overseer/`. Close the laptop, lose the allocation or switch hosts, then run `overseer.py status` and `overseer.py next` in a new session and carry on.
 - **Shareable record.** `overseer.py report --public` writes a report built from an allowlist: what merged, which tests ran, who reviewed, and every item that is incomplete or uncertain.
