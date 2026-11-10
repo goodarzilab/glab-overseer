@@ -194,6 +194,41 @@ class PublicAllowlistTests(ReportCase):
         self.assertIn({"unit": "alpha", "item": "an output record has an invalid path"}, rep["incomplete"])
 
 
+class UsageTests(ReportCase):
+    def test_token_usage_is_summed_per_role_and_family_and_unknown_is_counted_not_zeroed(self):
+        self.make_alpha()
+        inv = os.path.join(self.adir("alpha"), "inv", "01-author")
+        with open(os.path.join(inv, "stdout.log"), "w") as f:  # claude -p event array; the result event carries usage
+            json.dump([{"type": "system"}, {"type": "result", "usage": {
+                "input_tokens": 6, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 40, "output_tokens": 7,
+                "service_tier": TOKEN}}], f)
+        fx = os.path.join(self.adir("alpha"), "inv", "02-fixer")
+        wj(os.path.join(fx, "intent.json"), {"token": TOKEN_ID, "kind": "fixer", "argv": ["/x/bin/claude", "--model", "sonnet"],
+                                             "backend": "local", "cwd": HOME})
+        with open(os.path.join(fx, "stdout.log"), "w") as f:
+            f.write("not json " + HOME)  # a crashed fixer: unknown, never zero
+        r1 = os.path.join(self.adir("alpha"), "reviews", "r1")
+        with open(os.path.join(r1, "round.json")) as f:
+            rd = json.load(f)
+        rd["calls"][0]["dir"], rd["calls"][1]["dir"] = "c1", "c2"
+        wj(os.path.join(r1, "round.json"), rd)
+        wj(os.path.join(r1, "c1", "stdout.txt"), {"status": "SUCCESS", "usage": {
+            "input_tokens": 50, "output_tokens": 5, "cache_read_tokens": 30, "thinking_tokens": 2, "total_tokens": 55}})
+        wj(os.path.join(r1, "c2", "stdout.txt"), {"type": "result", "usage": {"input_tokens": 1, "output_tokens": -1}})
+        rep = self.build()
+        alpha = self.units(rep)["alpha"]
+        self.assertEqual(alpha["attempts"][0]["author_usage"], {"calls": 1, "unknown_calls": 1, "input": 6, "cache_read": 100,
+                                                                "cache_write": 40, "output": 7})
+        self.assertEqual(alpha["attempts"][0]["reviews"][0]["usage"], {"calls": 1, "unknown_calls": 1, "input": 50,
+                                                                       "cache_read": 30, "cache_write": 0, "output": 5})
+        rows = {(r["role"], r["family"]): r for r in rep["plans"][0]["usage"]}
+        self.assertEqual((rows[("author", "claude")]["input"], rows[("author", "claude")]["unknown_calls"]), (6, 1))
+        md = report.render(rep)
+        self.assertIn("| author | claude | 1 | 6 | 100 | 40 | 7 | 1 |", md)
+        self.assertNotIn(TOKEN, json.dumps(rep))
+        self.assertNotIn(HOME, json.dumps(rep))
+
+
 class StateTests(ReportCase):
     def test_incomplete_items_list_uncertain_and_pending(self):
         self.make_alpha()
@@ -575,7 +610,7 @@ class FilesTests(ReportCase):
                 rep = json.load(f)
             with open(os.path.join(out, "report.md")) as f:
                 md = f.read()
-            rows = dict((m.group(1), m.group(2)) for m in re.finditer(r"^\| ([a-z0-9_-]+) \| \w+ \| ([A-Za-z_]+) \|", md, re.M) if m.group(1) != "unit")
+            rows = dict((m.group(1), m.group(2)) for m in re.finditer(r"^\| ([a-z0-9_-]+) \| \w+ \| ([A-Za-z_]+) \|", md, re.M) if m.group(1) not in ("unit", "role"))  # table headers
             states = dict((u["id"], u["state"]) for p in rep["plans"] for u in p["units"])
             self.assertEqual(rows, states)
             self.assertEqual(rep["public"], public)

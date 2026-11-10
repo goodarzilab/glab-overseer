@@ -168,7 +168,7 @@ overseer.py next
 overseer.py report --public
 ```
 
-writes `.overseer/report/public/report.md` and `report.json`: one row per unit with its state, attempts, pull request, issue, merge commits, workers, review rounds and output digests, followed by every incomplete or uncertain item. The public report is built from an allowlist of fields and is meant to be shared. `overseer.py report` without `--public` writes the private report with every record; keep that one to yourself.
+writes `.overseer/report/public/report.md` and `report.json`: one row per unit with its state, attempts, pull request, issue, merge commits, workers, review rounds and output digests, followed by every incomplete or uncertain item. Each plan also gets a token table (calls, input, cache read, cache write and output tokens per role and model family), taken from what `claude` and `agy` report about their own calls; a call with no usage in its output is counted as unknown, never as zero. The public report is built from an allowlist of fields and is meant to be shared. `overseer.py report` without `--public` writes the private report with every record; keep that one to yourself.
 
 ## Warning: API keys
 

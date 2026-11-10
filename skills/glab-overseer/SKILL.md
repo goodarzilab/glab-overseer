@@ -104,7 +104,7 @@ A new session, a new host or a new machine: `cd` into the project, run `overseer
 
 ## 9. Reporting (O13)
 
-Tell the user at each merged PR (unit, PR number, what changed, test result) and immediately when the owner is needed (what you need decided, your recommendation). Keep messages short. At the end run `overseer.py report --public` and give the user `report.md` (default `.overseer/report/public/`). `overseer.py report` without `--public` writes the private report with every record; do not share it. `--out DIR` chooses the directory. The public report lists every UNCERTAIN or incomplete item; never describe the run as complete when it does.
+Tell the user at each merged PR (unit, PR number, what changed, test result) and immediately when the owner is needed (what you need decided, your recommendation). Keep messages short. At the end run `overseer.py report --public` and give the user `report.md` (default `.overseer/report/public/`). `overseer.py report` without `--public` writes the private report with every record; do not share it. `--out DIR` chooses the directory. The public report lists every UNCERTAIN or incomplete item; never describe the run as complete when it does. It also totals token usage per role and family from what each CLI reported about its own calls; a call whose output carried no usage is counted as unknown, not as zero. These are subscription tokens, not a bill.
 
 ## 10. Failure and honesty
 

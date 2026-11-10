@@ -153,6 +153,49 @@ def _author(inv, gaps, uid):
     return backend, fam, model
 
 
+USAGE_KEYS = ("input", "cache_read", "cache_write", "output")
+# Token fields as each CLI reports them in its JSON result: claude -p (a result event) and agy -p (one object).
+_USAGE_MAP = {"claude": {"input": "input_tokens", "cache_read": "cache_read_input_tokens",
+                         "cache_write": "cache_creation_input_tokens", "output": "output_tokens"},
+              "google": {"input": "input_tokens", "cache_read": "cache_read_tokens", "output": "output_tokens"}}
+
+
+def _usage_of(path):
+    """Token counts from one worker or reviewer stdout, as {key: int}; None when the file has no readable usage.
+    The counts are what the CLI reported about itself; nothing here can verify them."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if isinstance(data, list):  # claude -p --output-format json may print the event array; the result event is last
+        data = next((e for e in reversed(data) if isinstance(e, dict) and e.get("type") == "result"), None)
+    if not isinstance(data, dict) or not isinstance(data.get("usage"), dict):
+        return None
+    use = data["usage"]
+    fam = "claude" if "cache_read_input_tokens" in use or "cache_creation_input_tokens" in use else "google"
+    out = {}
+    for k, src in _USAGE_MAP[fam].items():
+        if src in use:
+            if _int(use[src]) is None:
+                return None
+            out[k] = use[src]
+    return out if "input" in out and "output" in out else None
+
+
+def _add_usage(tot, use):
+    if use is None:
+        tot["unknown_calls"] += 1
+    else:
+        tot["calls"] += 1
+        for k in USAGE_KEYS:
+            tot[k] += use.get(k, 0)
+
+
+def _empty_usage():
+    return dict({"calls": 0, "unknown_calls": 0}, **{k: 0 for k in USAGE_KEYS})
+
+
 def _reviews(adir, uid, gaps):
     rounds = []
     base = os.path.join(adir, "reviews")
@@ -171,7 +214,12 @@ def _reviews(adir, uid, gaps):
         for d in ((disp or {}).get("dispositions") or {}).values():
             if isinstance(d, dict) and d.get("ruling") in R.RULINGS:
                 counts[d["ruling"]] = counts.get(d["ruling"], 0) + 1
+        use = _empty_usage()
+        for c in calls:
+            if isinstance(c.get("dir"), str) and re.fullmatch(r"c[0-9]+", c["dir"]):
+                _add_usage(use, _usage_of(os.path.join(rdir, c["dir"], "stdout.txt")))
         rounds.append({
+            "usage": use,
             "round": _int(rd.get("round")), "state": _word(rd.get("state")), "verdict": _word(rd.get("verdict")),
             "candidate": _sha(rd.get("candidate")),
             "reviewer_family": last.get("family") if last.get("family") in FAMILY.values() else _word(rd.get("reviewer_family")),
@@ -187,20 +235,23 @@ def _attempt(root, pid, u, n, repo, gaps, need_judgment=False):
     adir = paths.attempt_dir(root, pid, uid, n)
     invs = [i for i in X.iter_invocations(root, pid, uid) if i["attempt"] == n]
     kinds, backends, models = {}, [], []
+    author_use = _empty_usage()
     for i in invs:
         kinds[i["kind"]] = kinds.get(i["kind"], 0) + 1
         b, fam, model = _author(i["path"], gaps, uid)
         if b and b not in backends:
             backends.append(b)
-        if i["kind"] in ("author", "fixer") and {"family": fam, "model": model} not in models:
-            models.append({"family": fam, "model": model})
+        if i["kind"] in ("author", "fixer"):
+            _add_usage(author_use, _usage_of(os.path.join(i["path"], "stdout.log")))
+            if {"family": fam, "model": model} not in models:
+                models.append({"family": fam, "model": model})
     ws = gaps.obj(os.path.join(adir, "workspace.json"), uid, "workspace") if u["kind"] == "code" else None
     wt = ws.get("worktree") if isinstance(ws, dict) and isinstance(ws.get("worktree"), str) and os.path.isdir(ws["worktree"]) else None
     j = gaps.obj(os.path.join(adir, "judgment.json"), uid, "judgment", need_judgment) or {}
     integ = gaps.obj(os.path.join(adir, "integration.json"), uid, "integration record") or {}
     dec = gaps.obj(os.path.join(adir, "reviews", "orchestrator_decision.json"), uid, "orchestrator decision")
     return {
-        "attempt": n, "backends": backends, "invocations": kinds, "workers": models,
+        "attempt": n, "backends": backends, "invocations": kinds, "workers": models, "author_usage": author_use,
         "base": _sha((ws or {}).get("base")),
         "integration_base": _sha(integ.get("integration_base")),
         "judgment": {"status": _word(j.get("status")), "candidate": _sha(j.get("candidate")),
@@ -326,8 +377,25 @@ def public_report(root):
             seen.add(u["id"])
             units.append(_unit(root, pid, live.get(u["id"], u), approval.load_unit_state(root, pid, u["id"]),
                                repo, gaps, u["id"] in live))
-        plans.append({"plan_id": pid, "units": units})
+        plans.append({"plan_id": pid, "units": units, "usage": _plan_usage(units)})
     return {"public": True, "plans": plans, "incomplete": gaps.items}
+
+
+def _plan_usage(units):
+    """Token totals per (role, family) across every attempt and review round of the plan."""
+    rows = {}
+    def add(role, fam, use):
+        t = rows.setdefault((role, fam or "unknown"), _empty_usage())
+        for k in t:
+            t[k] += use[k]
+    for u in units:
+        for a in u["attempts"]:
+            fams = sorted(set(w["family"] or "unknown" for w in a["workers"]))
+            add("author", fams[0] if len(fams) == 1 else "mixed", a["author_usage"])
+            for r in a["reviews"]:
+                add("review", r["reviewer_family"], r["usage"])
+    return [dict({"role": role, "family": fam}, **t) for (role, fam), t in sorted(rows.items())
+            if t["calls"] or t["unknown_calls"]]
 
 
 # ---- private -----------------------------------------------------------------
@@ -504,6 +572,14 @@ def render(rep):
                 u["id"], u["kind"], u["state"], u["attempts_used"], f["closure"], f["tracker"],
                 (u["pr"] or {}).get("number"), (u["issue"] or {}).get("number"))))
         out.append("")
+        if p.get("usage"):
+            out += ["Token usage, as reported by each CLI (subscription use, not a bill):", "",
+                    "| role | family | calls | input | cache read | cache write | output | usage unknown |",
+                    "|---|---|---|---|---|---|---|---|"]
+            out += ["| %s | %s | %d | %s | %s | %s | %s | %d |" % (
+                r["role"], r["family"], r["calls"], "{:,}".format(r["input"]), "{:,}".format(r["cache_read"]),
+                "{:,}".format(r["cache_write"]), "{:,}".format(r["output"]), r["unknown_calls"]) for r in p["usage"]]
+            out.append("")
         for u in p["units"]:
             out.append("### %s: %s" % (u["id"], _cell(u["title"])))
             if u["pr"]:
