@@ -8,7 +8,7 @@ import unittest
 import test_u5 as U5
 from test_u5 import COMMIT, jload, sh
 
-from overseer import approval, execution as X, judge as J, review as R, workspace as W
+from overseer import approval, paths, execution as X, judge as J, review as R, workspace as W
 
 AUTHOR = ('mkdir -p src tests; echo hi > src/alpha.py; echo t > tests/test_alpha.py; git add src tests; %s; '
           "echo '[{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"author-sess\"}]'"
@@ -265,6 +265,85 @@ class Review(Case):
         self.assertTrue(dec["orchestrator_decision"])
         self.commit_more("src/alpha_extra.py")
         self.assertEqual(self.state()["state"], "NOT_ELIGIBLE")  # bound to the old candidate
+
+
+class Budget(Case):
+    """The review cap is a budget per logical unit: earlier attempts and a split parent count against it."""
+
+    def inherit(self, rounds):
+        st = approval.load_unit_state(self.root, "demo", "alpha")
+        st["lineage"] = {"parent": "alpha0", "reason": "test", "time": "2026-11-10T00:00:00Z", "review_rounds": rounds}
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+
+    def test_rounds_used_before_this_attempt_leave_less_budget(self):
+        self.done()
+        self.inherit(2)
+        self.reviewer("agy", agy_out(fail(), "s"))
+        self.assertEqual(self.review()[1]["round"], 1)
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "alpha")["counters"]["review_rounds"], 3)
+        n = len(self.calls())
+        rc, _, err = self.review()
+        self.assertEqual(rc, 1)
+        self.assertIn("2 used before this attempt", err)
+        self.assertEqual(len(self.calls()), n)
+        self.commit_more("src/alpha_extra.py")  # a fixed candidate after the last permitted round
+        self.assertEqual(self.cli("judge", "alpha")[0], 0)
+        self.assertIn("stop alpha: review cap reached", self.cli("next")[1])
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "three rounds across the unit")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(json.loads(out)["orchestrator_decision"])
+
+    def test_spent_budget_stops_next_and_admits_a_decision_without_a_new_round(self):
+        self.done()
+        self.inherit(3)
+        rc, out, err = self.cli("next")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("stop alpha: the unit's review budget is used by earlier attempts", out)
+        rc, _, err = self.review()
+        self.assertEqual(rc, 1)
+        self.assertIn("capped at 3 per unit", err)
+        self.assertEqual(self.calls(), [])
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "budget used by a1")
+        self.assertEqual((rc, json.loads(out)["state"]), (0, "ELIGIBLE"), err)
+
+    def test_used_counts_round_directories_of_earlier_attempts_and_lineage(self):
+        self.done()
+        for k, names in ((1, ["r1", "r2", "rx", "r0"]), (2, ["r1"]), (3, [])):
+            for nm in names:
+                os.makedirs(os.path.join(self.attempt_dir(n=k), "reviews", nm), exist_ok=True)
+        used = approval.review_rounds_used
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=1), 0)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 2)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=3), 3)
+        self.assertEqual(used(self.root, "demo", "alpha"), 3)
+        self.inherit(1)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+        with open(os.path.join(self.attempt_dir(n=1), "reviews", "r9"), "w") as f:
+            f.write("not a round")  # a file is not a round
+        os.makedirs(os.path.join(self.attempt_dir(n=1), "reviews", "r8\n"))  # nor a name with a trailing newline
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+
+    def test_an_unfinished_round_over_a_legacy_budget_stops_next(self):
+        self.done()
+        self.inherit(3)
+        os.makedirs(self.rdir(1))
+        with open(os.path.join(self.rdir(1), "round.json"), "w") as f:
+            json.dump({"round": 1, "state": "aborted", "retried": False}, f)
+        self.assertIn("stop alpha: the unit's review budget of 3 rounds is used", self.cli("next")[1])
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "legacy rounds used the budget")
+        self.assertEqual(rc, 0, err)
+
+    def test_child_split_before_the_record_inherits_its_parents_rounds(self):
+        self.done()
+        for nm in ("r1", "r2"):
+            os.makedirs(os.path.join(paths.attempt_dir(self.root, "demo", "alpha0", 1), "reviews", nm))
+        st = approval.load_unit_state(self.root, "demo", "alpha")
+        st["lineage"] = {"parent": "alpha0", "reason": "legacy", "time": "2026-11-01T00:00:00Z"}
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+        self.assertEqual(approval.review_rounds_used(self.root, "demo", "alpha", before_attempt=1), 2)
+        st["lineage"]["parent"] = "alpha"  # a self-referencing lineage cannot loop
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+        self.assertEqual(approval.review_rounds_used(self.root, "demo", "alpha", before_attempt=1), 0)
 
 
 class Dispositions(Case):

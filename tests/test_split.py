@@ -44,6 +44,15 @@ class SplitTests(TmpCase):
         self.assertIn("unit=alpha-a", revs[0]["drafts"]["alpha-a"]["body"])
         self.assertEqual(A.require_approval(self.root, "demo")["digest"], self.digest)
 
+    def test_children_inherit_the_review_rounds_the_parent_used(self):
+        for k, names in ((1, ["r1", "r2"]), (2, ["r1"])):
+            for nm in names:
+                os.makedirs(os.path.join(paths.attempt_dir(self.root, "demo", "alpha", k), "reviews", nm))
+        self.split(self.good_children())
+        for cid in ("alpha-a", "alpha-b"):
+            self.assertEqual(A.load_unit_state(self.root, "demo", cid)["lineage"]["review_rounds"], 3)
+            self.assertEqual(A.review_rounds_used(self.root, "demo", cid, before_attempt=2), 3)
+
     def test_effective_plan_rewires_dependents(self):
         self.split(self.good_children())
         units = A.effective_plan(self.root, "demo")["units"]
