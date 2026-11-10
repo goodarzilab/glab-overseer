@@ -73,7 +73,7 @@ def _rounds(adir):
     base = os.path.join(adir, "reviews")
     out = []
     for name in sorted(os.listdir(base) if os.path.isdir(base) else [], key=lambda s: (len(s), s)):
-        m = re.match(r"^r([1-9][0-9]*)$", name)
+        m = re.fullmatch(r"r([1-9][0-9]*)", name)
         if m and os.path.isdir(os.path.join(base, name)):
             rd = _obj(os.path.join(base, name, "round.json"))
             if rd is None:  # crashed after mkdir, before round.json: no reviewer was invoked

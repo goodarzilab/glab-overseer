@@ -376,6 +376,8 @@ def _review_action(adir, plan, cand, reasons=(), before=0):
     """`before` is the review rounds the unit used before this attempt: the cap is a budget per unit."""
     rounds = R._rounds(adir)
     cap = plan["caps"]["review_rounds"] - before
+    if len(rounds) > cap:  # only state from before the budget was per unit can get here
+        return "stop", "the unit's review budget of %d rounds is used: an orchestrator decision is needed" % plan["caps"]["review_rounds"]
     if rounds and any("reviewer session id" in r for r in reasons):  # dispositions cannot repair an invalid reviewer session
         return ("review", "") if len(rounds) < cap else ("stop", "review round r%d used a non-independent reviewer session at the cap" % rounds[-1][0])
     if not rounds:

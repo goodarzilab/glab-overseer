@@ -320,7 +320,18 @@ class Budget(Case):
         self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
         with open(os.path.join(self.attempt_dir(n=1), "reviews", "r9"), "w") as f:
             f.write("not a round")  # a file is not a round
+        os.makedirs(os.path.join(self.attempt_dir(n=1), "reviews", "r8\n"))  # nor a name with a trailing newline
         self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+
+    def test_an_unfinished_round_over_a_legacy_budget_stops_next(self):
+        self.done()
+        self.inherit(3)
+        os.makedirs(self.rdir(1))
+        with open(os.path.join(self.rdir(1), "round.json"), "w") as f:
+            json.dump({"round": 1, "state": "aborted", "retried": False}, f)
+        self.assertIn("stop alpha: the unit's review budget of 3 rounds is used", self.cli("next")[1])
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "legacy rounds used the budget")
+        self.assertEqual(rc, 0, err)
 
     def test_child_split_before_the_record_inherits_its_parents_rounds(self):
         self.done()
