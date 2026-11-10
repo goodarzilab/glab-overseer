@@ -24,7 +24,7 @@ Run these in the project, in order, and read the output:
 3. `overseer.py probe-transport` measures stdin and `--json-schema` support of each CLI.
 4. On a cluster only: from inside an interactive allocation run `overseer.py slurm-handshake --plan PLAN_ID`. It proves a batch job sees the project root. Use shared storage for the project, not `/tmp`.
 
-Then interview the user. Ask only what inspection cannot answer: the repository (`owner/name`) and target branch, what done looks like, which paths may change, how to test, what needs a batch job. Write `plan.json` (format and a complete example: `references/plan-format.md`), then:
+Then interview the user. Ask only what inspection cannot answer: the repository (`owner/name`) and target branch, what done looks like, which paths may change, how to test, what needs a batch job. Before you write the claims, test command or outputs of a unit that parses, walks, counts or summarizes project data, read a small real sample yourself, read-only (the first lines of a file, a directory listing, one record), and write the contract against what you saw, not against what the data is assumed to look like. Write `plan.json` (format and a complete example: `references/plan-format.md`), then:
 
 ```
 overseer.py plan validate plan.json
@@ -41,7 +41,7 @@ Before `plan approve`, show the user the plan and every issue title (`validate` 
 | next says | you run |
 |---|---|
 | `dispatch` | `overseer.py dispatch` (every READY unit up to the free slots) or `dispatch --unit U` |
-| `wait` | `overseer.py wait` (polls in Python, no model turns; exit 3 on timeout, so call it again) |
+| `wait` | `overseer.py wait --timeout S` (polls in Python; exit 3 on timeout, so call it again; choose S as below) |
 | `judge` | `overseer.py judge U` (exit 0 DONE, 1 FAILED, 4 UNCERTAIN) |
 | `resolve` | section 6 |
 | `retry` | `dispatch --unit U` starts the next attempt (cap: 2) |
@@ -53,6 +53,8 @@ Before `plan approve`, show the user the plan and every issue title (`validate` 
 | `merge` | `overseer.py merge U` |
 | `tracker` | rerun `merge U` (code) or `overseer.py issues close U --comment TEXT` (job) |
 | `stop` | the owner decides: section 4 |
+
+Every `wait` call costs a model turn, however short; the time inside it costs none. So block as long as your host's command tool allows instead of polling: in Claude Code run `overseer.py wait --timeout 570` with the Bash tool's 600000 ms timeout; in Antigravity give the command a wait-before-async that covers the timeout. Never loop on short timeouts such as `--timeout 8`. If the host moves the command to the background, wait for its completion notice rather than polling it.
 
 Per code unit the path is `dispatch`, `wait`, `judge`, `review`; then, for each finding you might act on, `overseer.py reproduce U --finding ID --command CMD`, and `dispositions` to rule on all of them; when a fix is needed, `fix`, `judge` and `review` again; then `nonvacuous`, `pr`, `merge`. Job units close on a DONE judgment; no review or PR. A job runs in the project checkout: before dispatching one that needs merged code units, update the checkout to the target, or `dispatch` refuses it. `status` (or `status --json`) shows unit facets, active invocations and slots at any time. `abort U` stops a unit's active invocations. `plan split U --into SPEC.json --reason TEXT` replaces an unclosed unit with narrower children inside the approved scope. Exact semantics and exit codes: `references/operating-loop.md`. Review mechanics: `references/review.md`.
 
@@ -96,7 +98,7 @@ Use `--as done` only for a job whose output predicates pass and for which no fai
 
 ## 7. Caps (O12, D1)
 
-At most 3 concurrent workers per project. The cap counts background executions only: authors, fixers and job units, including queued and uncertain ones. Reviews, reproductions, tests and `nonvacuous` run one at a time and do not count. At most 2 attempts per unit and 3 review rounds per pull request. At the review cap, rule alone with `overseer.py dispositions U --orchestrator-decision TEXT`; it is recorded and labeled. Raising any cap needs the owner and a new approval.
+At most 3 concurrent workers per project. The cap counts background executions only: authors, fixers and job units, including queued and uncertain ones. Reviews, reproductions, tests and `nonvacuous` run one at a time and do not count. At most 2 attempts per unit and 3 review rounds per unit. The round budget belongs to the logical unit: rounds used in earlier attempts, and by a split parent, count against it, so a retry or a split never resets it. At the review cap, rule alone with `overseer.py dispositions U --orchestrator-decision TEXT`; it is recorded and labeled. Raising any cap needs the owner and a new approval.
 
 ## 8. Resuming
 
