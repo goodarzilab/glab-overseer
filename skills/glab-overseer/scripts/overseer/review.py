@@ -74,7 +74,7 @@ def _rounds(adir):
     out = []
     for name in sorted(os.listdir(base) if os.path.isdir(base) else [], key=lambda s: (len(s), s)):
         m = re.match(r"^r([1-9][0-9]*)$", name)
-        if m:
+        if m and os.path.isdir(os.path.join(base, name)):
             rd = _obj(os.path.join(base, name, "round.json"))
             if rd is None:  # crashed after mkdir, before round.json: no reviewer was invoked
                 rd = _aborted(int(m.group(1)))
@@ -331,7 +331,8 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
                 text = f.read()
         else:
             R = last[0] if (retry and aborted) else (last[0] if last else 0) + 1
-            if before + R > _cap(plan):
+            total = before + len(rounds) + (0 if (retry and aborted) else 1)  # rounds counted as directories, like the decision
+            if total > _cap(plan):
                 raise ReviewError("review rounds are capped at %d per unit (%d used before this attempt); the orchestrator "
                                   "rules alone with `dispositions %s --orchestrator-decision TEXT`"
                                   % (_cap(plan), before, unit["id"]))
@@ -349,7 +350,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
                   "same_family_fallback": False, "calls": [], "verdict": None}
             store.write_json_atomic(os.path.join(rdir, "round.json"), rd)
             st = approval.load_unit_state(root, plan_id, unit["id"])
-            st["counters"]["review_rounds"] = before + R
+            st["counters"]["review_rounds"] = total
             approval.save_unit_state(root, plan_id, unit["id"], st)
             store.append_event(root, "review_round_started", plan_id=plan_id, unit_id=unit["id"], round=R, candidate=cand)
         if reuse:

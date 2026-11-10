@@ -8,7 +8,7 @@ import unittest
 import test_u5 as U5
 from test_u5 import COMMIT, jload, sh
 
-from overseer import approval, execution as X, judge as J, review as R, workspace as W
+from overseer import approval, paths, execution as X, judge as J, review as R, workspace as W
 
 AUTHOR = ('mkdir -p src tests; echo hi > src/alpha.py; echo t > tests/test_alpha.py; git add src tests; %s; '
           "echo '[{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"author-sess\"}]'"
@@ -286,6 +286,9 @@ class Budget(Case):
         self.assertEqual(rc, 1)
         self.assertIn("2 used before this attempt", err)
         self.assertEqual(len(self.calls()), n)
+        self.commit_more("src/alpha_extra.py")  # a fixed candidate after the last permitted round
+        self.assertEqual(self.cli("judge", "alpha")[0], 0)
+        self.assertIn("stop alpha: review cap reached", self.cli("next")[1])
         rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "three rounds across the unit")
         self.assertEqual(rc, 0, err)
         self.assertTrue(json.loads(out)["orchestrator_decision"])
@@ -315,6 +318,21 @@ class Budget(Case):
         self.assertEqual(used(self.root, "demo", "alpha"), 3)
         self.inherit(1)
         self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+        with open(os.path.join(self.attempt_dir(n=1), "reviews", "r9"), "w") as f:
+            f.write("not a round")  # a file is not a round
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+
+    def test_child_split_before_the_record_inherits_its_parents_rounds(self):
+        self.done()
+        for nm in ("r1", "r2"):
+            os.makedirs(os.path.join(paths.attempt_dir(self.root, "demo", "alpha0", 1), "reviews", nm))
+        st = approval.load_unit_state(self.root, "demo", "alpha")
+        st["lineage"] = {"parent": "alpha0", "reason": "legacy", "time": "2026-11-01T00:00:00Z"}
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+        self.assertEqual(approval.review_rounds_used(self.root, "demo", "alpha", before_attempt=1), 2)
+        st["lineage"]["parent"] = "alpha"  # a self-referencing lineage cannot loop
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+        self.assertEqual(approval.review_rounds_used(self.root, "demo", "alpha", before_attempt=1), 0)
 
 
 class Dispositions(Case):
