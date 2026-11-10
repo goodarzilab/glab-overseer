@@ -165,25 +165,28 @@ USAGE_FILE_MAX = 64 * 1024 * 1024
 
 def _usage_of(path, family=None):
     """Token counts from one worker or reviewer stdout, as {key: int}; None when the file has no readable usage.
-    `family` is the call's recorded family and picks the field names. Only a regular file is read (never a FIFO
-    or device, which could block). The counts are what the CLI reported about itself; nothing here verifies them."""
+    `family` is the call's recorded family and picks the field names; without a known family the usage is
+    unknown, never guessed. Only a regular file is read: it is opened non-blocking and without following links,
+    then checked on the open descriptor, so a FIFO or device cannot block the report. The counts are what the CLI
+    reported about itself; nothing here verifies them."""
+    if not (isinstance(family, str) and family in _USAGE_MAP):
+        return None
     try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > USAGE_FILE_MAX:
-            return None
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > USAGE_FILE_MAX:
+                return None
+            data = json.loads(f.read(USAGE_FILE_MAX + 1).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return None
     if isinstance(data, list):  # claude -p --output-format json may print the event array; the result event is last
         data = next((e for e in reversed(data) if isinstance(e, dict) and e.get("type") == "result"), None)
     if not isinstance(data, dict) or not isinstance(data.get("usage"), dict):
         return None
     use = data["usage"]
-    fam = family if family in _USAGE_MAP else (
-        "claude" if "cache_read_input_tokens" in use or "cache_creation_input_tokens" in use else "google")
     out = {}
-    for k, src in _USAGE_MAP[fam].items():
+    for k, src in _USAGE_MAP[family].items():
         if src in use:
             if _int(use[src]) is None:
                 return None
@@ -206,7 +209,7 @@ def _empty_usage():
 
 def _add_by_family(by, fam, use):
     """Each call is attributed to its own family, so mixed attempts and fallback rounds stay separate."""
-    _add_usage(by.setdefault(fam if fam in ("claude", "google") else "unknown", _empty_usage()), use)
+    _add_usage(by.setdefault(fam if isinstance(fam, str) and fam in _USAGE_MAP else "unknown", _empty_usage()), use)
 
 
 def _reviews(adir, uid, gaps):

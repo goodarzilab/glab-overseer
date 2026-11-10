@@ -255,6 +255,18 @@ class UsageTests(ReportCase):
         g = next(r for r in rep["plans"][0]["usage"] if (r["role"], r["family"]) == ("review", "google"))
         self.assertEqual((g["cache_read"], g["cache_write"]), (3, 0))
 
+    def test_usage_without_a_known_family_or_with_string_counts_is_unknown(self):
+        p = os.path.join(self.tmp, "out.json")
+        wj(p, {"type": "result", "usage": {"input_tokens": 6, "output_tokens": 1, "cache_read_tokens": 3}})
+        self.assertEqual(report._usage_of(p, "google"), {"input": 6, "output": 1, "cache_read": 3})
+        for fam in (None, [], "mixed"):
+            self.assertIsNone(report._usage_of(p, fam))
+        wj(p, {"type": "result", "usage": {"input_tokens": "6", "output_tokens": 1}})
+        self.assertIsNone(report._usage_of(p, "claude"))
+        by = {}
+        report._add_by_family(by, [], None)  # an unhashable recorded family is unknown, not a crash
+        self.assertEqual(by["unknown"]["unknown_calls"], 1)
+
 
 class StateTests(ReportCase):
     def test_incomplete_items_list_uncertain_and_pending(self):
