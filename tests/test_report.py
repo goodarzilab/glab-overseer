@@ -228,6 +228,26 @@ class UsageTests(ReportCase):
         self.assertNotIn(TOKEN, json.dumps(rep))
         self.assertNotIn(HOME, json.dumps(rep))
 
+    def test_each_call_counts_for_its_own_family_and_odd_records_are_unknown(self):
+        self.make_alpha()
+        with open(os.path.join(self.adir("alpha"), "inv", "01-author", "stdout.log"), "w") as f:
+            json.dump({"type": "result", "usage": {"input_tokens": 6, "output_tokens": 1}}, f)
+        fx = os.path.join(self.adir("alpha"), "inv", "02-fixer")
+        wj(os.path.join(fx, "intent.json"), {"token": TOKEN_ID, "kind": "fixer", "argv": ["/x/bin/agy", "--model", "gemini-4-argon-high"],
+                                             "backend": "local", "cwd": HOME})
+        with open(os.path.join(fx, "stdout.log"), "w") as f:
+            f.write("[" * 5000 + "]" * 5000)  # nesting deep enough to exhaust the parser: unknown, and the report survives
+        r1 = os.path.join(self.adir("alpha"), "reviews", "r1")
+        with open(os.path.join(r1, "round.json")) as f:
+            rd = json.load(f)
+        rd["calls"][0]["dir"] = "c1"  # google call with usage; the claude fallback call has no directory recorded
+        wj(os.path.join(r1, "round.json"), rd)
+        wj(os.path.join(r1, "c1", "stdout.txt"), {"usage": {"input_tokens": 50, "output_tokens": 5, "cache_read_tokens": 3}})
+        rep = self.build()
+        rows = {(r["role"], r["family"]): (r["calls"], r["unknown_calls"], r["input"]) for r in rep["plans"][0]["usage"]}
+        self.assertEqual(rows, {("author", "claude"): (1, 0, 6), ("author", "google"): (0, 1, 0),
+                                ("review", "google"): (1, 0, 50), ("review", "claude"): (0, 1, 0)})
+
 
 class StateTests(ReportCase):
     def test_incomplete_items_list_uncertain_and_pending(self):

@@ -166,7 +166,7 @@ def _usage_of(path):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         return None
     if isinstance(data, list):  # claude -p --output-format json may print the event array; the result event is last
         data = next((e for e in reversed(data) if isinstance(e, dict) and e.get("type") == "result"), None)
@@ -196,6 +196,11 @@ def _empty_usage():
     return dict({"calls": 0, "unknown_calls": 0}, **{k: 0 for k in USAGE_KEYS})
 
 
+def _add_by_family(by, fam, use):
+    """Each call is attributed to its own family, so mixed attempts and fallback rounds stay separate."""
+    _add_usage(by.setdefault(fam if fam in ("claude", "google") else "unknown", _empty_usage()), use)
+
+
 def _reviews(adir, uid, gaps):
     rounds = []
     base = os.path.join(adir, "reviews")
@@ -214,12 +219,14 @@ def _reviews(adir, uid, gaps):
         for d in ((disp or {}).get("dispositions") or {}).values():
             if isinstance(d, dict) and d.get("ruling") in R.RULINGS:
                 counts[d["ruling"]] = counts.get(d["ruling"], 0) + 1
-        use = _empty_usage()
-        for c in calls:
-            if isinstance(c.get("dir"), str) and re.fullmatch(r"c[0-9]+", c["dir"]):
-                _add_usage(use, _usage_of(os.path.join(rdir, c["dir"], "stdout.txt")))
+        use, by = _empty_usage(), {}
+        for c in calls:  # a call without a recognizable directory has no readable usage: unknown
+            got = (_usage_of(os.path.join(rdir, c["dir"], "stdout.txt"))
+                   if isinstance(c.get("dir"), str) and re.fullmatch(r"c[0-9]+", c["dir"]) else None)
+            _add_usage(use, got)
+            _add_by_family(by, c.get("family"), got)
         rounds.append({
-            "usage": use,
+            "usage": use, "usage_by_family": by,
             "round": _int(rd.get("round")), "state": _word(rd.get("state")), "verdict": _word(rd.get("verdict")),
             "candidate": _sha(rd.get("candidate")),
             "reviewer_family": last.get("family") if last.get("family") in FAMILY.values() else _word(rd.get("reviewer_family")),
@@ -235,14 +242,16 @@ def _attempt(root, pid, u, n, repo, gaps, need_judgment=False):
     adir = paths.attempt_dir(root, pid, uid, n)
     invs = [i for i in X.iter_invocations(root, pid, uid) if i["attempt"] == n]
     kinds, backends, models = {}, [], []
-    author_use = _empty_usage()
+    author_use, author_by = _empty_usage(), {}
     for i in invs:
         kinds[i["kind"]] = kinds.get(i["kind"], 0) + 1
         b, fam, model = _author(i["path"], gaps, uid)
         if b and b not in backends:
             backends.append(b)
         if i["kind"] in ("author", "fixer"):
-            _add_usage(author_use, _usage_of(os.path.join(i["path"], "stdout.log")))
+            got = _usage_of(os.path.join(i["path"], "stdout.log"))
+            _add_usage(author_use, got)
+            _add_by_family(author_by, fam, got)
             if {"family": fam, "model": model} not in models:
                 models.append({"family": fam, "model": model})
     ws = gaps.obj(os.path.join(adir, "workspace.json"), uid, "workspace") if u["kind"] == "code" else None
@@ -252,6 +261,7 @@ def _attempt(root, pid, u, n, repo, gaps, need_judgment=False):
     dec = gaps.obj(os.path.join(adir, "reviews", "orchestrator_decision.json"), uid, "orchestrator decision")
     return {
         "attempt": n, "backends": backends, "invocations": kinds, "workers": models, "author_usage": author_use,
+        "author_usage_by_family": author_by,
         "base": _sha((ws or {}).get("base")),
         "integration_base": _sha(integ.get("integration_base")),
         "judgment": {"status": _word(j.get("status")), "candidate": _sha(j.get("candidate")),
@@ -390,10 +400,11 @@ def _plan_usage(units):
             t[k] += use[k]
     for u in units:
         for a in u["attempts"]:
-            fams = sorted(set(w["family"] or "unknown" for w in a["workers"]))
-            add("author", fams[0] if len(fams) == 1 else "mixed", a["author_usage"])
+            for fam, use in a["author_usage_by_family"].items():
+                add("author", fam, use)
             for r in a["reviews"]:
-                add("review", r["reviewer_family"], r["usage"])
+                for fam, use in r["usage_by_family"].items():
+                    add("review", fam, use)
     return [dict({"role": role, "family": fam}, **t) for (role, fam), t in sorted(rows.items())
             if t["calls"] or t["unknown_calls"]]
 
