@@ -10,7 +10,7 @@ A plan is one JSON object. `overseer.py plan validate PLAN` checks it and prints
 | `repo` | GitHub `owner/name` |
 | `target_branch` | branch that pull requests merge into |
 | `scope` | repository-relative globs the plan may change; no absolute paths, no `..` |
-| `caps` | optional: `workers` (max 3), `attempts` (max 2), `review_rounds` (max 3). A value above its maximum is refused |
+| `caps` | optional: `workers` (max 3), `attempts` (max 2), `review_rounds` (max 3, a budget per unit across its attempts and splits). A value above its maximum is refused |
 | `test_globs` | optional: globs that mark test files for `nonvacuous` (default: `tests/**`, `test_*.py`, `*_test.py`) |
 | `slurm` | optional defaults for batch execution: `partition`, `account`, `qos`, `gres`, `time` (finite walltime), `cpus`, and exactly one of `mem` or `mem_per_cpu` |
 | `units` | list of units, at least one |

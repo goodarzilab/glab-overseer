@@ -267,6 +267,56 @@ class Review(Case):
         self.assertEqual(self.state()["state"], "NOT_ELIGIBLE")  # bound to the old candidate
 
 
+class Budget(Case):
+    """The review cap is a budget per logical unit: earlier attempts and a split parent count against it."""
+
+    def inherit(self, rounds):
+        st = approval.load_unit_state(self.root, "demo", "alpha")
+        st["lineage"] = {"parent": "alpha0", "reason": "test", "time": "2026-11-10T00:00:00Z", "review_rounds": rounds}
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+
+    def test_rounds_used_before_this_attempt_leave_less_budget(self):
+        self.done()
+        self.inherit(2)
+        self.reviewer("agy", agy_out(fail(), "s"))
+        self.assertEqual(self.review()[1]["round"], 1)
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "alpha")["counters"]["review_rounds"], 3)
+        n = len(self.calls())
+        rc, _, err = self.review()
+        self.assertEqual(rc, 1)
+        self.assertIn("2 used before this attempt", err)
+        self.assertEqual(len(self.calls()), n)
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "three rounds across the unit")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(json.loads(out)["orchestrator_decision"])
+
+    def test_spent_budget_stops_next_and_admits_a_decision_without_a_new_round(self):
+        self.done()
+        self.inherit(3)
+        rc, out, err = self.cli("next")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("stop alpha: the unit's review budget is used by earlier attempts", out)
+        rc, _, err = self.review()
+        self.assertEqual(rc, 1)
+        self.assertIn("capped at 3 per unit", err)
+        self.assertEqual(self.calls(), [])
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "budget used by a1")
+        self.assertEqual((rc, json.loads(out)["state"]), (0, "ELIGIBLE"), err)
+
+    def test_used_counts_round_directories_of_earlier_attempts_and_lineage(self):
+        self.done()
+        for k, names in ((1, ["r1", "r2", "rx", "r0"]), (2, ["r1"]), (3, [])):
+            for nm in names:
+                os.makedirs(os.path.join(self.attempt_dir(n=k), "reviews", nm), exist_ok=True)
+        used = approval.review_rounds_used
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=1), 0)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 2)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=3), 3)
+        self.assertEqual(used(self.root, "demo", "alpha"), 3)
+        self.inherit(1)
+        self.assertEqual(used(self.root, "demo", "alpha", before_attempt=2), 3)
+
+
 class Dispositions(Case):
     def fail_round(self, *fs):
         self.done()

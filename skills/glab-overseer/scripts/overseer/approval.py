@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 
 from . import paths, plan as P, store
 
@@ -64,6 +65,24 @@ def default_unit_state(plan_id, unit_id, digest=None):
 
 def unit_state_path(root, plan_id, unit_id):
     return os.path.join(paths.unit_dir(root, plan_id, unit_id), "unit.json")
+
+
+_ROUND_DIR = re.compile(r"^r[1-9][0-9]*$")
+_ATTEMPT_DIR = re.compile(r"^a([1-9][0-9]*)$")
+
+
+def review_rounds_used(root, plan_id, unit_id, before_attempt=None):
+    """Review rounds a unit has used across its attempts (only those before `before_attempt` when given), plus the
+    rounds its split parent had used. The review cap is a budget per logical unit, not per attempt."""
+    lin = load_unit_state(root, plan_id, unit_id).get("lineage") or {}
+    used = lin["review_rounds"] if type(lin.get("review_rounds")) is int and lin["review_rounds"] >= 0 else 0
+    adir = os.path.join(paths.unit_dir(root, plan_id, unit_id), "attempts")
+    for name in os.listdir(adir) if os.path.isdir(adir) else []:
+        m = _ATTEMPT_DIR.match(name)
+        if m and (before_attempt is None or int(m.group(1)) < before_attempt):
+            rdir = os.path.join(adir, name, "reviews")
+            used += sum(1 for r in (os.listdir(rdir) if os.path.isdir(rdir) else []) if _ROUND_DIR.match(r))
+    return used
 
 
 def load_unit_state(root, plan_id, unit_id):
@@ -346,7 +365,8 @@ def _apply_split_state(root, plan_id, rev, digest):
     for k in rev["children"]:
         if not os.path.exists(unit_state_path(root, plan_id, k["id"])):
             st = default_unit_state(plan_id, k["id"], digest)
-            st["lineage"] = {"parent": rev["parent"], "reason": rev["reason"], "time": rev["time"]}
+            st["lineage"] = {"parent": rev["parent"], "reason": rev["reason"], "time": rev["time"],
+                             "review_rounds": review_rounds_used(root, plan_id, rev["parent"])}
             st["counters"] = dict(pstate["counters"])
             st["authorization"]["via"] = "split"
             save_unit_state(root, plan_id, k["id"], st)

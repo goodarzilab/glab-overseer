@@ -372,13 +372,14 @@ def merge_unit(root, plan_id, unit):
 
 # ---- next ---------------------------------------------------------------------
 
-def _review_action(adir, plan, cand, reasons=()):
+def _review_action(adir, plan, cand, reasons=(), before=0):
+    """`before` is the review rounds the unit used before this attempt: the cap is a budget per unit."""
     rounds = R._rounds(adir)
-    cap = plan["caps"]["review_rounds"]
+    cap = plan["caps"]["review_rounds"] - before
     if rounds and any("reviewer session id" in r for r in reasons):  # dispositions cannot repair an invalid reviewer session
         return ("review", "") if len(rounds) < cap else ("stop", "review round r%d used a non-independent reviewer session at the cap" % rounds[-1][0])
     if not rounds:
-        return "review", ""
+        return ("review", "") if cap > 0 else ("stop", "the unit's review budget is used by earlier attempts: an orchestrator decision is needed")
     num, rdir, rd = rounds[-1]
     if rd.get("state") != "complete":
         return ("review", "--retry") if not rd.get("retried") else (
@@ -435,7 +436,7 @@ def _unit_action(root, plan, u, st, free, after_quota=False):
         return "stop", "%s: %s" % (stop.get("kind"), ", ".join(stop.get("files") or []))
     rs = R.review_state(root, pid, u)
     if rs["state"] != "ELIGIBLE":
-        return _review_action(adir, plan, j["candidate"], rs["reasons"])
+        return _review_action(adir, plan, j["candidate"], rs["reasons"], approval.review_rounds_used(root, pid, uid, before_attempt=n))
     nv = nonvacuity_problem(adir, j["candidate"], rs)
     if nv:
         return ("nonvacuous", "") if "no non-vacuity" in nv or "another candidate" in nv else ("stop", nv)
