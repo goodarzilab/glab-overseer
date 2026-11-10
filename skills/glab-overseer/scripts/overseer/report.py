@@ -160,10 +160,17 @@ _USAGE_MAP = {"claude": {"input": "input_tokens", "cache_read": "cache_read_inpu
               "google": {"input": "input_tokens", "cache_read": "cache_read_tokens", "output": "output_tokens"}}
 
 
-def _usage_of(path):
+USAGE_FILE_MAX = 64 * 1024 * 1024
+
+
+def _usage_of(path, family=None):
     """Token counts from one worker or reviewer stdout, as {key: int}; None when the file has no readable usage.
-    The counts are what the CLI reported about itself; nothing here can verify them."""
+    `family` is the call's recorded family and picks the field names. Only a regular file is read (never a FIFO
+    or device, which could block). The counts are what the CLI reported about itself; nothing here verifies them."""
     try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > USAGE_FILE_MAX:
+            return None
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
@@ -173,7 +180,8 @@ def _usage_of(path):
     if not isinstance(data, dict) or not isinstance(data.get("usage"), dict):
         return None
     use = data["usage"]
-    fam = "claude" if "cache_read_input_tokens" in use or "cache_creation_input_tokens" in use else "google"
+    fam = family if family in _USAGE_MAP else (
+        "claude" if "cache_read_input_tokens" in use or "cache_creation_input_tokens" in use else "google")
     out = {}
     for k, src in _USAGE_MAP[fam].items():
         if src in use:
@@ -221,7 +229,7 @@ def _reviews(adir, uid, gaps):
                 counts[d["ruling"]] = counts.get(d["ruling"], 0) + 1
         use, by = _empty_usage(), {}
         for c in calls:  # a call without a recognizable directory has no readable usage: unknown
-            got = (_usage_of(os.path.join(rdir, c["dir"], "stdout.txt"))
+            got = (_usage_of(os.path.join(rdir, c["dir"], "stdout.txt"), c.get("family"))
                    if isinstance(c.get("dir"), str) and re.fullmatch(r"c[0-9]+", c["dir"]) else None)
             _add_usage(use, got)
             _add_by_family(by, c.get("family"), got)
@@ -249,7 +257,7 @@ def _attempt(root, pid, u, n, repo, gaps, need_judgment=False):
         if b and b not in backends:
             backends.append(b)
         if i["kind"] in ("author", "fixer"):
-            got = _usage_of(os.path.join(i["path"], "stdout.log"))
+            got = _usage_of(os.path.join(i["path"], "stdout.log"), fam)
             _add_usage(author_use, got)
             _add_by_family(author_by, fam, got)
             if {"family": fam, "model": model} not in models:

@@ -242,11 +242,18 @@ class UsageTests(ReportCase):
             rd = json.load(f)
         rd["calls"][0]["dir"] = "c1"  # google call with usage; the claude fallback call has no directory recorded
         wj(os.path.join(r1, "round.json"), rd)
-        wj(os.path.join(r1, "c1", "stdout.txt"), {"usage": {"input_tokens": 50, "output_tokens": 5, "cache_read_tokens": 3}})
+        wj(os.path.join(r1, "c1", "stdout.txt"), {"usage": {"input_tokens": 50, "output_tokens": 5, "cache_read_tokens": 3,
+                                                            "cache_creation_input_tokens": 9}})  # field names follow the family
+        os.makedirs(os.path.join(r1, "c2"))
+        os.mkfifo(os.path.join(r1, "c2", "stdout.txt"))  # never opened: a FIFO could block the report
+        rd["calls"][1]["dir"] = "c2"
+        wj(os.path.join(r1, "round.json"), rd)
         rep = self.build()
         rows = {(r["role"], r["family"]): (r["calls"], r["unknown_calls"], r["input"]) for r in rep["plans"][0]["usage"]}
         self.assertEqual(rows, {("author", "claude"): (1, 0, 6), ("author", "google"): (0, 1, 0),
                                 ("review", "google"): (1, 0, 50), ("review", "claude"): (0, 1, 0)})
+        g = next(r for r in rep["plans"][0]["usage"] if (r["role"], r["family"]) == ("review", "google"))
+        self.assertEqual((g["cache_read"], g["cache_write"]), (3, 0))
 
 
 class StateTests(ReportCase):
