@@ -26,7 +26,7 @@ Rulings: `dismissed`, `fixed`, `nonblocking`, `blocked`, `inconclusive`. Evidenc
 
 ## Adjudication and the cap
 
-You adjudicate. Reproduce before acting on a blocking finding; do not accept or dismiss on the reviewer's say-so. At most 3 rounds per unit, counted across its attempts and inherited by split children from the parent (`lineage.review_rounds`); a retry or a split never resets the budget. When the cap is reached with open findings, or a new attempt starts with the budget already used, decide alone and record it:
+You adjudicate. Reproduce before acting on a blocking finding; do not accept or dismiss on the reviewer's say-so. At most 3 rounds per unit, counted across its attempts and inherited by split children from the parent (`lineage.review_rounds`); a retry or a split never resets the budget. A new attempt (a retry, or a split child's first attempt) always gets at least one round, even when the budget is already used, so it may use `max(3 - used before it, 1)` rounds. When this attempt has used its rounds and findings are still open, decide alone and record it:
 
 ```
 overseer.py dispositions UNIT --orchestrator-decision "why this is safe to merge"
