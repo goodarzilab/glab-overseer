@@ -255,6 +255,23 @@ class ModelTests(Case):
         self.assertIs(rec["choices"]["google"]["available"], False)
         self.assertIn("claude-opus-5-5-high", rec["raw"])
 
+    FLASH_ONLY = ("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+                  "claude-sonnet-4-6\tClaude Sonnet 4.6\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
+
+    def test_flash_only_listing_uses_flash_for_every_role(self):
+        c = models.resolve_google(models.parse_listing(self.FLASH_ONLY))
+        self.assertEqual(c, {"plan": "gemini-3.8-flash-high", "code": "gemini-3.8-flash-high",
+                             "review": "gemini-3.8-flash-high"})
+        listing = os.path.join(self.tmp, "flash.txt")
+        with open(listing, "w") as f:
+            f.write(self.FLASH_ONLY)
+        self.shim("agy", "cat '%s'" % listing)
+        for host in ("claude", "google"):
+            rc, out, err = self.run_cli("models", "--host", host, "--refresh")
+            self.assertEqual(rc, 0, err)
+            self.assertIn("google: plan=gemini-3.8-flash-high, code=gemini-3.8-flash-high, review=gemini-3.8-flash-high", out)
+            self.assertIs(models.load_valid(self.root)["choices"]["google"]["available"], True)
+
     def test_listing_is_retried_once_after_a_transient_failure(self):
         # Measured: agy prints "Error: timed out waiting for available models" and lists fine moments later.
         flag = os.path.join(self.tmp, "listed-once")

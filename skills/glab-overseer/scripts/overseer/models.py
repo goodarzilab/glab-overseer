@@ -49,13 +49,13 @@ def _best(ids, rx):
 
 
 def resolve_google(entries):
+    """The newest pro-tier model plans and codes; without one (some accounts list only flash), the newest
+    flash model does. The newest flash model always reviews."""
     ids = [i for i, _ in entries if i.startswith("gemini-")]
-    top = _best(ids, _PRO)
     review = _best(ids, _FLASH)
-    if top is None:
-        raise ModelError("no eligible plan/code model (gemini-<v>-(argon|carbon|pro)-high) in listing")
     if review is None:
         raise ModelError("no eligible review model (gemini-<v>-flash-high) in listing")
+    top = _best(ids, _PRO) or review
     return {"plan": top, "code": top, "review": review}
 
 
