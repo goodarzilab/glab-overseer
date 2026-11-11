@@ -92,6 +92,13 @@ def review_rounds_used(root, plan_id, unit_id, before_attempt=None, _seen=()):
     return used
 
 
+def review_allowance(root, plan_id, unit_id, attempt, cap):
+    """(rounds used before `attempt`, rounds `attempt` may use). The cap is a budget per logical unit, but every new
+    attempt gets at least one round, so new code is never merged without a reviewer seeing it."""
+    before = review_rounds_used(root, plan_id, unit_id, before_attempt=attempt)
+    return before, max(cap - before, 1)
+
+
 def load_unit_state(root, plan_id, unit_id):
     st = store.read_json(unit_state_path(root, plan_id, unit_id), None)
     base = default_unit_state(plan_id, unit_id)

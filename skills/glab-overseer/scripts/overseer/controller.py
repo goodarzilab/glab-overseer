@@ -61,8 +61,11 @@ def owner_problems(root, plan_id):
                 out.append("unit %s scope %r widens the approved scope" % (u["id"], g))
         c = approval.load_unit_state(root, plan_id, u["id"])["counters"]
         for k in ("attempts", "review_rounds"):
-            if type(c.get(k)) is not int or c[k] > plan["caps"][k]:
-                out.append("unit %s has %s=%r above the cap %s" % (u["id"], k, c.get(k), plan["caps"][k]))
+            lim = plan["caps"][k]
+            if k == "review_rounds" and type(c.get("attempts")) is int and c["attempts"] > 0:
+                lim = sum(approval.review_allowance(root, plan_id, u["id"], c["attempts"], lim))  # one round per new attempt
+            if type(c.get(k)) is not int or c[k] > lim:
+                out.append("unit %s has %s=%r above the cap %s" % (u["id"], k, c.get(k), lim))
     if X.slots_in_use(root, False, plan_id) > plan["caps"]["workers"]:
         out.append("more worker slots in use than the approved workers cap")
     return out
@@ -372,16 +375,17 @@ def merge_unit(root, plan_id, unit):
 
 # ---- next ---------------------------------------------------------------------
 
-def _review_action(adir, plan, cand, reasons=(), before=0):
-    """`before` is the review rounds the unit used before this attempt: the cap is a budget per unit."""
+def _review_action(adir, plan, cand, reasons=(), allowed=None):
+    """`allowed` is the rounds this attempt may use (approval.review_allowance): the cap is a budget per unit, and
+    each new attempt gets at least one round."""
     rounds = R._rounds(adir)
-    cap = plan["caps"]["review_rounds"] - before
+    cap = plan["caps"]["review_rounds"] if allowed is None else allowed
     if len(rounds) > cap:  # only state from before the budget was per unit can get here
         return "stop", "the unit's review budget of %d rounds is used: an orchestrator decision is needed" % plan["caps"]["review_rounds"]
     if rounds and any("reviewer session id" in r for r in reasons):  # dispositions cannot repair an invalid reviewer session
         return ("review", "") if len(rounds) < cap else ("stop", "review round r%d used a non-independent reviewer session at the cap" % rounds[-1][0])
     if not rounds:
-        return ("review", "") if cap > 0 else ("stop", "the unit's review budget is used by earlier attempts: an orchestrator decision is needed")
+        return "review", ""
     num, rdir, rd = rounds[-1]
     if rd.get("state") != "complete":
         return ("review", "--retry") if not rd.get("retried") else (
@@ -438,7 +442,8 @@ def _unit_action(root, plan, u, st, free, after_quota=False):
         return "stop", "%s: %s" % (stop.get("kind"), ", ".join(stop.get("files") or []))
     rs = R.review_state(root, pid, u)
     if rs["state"] != "ELIGIBLE":
-        return _review_action(adir, plan, j["candidate"], rs["reasons"], approval.review_rounds_used(root, pid, uid, before_attempt=n))
+        return _review_action(adir, plan, j["candidate"], rs["reasons"],
+                              approval.review_allowance(root, pid, uid, n, plan["caps"]["review_rounds"])[1])
     nv = nonvacuity_problem(adir, j["candidate"], rs)
     if nv:
         return ("nonvacuous", "") if "no non-vacuity" in nv or "another candidate" in nv else ("stop", nv)
