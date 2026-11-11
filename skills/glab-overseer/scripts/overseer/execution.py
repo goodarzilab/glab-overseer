@@ -1017,8 +1017,9 @@ def run_status(args):
         print(json.dumps(data, indent=2, sort_keys=True))
         return 0
     for pid, p in data["plans"].items():
-        print("plan %s: slots %d/%d (project %d/%d)" % (pid, p["slots_in_use"], p["workers_cap"],
-                                                          data["slots_in_use"], data["project_limit"]))
+        print("plan %s: slots %d/%d (project %d/%d), Slurm job slots %d/%d (project %d/%d)" % (
+            pid, p["slots_in_use"], p["workers_cap"], data["slots_in_use"], data["project_limit"],
+            p["job_slots_in_use"], p["job_workers_cap"], data["job_slots_in_use"], data["project_job_limit"]))
         for uid, u in p["units"].items():
             print("  %s (%s) auth=%s exec=%s closure=%s tracker=%s attempts=%d" % (
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
