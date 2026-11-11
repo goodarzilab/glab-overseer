@@ -449,6 +449,12 @@ def record_dispositions(root, plan_id, unit, data):
     return review_state(root, plan_id, unit)
 
 
+def _retry_pending(rounds, allowed):
+    """The latest round has no verdict and its one retry is still admitted: a decision must wait for that retry."""
+    last = rounds[-1][2] if rounds else None
+    return bool(last) and len(rounds) <= allowed and last.get("state") != "complete" and not last.get("retried")
+
+
 def record_decision(root, plan_id, unit, text):
     if not (isinstance(text, str) and text.strip()):
         raise ReviewError("--orchestrator-decision needs non-blank text")
@@ -461,8 +467,7 @@ def record_decision(root, plan_id, unit, text):
     if mine < allowed:
         raise ReviewError("%d of %d review rounds used by this unit (this attempt has used %d of its %d); an orchestrator "
                           "decision is accepted only at the cap" % (done, _cap(plan), mine, allowed))
-    last = rounds[-1][2] if rounds else {}
-    if mine <= allowed and last.get("state") != "complete" and not last.get("retried"):  # its retry is still admitted
+    if _retry_pending(rounds, allowed):
         raise ReviewError("round r%d has no verdict and has not been retried; run `review %s --retry` before an "
                           "orchestrator decision" % (rounds[-1][0], unit["id"]))
     try:  # binds the decision to the non-vacuity record that exists now (null when none does)
@@ -520,7 +525,7 @@ def review_state(root, plan_id, unit):
     dec = _obj(os.path.join(adir, "reviews", "orchestrator_decision.json"))
     eq = equivalent_candidates(adir, cand)
     allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))[1]
-    if dec and dec.get("candidate") in eq and len(rounds) >= allowed:
+    if dec and dec.get("candidate") in eq and len(rounds) >= allowed and not _retry_pending(rounds, allowed):
         return {"state": "ELIGIBLE", "reasons": ["orchestrator decision recorded at the round cap"], "orchestrator_decision": True}
     if not rounds:
         return no("no review round")

@@ -328,6 +328,10 @@ class Budget(Case):
         rc, _, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "the review never ran")
         self.assertEqual(rc, 1)
         self.assertIn("has not been retried", err)
+        with open(os.path.join(self.attempt_dir(), "reviews", "orchestrator_decision.json"), "w") as f:
+            json.dump({"orchestrator_decision": True, "text": "recorded by an earlier version",
+                       "candidate": self.state_cand(), "rounds": 4}, f)
+        self.assertEqual(self.state()["state"], "NOT_ELIGIBLE")  # an earlier decision does not skip the retry
 
     def test_a_counter_above_the_unit_allowance_stops_next(self):
         self.done()
