@@ -455,11 +455,16 @@ def record_decision(root, plan_id, unit, text):
     plan = approval.effective_plan(root, plan_id)
     j, n, adir, wt = _current(root, plan_id, unit)
     before, allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))
-    mine = len(_rounds(adir))
+    rounds = _rounds(adir)
+    mine = len(rounds)
     done = before + mine
     if mine < allowed:
         raise ReviewError("%d of %d review rounds used by this unit (this attempt has used %d of its %d); an orchestrator "
                           "decision is accepted only at the cap" % (done, _cap(plan), mine, allowed))
+    last = rounds[-1][2] if rounds else {}
+    if mine <= allowed and last.get("state") != "complete" and not last.get("retried"):  # its retry is still admitted
+        raise ReviewError("round r%d has no verdict and has not been retried; run `review %s --retry` before an "
+                          "orchestrator decision" % (rounds[-1][0], unit["id"]))
     try:  # binds the decision to the non-vacuity record that exists now (null when none does)
         with open(os.path.join(adir, "nonvacuous.json"), "rb") as f:
             nv_digest = hashlib.sha256(f.read()).hexdigest()

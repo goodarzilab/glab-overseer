@@ -318,6 +318,17 @@ class Budget(Case):
         rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "one round on the new attempt")
         self.assertEqual((rc, json.loads(out)["state"]), (0, "ELIGIBLE"), err)
 
+    def test_an_unretried_round_without_a_verdict_does_not_admit_a_decision(self):
+        self.done()
+        self.inherit(3)
+        os.makedirs(self.rdir(1))
+        with open(os.path.join(self.rdir(1), "round.json"), "w") as f:
+            json.dump({"round": 1, "state": "aborted", "retried": False}, f)
+        self.assertIn("review alpha: --retry", self.cli("next")[1])
+        rc, _, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "the review never ran")
+        self.assertEqual(rc, 1)
+        self.assertIn("has not been retried", err)
+
     def test_a_counter_above_the_unit_allowance_stops_next(self):
         self.done()
         self.inherit(3)
