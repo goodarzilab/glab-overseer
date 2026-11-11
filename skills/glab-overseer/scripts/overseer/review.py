@@ -309,7 +309,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
         if roles is None:
             raise ReviewError("the reviewer family %s is unavailable in models.json (%s)" % (other, cache["choices"][other].get("reason")))
         rounds = _rounds(adir)
-        before = approval.review_rounds_used(root, plan_id, unit["id"], before_attempt=n)
+        before, allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))
         for R0, rdir0, rd0 in rounds:  # persist orphaned round directories as aborted records
             if not os.path.exists(os.path.join(rdir0, "round.json")):
                 store.write_json_atomic(os.path.join(rdir0, "round.json"), rd0)
@@ -331,11 +331,12 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
                 text = f.read()
         else:
             R = last[0] if (retry and aborted) else (last[0] if last else 0) + 1
-            total = before + len(rounds) + (0 if (retry and aborted) else 1)  # rounds counted as directories, like the decision
-            if total > _cap(plan):
-                raise ReviewError("review rounds are capped at %d per unit (%d used before this attempt); the orchestrator "
-                                  "rules alone with `dispositions %s --orchestrator-decision TEXT`"
-                                  % (_cap(plan), before, unit["id"]))
+            mine = len(rounds) + (0 if (retry and aborted) else 1)  # rounds counted as directories, like the decision
+            total = before + mine
+            if mine > allowed:
+                raise ReviewError("review rounds are capped at %d per unit (%d used before this attempt, which may use %d); "
+                                  "the orchestrator rules alone with `dispositions %s --orchestrator-decision TEXT`"
+                                  % (_cap(plan), before, allowed, unit["id"]))
             diff = W.git(wt, "diff", "--text", "--no-ext-diff", "--no-textconv", "--no-color", _diff_base(adir, j), cand)["stdout"]
             text = build_input(unit, j, diff, _earlier(rounds))
             if len(text) > max_chars:
@@ -453,10 +454,12 @@ def record_decision(root, plan_id, unit, text):
         raise ReviewError("--orchestrator-decision needs non-blank text")
     plan = approval.effective_plan(root, plan_id)
     j, n, adir, wt = _current(root, plan_id, unit)
-    done = approval.review_rounds_used(root, plan_id, unit["id"], before_attempt=n) + len(_rounds(adir))
-    if done < _cap(plan):
-        raise ReviewError("%d of %d review rounds used by this unit; an orchestrator decision is accepted only at the cap"
-                          % (done, _cap(plan)))
+    before, allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))
+    mine = len(_rounds(adir))
+    done = before + mine
+    if mine < allowed:
+        raise ReviewError("%d of %d review rounds used by this unit (this attempt has used %d of its %d); an orchestrator "
+                          "decision is accepted only at the cap" % (done, _cap(plan), mine, allowed))
     try:  # binds the decision to the non-vacuity record that exists now (null when none does)
         with open(os.path.join(adir, "nonvacuous.json"), "rb") as f:
             nv_digest = hashlib.sha256(f.read()).hexdigest()
@@ -511,8 +514,8 @@ def review_state(root, plan_id, unit):
     rounds = _rounds(adir)
     dec = _obj(os.path.join(adir, "reviews", "orchestrator_decision.json"))
     eq = equivalent_candidates(adir, cand)
-    used = approval.review_rounds_used(root, plan_id, unit["id"], before_attempt=n) + len(rounds)
-    if dec and dec.get("candidate") in eq and used >= _cap(plan):
+    allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))[1]
+    if dec and dec.get("candidate") in eq and len(rounds) >= allowed:
         return {"state": "ELIGIBLE", "reasons": ["orchestrator decision recorded at the round cap"], "orchestrator_decision": True}
     if not rounds:
         return no("no review round")

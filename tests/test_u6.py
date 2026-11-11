@@ -293,18 +293,38 @@ class Budget(Case):
         self.assertEqual(rc, 0, err)
         self.assertTrue(json.loads(out)["orchestrator_decision"])
 
-    def test_spent_budget_stops_next_and_admits_a_decision_without_a_new_round(self):
+    def test_a_new_attempt_after_a_spent_budget_gets_one_round(self):
         self.done()
         self.inherit(3)
         rc, out, err = self.cli("next")
         self.assertEqual(rc, 0, err)
-        self.assertIn("stop alpha: the unit's review budget is used by earlier attempts", out)
+        self.assertIn("review alpha", out)
+        rc, _, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "budget used by a1")
+        self.assertEqual(rc, 1)
+        self.assertIn("accepted only at the cap", err)
+        self.reviewer("agy", agy_out(fail(), "s"))
+        self.assertEqual(self.review()[1]["round"], 1)
+        self.assertEqual(approval.load_unit_state(self.root, "demo", "alpha")["counters"]["review_rounds"], 4)
+        n = len(self.calls())
         rc, _, err = self.review()
         self.assertEqual(rc, 1)
-        self.assertIn("capped at 3 per unit", err)
-        self.assertEqual(self.calls(), [])
-        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "budget used by a1")
+        self.assertIn("3 used before this attempt, which may use 1", err)
+        self.assertEqual(len(self.calls()), n)
+        self.commit_more("src/alpha_extra.py")
+        self.assertEqual(self.cli("judge", "alpha")[0], 0)
+        rc, out, err = self.cli("next")
+        self.assertIn("stop alpha: review cap reached", out)
+        self.assertNotIn("above the cap", out)
+        rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "one round on the new attempt")
         self.assertEqual((rc, json.loads(out)["state"]), (0, "ELIGIBLE"), err)
+
+    def test_a_counter_above_the_unit_allowance_stops_next(self):
+        self.done()
+        self.inherit(3)
+        st = approval.load_unit_state(self.root, "demo", "alpha")
+        st["counters"]["review_rounds"] = 5  # 3 before this attempt plus its one round is 4
+        approval.save_unit_state(self.root, "demo", "alpha", st)
+        self.assertIn("review_rounds=5 above the cap 4", self.cli("next")[1])
 
     def test_used_counts_round_directories_of_earlier_attempts_and_lineage(self):
         self.done()
@@ -326,9 +346,10 @@ class Budget(Case):
     def test_an_unfinished_round_over_a_legacy_budget_stops_next(self):
         self.done()
         self.inherit(3)
-        os.makedirs(self.rdir(1))
-        with open(os.path.join(self.rdir(1), "round.json"), "w") as f:
-            json.dump({"round": 1, "state": "aborted", "retried": False}, f)
+        for r in (1, 2):  # two rounds in one attempt over a spent budget: only legacy state can hold this
+            os.makedirs(self.rdir(r))
+            with open(os.path.join(self.rdir(r), "round.json"), "w") as f:
+                json.dump({"round": r, "state": "aborted", "retried": False}, f)
         self.assertIn("stop alpha: the unit's review budget of 3 rounds is used", self.cli("next")[1])
         rc, out, err = self.cli("dispositions", "alpha", "--orchestrator-decision", "legacy rounds used the budget")
         self.assertEqual(rc, 0, err)
