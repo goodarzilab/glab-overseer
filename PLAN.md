@@ -152,10 +152,10 @@ evidence the attempt is UNCERTAIN.
 | O9 | `sacct` is unreliable on the cluster; a backup judgment path is required. |
 | O10 | Unit kinds are `code` and `job`. |
 | O11 | Laptop workers run as local detached processes; cluster workers run as batch jobs. |
-| O12 | Caps: 3 concurrent workers, 2 attempts per unit, 3 review rounds per unit, then the orchestrator decides alone. Amended 2026-11-10 by the owner: the round budget was per pull request (so per attempt); it is now per logical unit, counted across attempts and inherited by split children. |
+| O12 | Caps: 3 concurrent workers, 2 attempts per unit, 3 review rounds per unit, then the orchestrator decides alone. Amended 2026-11-10 by the owner: the round budget was per pull request (so per attempt); it is now per logical unit, counted across attempts and inherited by split children. Amended 2026-11-10 by the owner (issue #30): job units submitted to Slurm count against a separate cap, `caps.job_workers` (default 3, at most 32 per plan and per project); authors, fixers and jobs on the local backend keep the cap of 3. |
 | O13 | Report at each merged PR and immediately when the owner is needed. No findings to publish. |
 | O14 | One skill named `glab-overseer` in `goodarzilab/glab-overseer`. |
-| D1 | The worker cap counts background executions only (authors, fixers, job units, including queued and uncertain). Reviews and tests run one at a time outside the cap. |
+| D1 | The worker cap counts background executions only (authors, fixers, job units, including queued and uncertain; Slurm job units count against `job_workers`, O12). Reviews and tests run one at a time outside the cap. |
 | D2 | After merging an advanced target, always retest. Reuse the prior review only when `git patch-id` shows the unit's own change is identical; otherwise run a new round within the cap. |
 | D3 | Acceptance proves the `sacct` fallback live. If `sacct` never answers during acceptance, the `sacct`-judged item is reported incomplete. |
 | D4 | A job with no terminal evidence holds its slot as UNCERTAIN. The orchestrator inspects the outputs itself and, with sufficient conviction, marks it done; otherwise it releases it as failed. Both go through `resolve` with a recorded reason and are labeled orchestrator-resolved. |

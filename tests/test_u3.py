@@ -13,7 +13,7 @@ from unittest import mock
 
 from helpers import ENTRY, TmpCase, plan_copy
 
-from overseer import approval, cli, execution as X, store
+from overseer import approval, cli, controller as C, execution as X, slurm, store
 
 
 def job(uid, command="true"):
@@ -439,6 +439,45 @@ class SlotTests(Case):
         with self.assertRaisesRegex(X.SlotsFull, "project-wide limit of 3"):
             self.launch("j3", plan="demo")
         self.assertEqual(X.slots_in_use(self.root, plan_id="demo"), 2)
+
+    def wide(self, n=6, workers=1, job_workers=5):
+        p = make_plan("wide", n, workers)
+        p["caps"]["job_workers"] = job_workers
+        approval.approve_plan(self.root, p, "me")
+        probe = mock.patch.dict(X.PROBES, {"slurm": lambda *a: "QUEUED"})  # no squeue: the jobs stay queued
+        probe.start()
+        self.addCleanup(probe.stop)
+
+    def sbatch(self, uid, plan="wide", kind="job"):
+        return self.launch(uid, plan=plan, kind=kind, backend="slurm", spawn=lambda inv, run_sh, env, cwd: {"job_id": "9%s" % uid[1:]})
+
+    def test_slurm_jobs_use_their_own_cap(self):
+        self.wide()
+        for u in ("j1", "j2", "j3", "j4", "j5"):
+            self.sbatch(u)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 5)
+        self.assertEqual(X.slots_in_use(self.root), 0)
+        with self.assertRaisesRegex(X.SlotsFull, "plan wide has 5 of its 5 Slurm job slots"):
+            self.sbatch("j6")
+        self.launch("j6", plan="wide")  # an author still has its worker slot
+        with self.assertRaisesRegex(X.SlotsFull, "plan wide has 1 of its 1 worker slots"):
+            self.launch("j6", plan="wide", kind="job", n=1)  # a job on this host counts as a worker
+
+    def test_slurm_job_slots_have_a_project_wide_limit(self):
+        self.wide()
+        with mock.patch.dict(X.POOL_LIMIT, {"job_workers": 2}):
+            self.sbatch("j1")
+            self.sbatch("j1", plan="demo")
+            with self.assertRaisesRegex(X.SlotsFull, "project-wide limit of 2 Slurm job slots"):
+                self.sbatch("j2")
+
+    def test_next_dispatches_up_to_the_job_cap_on_slurm_only(self):
+        self.wide(n=6, workers=3, job_workers=5)
+        acts = lambda: [a["unit"] for a in C.compute_actions(self.root, "wide") if a["action"] == "dispatch"]
+        with mock.patch.object(slurm, "choose_backend", return_value="local"):
+            self.assertEqual(acts(), ["j1", "j2", "j3"])
+        with mock.patch.object(slurm, "choose_backend", return_value="slurm"):
+            self.assertEqual(acts(), ["j1", "j2", "j3", "j4", "j5"])
 
     def test_finished_invocation_frees_slot(self):
         for u in ("j1", "j2", "j3"):
