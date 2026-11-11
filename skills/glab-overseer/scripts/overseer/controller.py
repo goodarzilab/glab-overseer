@@ -20,7 +20,7 @@ import os
 import sys
 import time
 
-from . import approval, execution as X, github as G, judge as J, paths, plan as P, review as R, store, workspace as W
+from . import approval, execution as X, github as G, judge as J, paths, plan as P, review as R, slurm, store, workspace as W
 
 POLL_SECONDS = 60.0
 POLL_INTERVAL = 3.0
@@ -68,6 +68,8 @@ def owner_problems(root, plan_id):
                 out.append("unit %s has %s=%r above the cap %s" % (u["id"], k, c.get(k), lim))
     if X.slots_in_use(root, False, plan_id) > plan["caps"]["workers"]:
         out.append("more worker slots in use than the approved workers cap")
+    if X.slots_in_use(root, False, plan_id, "job_workers") > P.caps_of(plan)["job_workers"]:
+        out.append("more Slurm job slots in use than the approved job_workers cap")
     return out
 
 
@@ -456,7 +458,9 @@ def _unit_action(root, plan, u, st, free, after_quota=False):
 def compute_actions(root, only_plan=None, write=False, after_quota=False, exclude=()):
     acts = []
     pdir = paths.plans_dir(root)
-    total = [X.slots_in_use(root, write)]
+    pools = ("workers", "job_workers")
+    total = dict((k, X.slots_in_use(root, write, pool=k)) for k in pools)
+    backend = slurm.choose_backend(root)
     for pid in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
         if not (paths.valid_id(pid) and os.path.exists(os.path.join(pdir, pid, "plan.json"))) or only_plan not in (None, pid):
             continue
@@ -465,17 +469,19 @@ def compute_actions(root, only_plan=None, write=False, after_quota=False, exclud
             acts += [{"plan": pid, "unit": None, "action": "stop", "detail": p} for p in problems]
             continue
         plan = approval.effective_plan(root, pid)
-        free = [plan["caps"]["workers"] - X.slots_in_use(root, write, pid), X.PROJECT_SLOTS - total[0]]
+        caps = P.caps_of(plan)
+        free = dict((k, [caps[k] - X.slots_in_use(root, write, pid, k), X.POOL_LIMIT[k] - total[k]]) for k in pools)
         for u in plan["units"]:
             if (pid, u["id"]) in exclude:  # a launch already skipped in this dispatch: its slot goes to the next unit
                 continue
-            a = _unit_action(root, plan, u, approval.load_unit_state(root, pid, u["id"]), free, after_quota)
+            pool = X.pool_of("job" if u["kind"] == "job" else "author", backend)
+            a = _unit_action(root, plan, u, approval.load_unit_state(root, pid, u["id"]), free[pool], after_quota)
             if a:
                 acts.append({"plan": pid, "unit": u["id"], "action": a[0], "detail": a[1]})
                 if a[0] in ("dispatch", "retry"):
-                    free[0] -= 1
-                    free[1] -= 1
-                    total[0] += 1
+                    free[pool][0] -= 1
+                    free[pool][1] -= 1
+                    total[pool] += 1
     return acts
 
 

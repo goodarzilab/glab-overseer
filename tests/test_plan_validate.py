@@ -269,6 +269,21 @@ class ValidateTests(unittest.TestCase):
             p["caps"] = {k: v}
             self.assertError(p, "caps.%s %d exceeds the maximum" % (k, v))
 
+    def test_job_workers_cap(self):
+        p = plan_copy()
+        p["caps"] = {"job_workers": 32}
+        self.assertEqual(errs(p), [])
+        p["caps"] = {"job_workers": 33}
+        self.assertError(p, "caps.job_workers 33 exceeds the maximum 32")
+
+    def test_unset_job_workers_leaves_the_normalized_caps_and_digest_unchanged(self):
+        p = plan_copy()
+        p.pop("caps", None)
+        self.assertEqual(sorted(P.normalize_plan(p)["caps"]), ["attempts", "review_rounds", "workers"])
+        self.assertEqual(P.caps_of(P.normalize_plan(p))["job_workers"], 3)
+        p["caps"] = {"job_workers": 8}
+        self.assertEqual(P.normalize_plan(p)["caps"]["job_workers"], 8)
+
     def test_caps_lower_allowed(self):
         p = plan_copy()
         p["caps"] = {"workers": 1, "attempts": 1, "review_rounds": 1}

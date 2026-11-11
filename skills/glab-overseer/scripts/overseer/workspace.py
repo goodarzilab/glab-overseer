@@ -151,8 +151,8 @@ def prohibited_name(path):
 
 
 def caps_of(plan):
-    """Caps with U1's defaults for any that the plan does not set."""
-    return dict(X.P.CAP_MAX, **(plan.get("caps") or {}))
+    """Caps with their defaults for any that the plan does not set."""
+    return X.P.caps_of(plan)
 
 
 def declared_outputs(unit):

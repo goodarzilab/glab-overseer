@@ -128,7 +128,7 @@ It stops and asks you when:
 - the plan changed after approval;
 - a merge hits a conflict, a unit runs out of attempts, or an author hits a quota or login failure.
 
-Caps: 3 concurrent workers per project, 2 attempts per unit, 3 review rounds per unit. The round budget covers all of a unit's attempts and carries over to the units a split creates, so a retry never starts a fresh budget. A new attempt still gets at least one round when the budget is used, so no new code merges unreviewed. At the review cap the orchestrator rules alone and the report labels that decision.
+Caps: 3 concurrent workers per project, 2 attempts per unit, 3 review rounds per unit. Job units submitted to Slurm have their own limit, `caps.job_workers`: 3 unless the plan sets it, at most 32. Jobs that run on your laptop count as workers. The round budget covers all of a unit's attempts and carries over to the units a split creates, so a retry never starts a fresh budget. A new attempt still gets at least one round when the budget is used, so no new code merges unreviewed. At the review cap the orchestrator rules alone and the report labels that decision.
 
 ## Models
 

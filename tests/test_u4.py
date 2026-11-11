@@ -322,7 +322,7 @@ class Submission(SlurmCase):
         self.assertTrue(os.path.exists(os.path.join(inv, "intent.json")))
         self.assertFalse(os.path.exists(os.path.join(inv, "launch.json")))
         self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")  # sbatch may never have run
-        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 1)
         self.fake("squeue.state", "RUNNING")  # the job did exist: reconcile by token
         self.fake("sbatch.calls", "x --comment %s --job-name n\n" % self.rec(inv, "intent.json")["token"])
         st = X.invocation_status(inv, True)
@@ -345,7 +345,7 @@ class Submission(SlurmCase):
         self.assertEqual(self.rec(inv, "sbatch.json")["outcome"], "rejected")
         self.assertEqual(X.invocation_status(inv, True)["state"], "LAUNCH_FAILED")
         self.assertEqual(len(self.calls()), 1)
-        self.assertEqual(X.slots_in_use(self.root), 0)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 0)
 
     def test_recovery_requires_the_full_token_in_the_comment(self):
         cases = (("j1", 'echo "4242|$name|someone-elses-token|RUNNING|None"'),  # same name, other comment
@@ -381,7 +381,7 @@ class Submission(SlurmCase):
         self.assertIn("Socket timed out", self.rec(inv, "sbatch.json")["stderr"])
         self.assertFalse(os.path.exists(os.path.join(inv, "launch_error.json")))
         self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")
-        self.assertEqual(X.slots_in_use(self.root), 2)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 2)
         tok = self.rec(inv, "intent.json")["token"]  # the job ran after all: its wrapper wrote start.json
         store.write_json_atomic(os.path.join(inv, "start.json"), {"token": "other", "pid": 1, "job_id": "999"})
         self.assertEqual(X.invocation_status(inv, True)["state"], "UNCERTAIN")  # bound by token only
@@ -412,7 +412,7 @@ class Submission(SlurmCase):
             self.assertEqual(len(self.calls()), 1)
             self.assertEqual(self.rec(rec["dir"], "sbatch.json")["outcome"], "recovered_by_squeue")
             self.assertEqual(self.status(rec)["state"], "QUEUED")
-        self.assertEqual(X.slots_in_use(self.root), 2)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 2)
 
     def test_ambiguous_sbatch_not_in_squeue_stays_uncertain_with_one_call(self):
         self.fake("sbatch.mode", "hang")
@@ -425,7 +425,7 @@ class Submission(SlurmCase):
         with self.assertRaisesRegex(X.ExecutionError, "UNCERTAIN"):
             self.dispatch()
         self.assertEqual(len(self.calls()), 1)  # never a second sbatch for one intent
-        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 1)
 
     def test_dispatch_cli_reports_job_id(self):
         out = io.StringIO()
@@ -570,7 +570,7 @@ class Evidence(SlurmCase):
         rec = self.dispatch()
         self.fake("squeue.state", "PENDING")
         self.assertEqual(self.status(rec)["state"], "QUEUED")
-        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 1)
         self.fake("squeue.state", "RUNNING")
         self.assertEqual(self.status(rec)["state"], "RUNNING")
         self.assertFalse(os.path.exists(os.path.join(rec["dir"], "evidence.json")))
@@ -625,7 +625,7 @@ class Evidence(SlurmCase):
         self.assertEqual(st["state"], "UNCERTAIN")
         self.assertIn("no terminal evidence", st["evidence"])
         self.assertEqual(self.evidence(rec)["verdict"], "UNCERTAIN")
-        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 1)
         with open(os.path.join(os.path.dirname(os.path.dirname(rec["dir"])), "slurm-4242.out"), "w") as f:
             f.write("harmless text\n")  # logs alone never produce success
         self.assertEqual(self.status(rec)["state"], "UNCERTAIN")
@@ -751,7 +751,7 @@ class Abort(SlurmCase):
         self.assertIn("requested_at", c)
         self.assertNotIn("confirmed_at", c)
         self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "CANCELLING")
-        self.assertEqual(X.slots_in_use(self.root), 1)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 1)
         self.unfake("squeue.state")  # left the queue, but nothing says why: still unconfirmed
         self.assertEqual(X.invocation_status(rec["dir"], True)["state"], "CANCELLING")
         self.fake("scontrol.state", "CANCELLED 0:15")
@@ -760,7 +760,7 @@ class Abort(SlurmCase):
         kinds = [e["kind"] for e in store.read_events(self.root) if e["kind"].startswith("cancel_")]
         self.assertEqual(kinds, ["cancel_requested", "cancel_confirmed"])
         self.assertEqual(self.calls("scancel"), ["4242"])
-        self.assertEqual(X.slots_in_use(self.root), 0)
+        self.assertEqual(X.slots_in_use(self.root, pool="job_workers"), 0)
 
     def test_abort_confirms_on_wrapper_exit_and_does_not_confirm_while_listed(self):
         rec = self.dispatch()

@@ -687,7 +687,7 @@ class Round1Fixes(Case):
         self.assertEqual(R._cap({}), 3)
         self.assertEqual(R._cap({"caps": {"workers": 1}}), 3)
         self.assertEqual(R._cap({"caps": {"review_rounds": 2}}), 2)
-        self.assertEqual(W.caps_of({"caps": {"workers": 1}}), {"workers": 1, "attempts": 2, "review_rounds": 3})
+        self.assertEqual(W.caps_of({"caps": {"workers": 1}}), {"workers": 1, "attempts": 2, "review_rounds": 3, "job_workers": 3})
 
 
 class Round2Fixes(Case):

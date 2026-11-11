@@ -9,7 +9,10 @@ import re
 
 from .paths import ID_PATTERN, glob_match, has_glob_meta, relpath_problem, valid_id
 
-CAP_MAX = {"workers": 3, "attempts": 2, "review_rounds": 3}
+CAP_MAX = {"workers": 3, "attempts": 2, "review_rounds": 3, "job_workers": 32}
+CAP_DEFAULT = {"workers": 3, "attempts": 2, "review_rounds": 3, "job_workers": 3}
+CAP_BASE = ("workers", "attempts", "review_rounds")  # always in the normalized caps; job_workers only when set,
+# so the digest of a plan approved before job_workers existed does not change
 KINDS = ("code", "job")
 CODE_REQUIRED = ("title", "prompt", "claims", "test_command", "outputs", "scope")
 JOB_REQUIRED = ("title", "command", "outputs")
@@ -210,7 +213,7 @@ def validate_plan(plan):
         for k in sorted(caps):
             v = caps[k]
             if k not in CAP_MAX:
-                errors.append("caps.%s is not a known cap (workers, attempts, review_rounds)" % k)
+                errors.append("caps.%s is not a known cap (workers, attempts, review_rounds, job_workers)" % k)
             elif isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 errors.append("caps.%s must be an integer >= 1" % k)
             elif v > CAP_MAX[k]:
@@ -386,6 +389,11 @@ def normalize_unit(u):
     return out
 
 
+def caps_of(plan):
+    """Every cap, with its default where the plan does not set it."""
+    return dict(CAP_DEFAULT, **(plan.get("caps") or {}))
+
+
 def normalize_plan(plan):
     """Canonical semantic form of a valid plan; the digest is computed over this."""
     out = {
@@ -393,7 +401,7 @@ def normalize_plan(plan):
         "repo": plan["repo"],
         "target_branch": plan["target_branch"],
         "scope": sorted(set(plan["scope"])),
-        "caps": dict(CAP_MAX, **(plan.get("caps") or {})),
+        "caps": dict(dict((k, CAP_DEFAULT[k]) for k in CAP_BASE), **(plan.get("caps") or {})),
         "test_globs": sorted(set(plan.get("test_globs") or [])),
         "units": [normalize_unit(u) for u in plan["units"]],
     }

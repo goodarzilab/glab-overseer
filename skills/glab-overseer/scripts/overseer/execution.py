@@ -25,7 +25,10 @@ import uuid
 from . import approval, env as E, paths, plan as P, store
 
 SHELL = "/bin/sh"  # run.sh interpreter; the process search matches exactly `SHELL run.sh`
-PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12)
+PROJECT_SLOTS = P.CAP_MAX["workers"]  # project-wide limit across plans (O12): authors, fixers, jobs run on this host
+PROJECT_JOB_SLOTS = P.CAP_MAX["job_workers"]  # project-wide limit for jobs submitted to Slurm (O12, amended)
+POOL_LIMIT = {"workers": PROJECT_SLOTS, "job_workers": PROJECT_JOB_SLOTS}
+POOL_NAME = {"workers": "worker slots", "job_workers": "Slurm job slots"}
 KINDS = ("author", "fixer", "job")
 ACTIVE = ("QUEUED", "RUNNING", "UNCERTAIN", "CANCELLING")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -378,19 +381,30 @@ def active_invocations(root, plan_id=None, unit_id=None, write=False):
     return out
 
 
-def slots_in_use(root, write=False, plan_id=None):
-    """Author, fixer and job invocations QUEUED, RUNNING or UNCERTAIN (one plan, or all plans)."""
-    return sum(1 for i in active_invocations(root, plan_id, write=write) if i["kind"] in KINDS)
+def pool_of(kind, backend):
+    """Which cap an invocation counts against: a job submitted to Slurm uses `job_workers`; authors, fixers
+    and jobs on any other backend use `workers` (they run as processes on, or agents driven from, this host)."""
+    return "job_workers" if kind == "job" and backend == "slurm" else "workers"
 
 
-def check_slots(root, plan_id, cap):
-    """Refuse when the plan's own cap or the project-wide limit is reached, naming which."""
-    mine = slots_in_use(root, True, plan_id)
+def _pool(i):
+    intent = _load(os.path.join(i["path"], "intent.json"))
+    return pool_of(i["kind"], intent.get("backend") if isinstance(intent, dict) else None)
+
+
+def slots_in_use(root, write=False, plan_id=None, pool="workers"):
+    """Invocations of one pool QUEUED, RUNNING or UNCERTAIN (one plan, or all plans)."""
+    return sum(1 for i in active_invocations(root, plan_id, write=write) if i["kind"] in KINDS and _pool(i) == pool)
+
+
+def check_slots(root, plan_id, cap, pool="workers"):
+    """Refuse when the plan's own cap or the project-wide limit for the pool is reached, naming which."""
+    mine = slots_in_use(root, True, plan_id, pool)
     if mine >= cap:
-        raise SlotsFull("plan %s has %d of its %d worker slots in use" % (plan_id, mine, cap))
-    total = slots_in_use(root, True)
-    if total >= PROJECT_SLOTS:
-        raise SlotsFull("the project-wide limit of %d worker slots is reached (%d in use)" % (PROJECT_SLOTS, total))
+        raise SlotsFull("plan %s has %d of its %d %s in use" % (plan_id, mine, cap, POOL_NAME[pool]))
+    total = slots_in_use(root, True, pool=pool)
+    if total >= POOL_LIMIT[pool]:
+        raise SlotsFull("the project-wide limit of %d %s is reached (%d in use)" % (POOL_LIMIT[pool], POOL_NAME[pool], total))
 
 
 # ---- attempts --------------------------------------------------------------
@@ -568,11 +582,12 @@ def launch_invocation(root, plan_id, unit_id, attempt, kind, argv, cwd, backend=
         if problem:
             raise ExecutionError(problem)
     approval.require_approval(root, plan_id)
-    cap = approval.effective_plan(root, plan_id)["caps"]["workers"]
+    pool = pool_of(kind, backend)
+    cap = P.caps_of(approval.effective_plan(root, plan_id))[pool]
     adir = paths.attempt_dir(root, plan_id, unit_id, attempt)
     if not os.path.isdir(adir):
         raise ExecutionError("attempt a%d of %s is not allocated" % (attempt, unit_id))
-    check_slots(root, plan_id, cap)
+    check_slots(root, plan_id, cap, pool)
     envd = E.worker_env(base=env, extras=extras)
 
     def resolved(argv, stdin_text):
@@ -689,7 +704,8 @@ def dispatch_job(root, plan_id, unit, after_quota=False):
     backend = slurm.choose_backend(root)
     if backend == "slurm":
         slurm.preflight(root, plan, unit)  # refuses before any attempt is allocated or sbatch runs
-    check_slots(root, plan_id, plan["caps"]["workers"])
+    pool = pool_of("job", backend)
+    check_slots(root, plan_id, P.caps_of(plan)[pool], pool)
     n, adir = acquire_attempt(root, plan_id, uid, after_quota)
     out = os.path.join(adir, "outputs")
     os.makedirs(out, exist_ok=True)
@@ -983,8 +999,11 @@ def collect_status(root, write=False):
                          "job_id": i["status"].get("job_id")}
                         for i in act if i["unit_id"] == u["id"]])
         plans[pid] = {"workers_cap": plan["caps"]["workers"], "slots_in_use": slots_in_use(root, write, pid),
-                      "units": units}
-    return {"slots_in_use": slots_in_use(root, write), "project_limit": PROJECT_SLOTS, "plans": plans}
+                      "job_workers_cap": P.caps_of(plan)["job_workers"],
+                      "job_slots_in_use": slots_in_use(root, write, pid, "job_workers"), "units": units}
+    return {"slots_in_use": slots_in_use(root, write), "project_limit": PROJECT_SLOTS,
+            "job_slots_in_use": slots_in_use(root, write, pool="job_workers"), "project_job_limit": PROJECT_JOB_SLOTS,
+            "plans": plans}
 
 
 def run_status(args):
@@ -998,8 +1017,9 @@ def run_status(args):
         print(json.dumps(data, indent=2, sort_keys=True))
         return 0
     for pid, p in data["plans"].items():
-        print("plan %s: slots %d/%d (project %d/%d)" % (pid, p["slots_in_use"], p["workers_cap"],
-                                                          data["slots_in_use"], data["project_limit"]))
+        print("plan %s: slots %d/%d (project %d/%d), Slurm job slots %d/%d (project %d/%d)" % (
+            pid, p["slots_in_use"], p["workers_cap"], data["slots_in_use"], data["project_limit"],
+            p["job_slots_in_use"], p["job_workers_cap"], data["job_slots_in_use"], data["project_job_limit"]))
         for uid, u in p["units"].items():
             print("  %s (%s) auth=%s exec=%s closure=%s tracker=%s attempts=%d" % (
                 uid, u["kind"], u["authorization"].get("state"), u["execution"].get("state"),
