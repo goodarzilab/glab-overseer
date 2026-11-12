@@ -81,7 +81,7 @@ The host family writes code; the other family reviews. The supervisor resolves n
 | | orchestrate | write code | review |
 |---|---|---|---|
 | Claude Code host | `opus` | `sonnet` | newest Google flash |
-| Antigravity host | newest argon-tier | newest argon-tier | Claude `haiku` |
+| Antigravity host | newest pro tier (argon, carbon, pro), else newest flash | same as plan | Claude `haiku` |
 
 On a confirmed quota or auth failure of the reviewer, the supervisor retries once with the host family's small model in a fresh session and labels the round `same_family_fallback`. Authors never switch family. Say so in the report whenever a fallback occurred. Host-specific: in Claude Code the supervisor runs `claude -p`; in Antigravity it runs `agy -p`. Both are launched headless by the supervisor, never by you.
 

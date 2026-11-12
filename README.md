@@ -137,7 +137,7 @@ The host family writes the code; the other family reviews it.
 | Host | Orchestrates | Writes code | Reviews |
 |---|---|---|---|
 | Claude Code | `opus` | `sonnet` | newest Gemini flash |
-| Antigravity | newest Gemini argon tier | newest Gemini argon tier | Claude `haiku` |
+| Antigravity | newest Gemini pro tier (flash if the account has none) | same as plan | Claude `haiku` |
 
 Google model names are resolved from `agy models` and cached with a date (`overseer.py models --refresh` updates them). If the reviewer hits a confirmed quota or login failure, the supervisor retries once with the host family's small model and labels the round `same_family_fallback` in the report. Authors never switch family.
 

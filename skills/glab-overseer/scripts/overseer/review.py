@@ -307,7 +307,8 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
         other = [f for f in models.FAMILIES if f != host][0]
         roles = models.roles_for(cache, other)
         if roles is None:
-            raise ReviewError("the reviewer family %s is unavailable in models.json (%s)" % (other, cache["choices"][other].get("reason")))
+            raise ReviewError("the reviewer family %s is unavailable in models.json (%s); once it is fixed, run "
+                              "`overseer.py models --host %s --refresh`" % (other, cache["choices"][other].get("reason"), host))
         rounds = _rounds(adir)
         before, allowed = approval.review_allowance(root, plan_id, unit["id"], n, _cap(plan))
         for R0, rdir0, rd0 in rounds:  # persist orphaned round directories as aborted records
