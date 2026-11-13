@@ -165,6 +165,20 @@ class Persist(U2.Case):
         self.assertIn("reviewer: google", out)
         self.assertNotIn("reviewer", models.load_valid(self.root))
 
+    def test_a_failing_codex_listing_leaves_the_record_and_names_the_way_out(self):
+        cat = os.path.join(self.tmp, "codex-models.json")
+        with open(cat, "w") as f:
+            json.dump(CATALOG, f)
+        self.shim("codex", "cat '%s'" % cat)
+        self.assertEqual(self.run_cli("models", "--host", "claude", "--reviewer", "codex")[0], 0)
+        before = models.read_cache(self.root)
+        self.shim("codex", "echo down >&2; exit 2")
+        rc, _, err = self.run_cli("models", "--host", "claude", "--refresh")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("models.json is unchanged", err)
+        self.assertIn("--reviewer none", err)
+        self.assertEqual(models.read_cache(self.root), before)
+
     def test_host_families_keep_the_measured_probe_schema(self):
         self.assertNotIn("additionalProperties", adapters.PROBE_SCHEMA)
         self.assertIs(adapters.CODEX_PROBE_SCHEMA["additionalProperties"], False)

@@ -213,7 +213,11 @@ def resolve(root, host, refresh=False, base=None, today=None, reviewer=KEEP):
     google, raw = _resolve_google(base, strict=(host == "google"))
     choices = {"claude": dict(CLAUDE_ROLES), "google": google}
     if reviewer == "codex":
-        choices["codex"] = _resolve_codex(base)
+        try:
+            choices["codex"] = _resolve_codex(base)
+        except ModelError as e:  # strict: Codex was asked for; the cached record stays as it was
+            raise ModelError("%s; models.json is unchanged. Fix the codex CLI, or pass `--reviewer none` to review "
+                             "with the non-host family" % e)
     day = (today or datetime.datetime.now(datetime.timezone.utc).date()).isoformat()
     record = {"date": day, "host": host, "raw": raw, "choices": choices}
     if reviewer is not None:
