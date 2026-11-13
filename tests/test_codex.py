@@ -173,6 +173,8 @@ class Review(U6.Case):
         rc, res, err = self.review()
         self.assertEqual((rc, res["verdict"], res["reviewer_family"], res["model"], res["same_family_fallback"]),
                          (0, "PASS", "codex", "gpt-6.1-sol", False), err)
+        md = report.render(report.build(self.root, True))
+        self.assertIn("by codex gpt-6.1-sol: PASS", md)  # the model name survives the report's allowlist
         (name, cwd, argv, count), = self.calls()
         self.assertEqual((name, count), ("codex", "0"))
         self.assertTrue(argv.endswith(" -"))
@@ -187,6 +189,8 @@ class Review(U6.Case):
         rc, res, err = self.review()
         self.assertEqual((rc, res["verdict"], res["reviewer_family"], res["same_family_fallback"]),
                          (0, "PASS", "google", False), err)
+        md = report.render(report.build(self.root, True))
+        self.assertIn("(fallback from the opted-in reviewer)", md)
         rd = jload(os.path.join(self.rdir(), "round.json"))
         self.assertIn("QUOTA from codex", rd["reviewer_fallback"])
         self.assertEqual([(c["purpose"], c["family"]) for c in rd["calls"]],

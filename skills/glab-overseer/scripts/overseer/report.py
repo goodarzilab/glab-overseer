@@ -19,7 +19,7 @@ from . import approval, controller, execution as X, judge as J, paths, plan as P
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 WORD_RE = re.compile(r"^[A-Za-z0-9_]{1,40}$")
 # Only the model shapes the supervisor resolves (models.py); anything else, including a token-shaped string, is dropped.
-MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+)$")
+MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+|gpt-[0-9]+(?:\.[0-9]+)*-[a-z]+)$")
 FAMILY = {"claude": "claude", "agy": "google", "google": "google", "codex": "codex"}
 BACKENDS = ("local", "slurm")
 INLINE_MAX = 16 * 1024 * 1024  # a larger file is copied by streaming into <out>/files/ instead of inlined
@@ -271,6 +271,7 @@ def _reviews(adir, uid, gaps):
             "reviewer_family": last.get("family") if last.get("family") in FAMILY.values() else _word(rd.get("reviewer_family")),
             "reviewer_model": _model(last.get("model") or rd.get("model")),
             "same_family_fallback": rd.get("same_family_fallback") is True,
+            "reviewer_fallback": isinstance(rd.get("reviewer_fallback"), str),
             "findings": len(rv["findings"]) if isinstance(rv, dict) and isinstance(rv.get("findings"), list) else None,
             "dispositions": counts})
     return rounds
@@ -655,7 +656,8 @@ def render(rep):
                 for r in a["reviews"]:
                     out.append("  - review r%s by %s %s: %s%s, %s findings, dispositions %s" % (
                         _cell(r["round"]), _cell(r["reviewer_family"]), _cell(r["reviewer_model"]), _cell(r["verdict"]),
-                        " (same-family fallback)" if r["same_family_fallback"] else "", _cell(r["findings"]),
+                        (" (same-family fallback)" if r["same_family_fallback"] else "")
+                        + (" (fallback from the opted-in reviewer)" if r.get("reviewer_fallback") else ""), _cell(r["findings"]),
                         json.dumps(r["dispositions"], sort_keys=True)))
                 if a["orchestrator_decision"]:
                     out.append("  - orchestrator decision recorded at the review cap")

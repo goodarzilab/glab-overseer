@@ -7,7 +7,7 @@ Anything else parses as not ok.
 
 `codex` is a reviewer-only family: it never hosts or authors. It always takes
 the prompt on stdin, because its Linux command sandbox may fail to start on a
-cluster node (measured on Chimera, 2026-11-13) and a reviewer needs no tools. Quota and auth signatures are provisional until a real
+cluster node (measured on a lab cluster, 2026-11-13) and a reviewer needs no tools. Quota and auth signatures are provisional until a real
 sanitized failure confirms them.
 """
 import json
