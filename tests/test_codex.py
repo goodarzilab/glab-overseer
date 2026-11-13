@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 
+import test_u2 as U2
 import test_u6 as U6
 from test_u5 import jload
 
@@ -145,6 +146,28 @@ class Models(unittest.TestCase):
         self.assertFalse(models._valid_cache(self.rec(reviewer="codex")))  # opted in, no choices.codex
         self.assertFalse(models._valid_cache(dict(cx, reviewer="gpt")))
         self.assertIsNone(models.roles_for(plain, "codex"))
+
+
+class Persist(U2.Case):
+    def test_refresh_keeps_the_opted_in_reviewer_until_none(self):
+        cat = os.path.join(self.tmp, "codex-models.json")
+        with open(cat, "w") as f:
+            json.dump(CATALOG, f)
+        self.shim("codex", "cat '%s'" % cat)
+        self.assertEqual(self.run_cli("models", "--host", "claude", "--reviewer", "codex")[0], 0)
+        for args in ((), ("--refresh",)):  # the stale-cache warning suggests a plain --refresh
+            rc, out, err = self.run_cli("models", "--host", "claude", *args)
+            self.assertEqual(rc, 0, err)
+            self.assertIn("reviewer: codex", out)
+            self.assertEqual(models.load_valid(self.root)["reviewer"], "codex")
+        rc, out, err = self.run_cli("models", "--host", "claude", "--reviewer", "none")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("reviewer: google", out)
+        self.assertNotIn("reviewer", models.load_valid(self.root))
+
+    def test_host_families_keep_the_measured_probe_schema(self):
+        self.assertNotIn("additionalProperties", adapters.PROBE_SCHEMA)
+        self.assertIs(adapters.CODEX_PROBE_SCHEMA["additionalProperties"], False)
 
 
 class Usage(unittest.TestCase):

@@ -14,6 +14,7 @@ from . import env as E, paths, store
 CLAUDE_ROLES = {"plan": "opus", "code": "sonnet", "review": "haiku"}
 FAMILIES = ("claude", "google")
 REVIEWERS = ("codex",)  # reviewer-only families; never hosts or authors
+KEEP, NO_REVIEWER = "keep", "none"  # `models` without --reviewer keeps the cached choice; --reviewer none clears it
 MAX_AGE_DAYS = 30
 LIST_TIMEOUT = 60
 _PRO = re.compile(r"^gemini-(\d+(?:\.\d+)*)-(argon|carbon|pro)-high$")
@@ -187,18 +188,23 @@ def _resolve_codex(base):
     return dict(resolve_codex(parse_codex_listing(r["stdout"])), available=True)
 
 
-def resolve(root, host, refresh=False, base=None, today=None, reviewer=None):
+def resolve(root, host, refresh=False, base=None, today=None, reviewer=KEEP):
     """Return (record, warnings). Resolves both families (and an opted-in reviewer-only family);
-    writes models.json only when it resolves anew."""
+    writes models.json only when it resolves anew. `reviewer` KEEP keeps the cached opt-in (so a refresh
+    never drops it silently), None or NO_REVIEWER clears it, a name in REVIEWERS opts in."""
     if host not in FAMILIES:
         raise ModelError("host must be claude or google")
-    if reviewer is not None and reviewer not in REVIEWERS:
-        raise ModelError("reviewer must be one of %s" % ", ".join(REVIEWERS))
+    if reviewer == NO_REVIEWER:
+        reviewer = None
+    if reviewer not in (None, KEEP) + REVIEWERS:
+        raise ModelError("reviewer must be one of %s" % ", ".join(REVIEWERS + (NO_REVIEWER,)))
     warnings = []
     cache = read_cache(root)
     if cache is not None and not _valid_cache(cache):
         warnings.append("ignoring malformed models.json")
         cache = None
+    if reviewer == KEEP:
+        reviewer = cache.get("reviewer") if cache else None
     if cache and cache["host"] == host and cache.get("reviewer") == reviewer and not refresh:
         age = cache_age_days(cache, today)
         if age > MAX_AGE_DAYS:
@@ -222,14 +228,15 @@ def resolve(root, host, refresh=False, base=None, today=None, reviewer=None):
 def configure(p):
     p.add_argument("--host", required=True, choices=list(FAMILIES))
     p.add_argument("--refresh", action="store_true", help="re-resolve even if models.json is current")
-    p.add_argument("--reviewer", choices=list(REVIEWERS), default=None,
-                   help="opt in to a reviewer-only family instead of the non-host family")
+    p.add_argument("--reviewer", choices=list(REVIEWERS) + [NO_REVIEWER], default=KEEP,
+                   help="opt in to a reviewer-only family instead of the non-host family (`none` clears it; "
+                        "omitted keeps the current choice)")
 
 
 def run(args):
     root = paths.find_root(args.root)
     with store.ProjectLock(root, "models"):
-        rec, warnings = resolve(root, args.host, args.refresh, reviewer=getattr(args, "reviewer", None))
+        rec, warnings = resolve(root, args.host, args.refresh, reviewer=getattr(args, "reviewer", KEEP))
     for w in warnings:
         sys.stderr.write("warning: %s\n" % w)
     print("host: %s (resolved %s)" % (rec["host"], rec["date"]))

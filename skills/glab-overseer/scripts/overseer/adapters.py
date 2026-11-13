@@ -328,9 +328,10 @@ def prepare(family, role, model, task_text, cwd, task_dir=None, survey=None, sch
 
 # ---- transport probes -------------------------------------------------------
 
-# additionalProperties false: codex (OpenAI strict structured outputs) rejects a schema without it.
-PROBE_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"],
-                "additionalProperties": False}
+PROBE_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+# codex (OpenAI strict structured outputs) rejects a schema without additionalProperties false; the host
+# families keep the schema they were measured with.
+CODEX_PROBE_SCHEMA = dict(PROBE_SCHEMA, additionalProperties=False)
 
 
 def _call(family, inv, env, timeout):
@@ -358,7 +359,8 @@ def probe_transport(family, cwd, env, model=None, timeout=180):
         out["stdin"] = "unsupported"
     with tempfile.TemporaryDirectory(prefix="ovr-task-") as task_dir:
         inv = prepare(family, "reviewer", model, 'Set the field "answer" to the word ok.', cwd,
-                      task_dir=task_dir, schema=PROBE_SCHEMA, transport="stdin" if family == "codex" else "file",
+                      task_dir=task_dir, schema=CODEX_PROBE_SCHEMA if family == "codex" else PROBE_SCHEMA,
+                      transport="stdin" if family == "codex" else "file",
                       schema_flag=True)
         state, res = _call(family, inv, env, timeout)
     # The flag works when the CLI itself returns a schema-valid structured_output.
