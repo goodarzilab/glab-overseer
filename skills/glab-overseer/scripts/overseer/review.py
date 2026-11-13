@@ -392,7 +392,8 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
             hroles = models.roles_for(cache, host)
             if hroles:
                 why = "%s from %s %s" % (c["classification"], fam, model)
-                rd = _update_round(root, rdir, lambda r: r.update(same_family_fallback=True, fallback_reason=why))
+                extra = {"reviewer_fallback": why} if fam in models.REVIEWERS else {}  # straight from codex
+                rd = _update_round(root, rdir, lambda r: r.update(same_family_fallback=True, fallback_reason=why, **extra))
                 plans.append(("fallback", host, hroles["review"]))
     else:
         rd = _update_round(root, rdir, lambda r: r.update(state="failed"))

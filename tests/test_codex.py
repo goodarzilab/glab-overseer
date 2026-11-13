@@ -248,6 +248,8 @@ class Review(U6.Case):
         self.reviewer("claude", U6.claude_out(U6.PASS, "fallback-sess"))
         rc, res, err = self.review()
         self.assertEqual((rc, res["reviewer_family"], res["same_family_fallback"]), (0, "claude", True), err)
+        self.assertIn("QUOTA from codex", jload(os.path.join(self.rdir(), "round.json"))["reviewer_fallback"])
+        self.assertIn("(fallback from the opted-in reviewer)", report.render(report.build(self.root, True)))
 
     def test_codex_transient_error_does_not_fall_back(self):
         self.done_codex()
