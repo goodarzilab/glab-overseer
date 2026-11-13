@@ -19,8 +19,8 @@ from . import approval, controller, execution as X, judge as J, paths, plan as P
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 WORD_RE = re.compile(r"^[A-Za-z0-9_]{1,40}$")
 # Only the model shapes the supervisor resolves (models.py); anything else, including a token-shaped string, is dropped.
-MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+)$")
-FAMILY = {"claude": "claude", "agy": "google", "google": "google"}
+MODEL_RE = re.compile(r"^(?:opus|sonnet|haiku|claude-(?:opus|sonnet|haiku)-[0-9][0-9.-]{0,20}|gemini-[0-9]+(?:\.[0-9]+)*-[a-z]+-[a-z]+|gpt-[0-9]+(?:\.[0-9]+)*-[a-z]+)$")
+FAMILY = {"claude": "claude", "agy": "google", "google": "google", "codex": "codex"}
 BACKENDS = ("local", "slurm")
 INLINE_MAX = 16 * 1024 * 1024  # a larger file is copied by streaming into <out>/files/ instead of inlined
 LIST_ONLY_DIRS = ("worktree", ".git")  # committed worktree files and .git: listed with size and digest, recoverable from commits
@@ -157,7 +157,34 @@ USAGE_KEYS = ("input", "cache_read", "cache_write", "output")
 # Token fields as each CLI reports them in its JSON result: claude -p (a result event) and agy -p (one object).
 _USAGE_MAP = {"claude": {"input": "input_tokens", "cache_read": "cache_read_input_tokens",
                          "cache_write": "cache_creation_input_tokens", "output": "output_tokens"},
-              "google": {"input": "input_tokens", "cache_read": "cache_read_tokens", "output": "output_tokens"}}
+              "google": {"input": "input_tokens", "cache_read": "cache_read_tokens", "output": "output_tokens"},
+              # codex: _codex_usage below has already turned its turn.completed totals into these keys.
+              "codex": {"input": "input", "cache_read": "cache_read", "cache_write": "cache_write", "output": "output"}}
+
+
+def _codex_usage(raw):
+    """Summed `turn.completed` usage from `codex exec --json` stdout (JSON Lines), in report keys.
+    OpenAI counts cached tokens inside input_tokens; they are split out so `input` means uncached
+    input, as it does for claude. Reasoning tokens are already inside output_tokens."""
+    tot, seen = {}, False
+    for line in raw.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        u = e.get("usage") if isinstance(e, dict) and e.get("type") == "turn.completed" else None
+        if not isinstance(u, dict):
+            continue
+        vals = {k: u.get(k, 0) for k in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")}
+        if any(_int(v) is None for v in vals.values()) or "input_tokens" not in u or "output_tokens" not in u:
+            return None
+        seen = True
+        for k, v in vals.items():
+            tot[k] = tot.get(k, 0) + v
+    if not seen:
+        return None
+    return {"usage": {"input": tot["input_tokens"] - tot["cached_input_tokens"], "cache_read": tot["cached_input_tokens"],
+                      "cache_write": tot["cache_write_input_tokens"], "output": tot["output_tokens"]}}
 
 
 USAGE_FILE_MAX = 64 * 1024 * 1024
@@ -177,7 +204,8 @@ def _usage_of(path, family=None):
             st = os.fstat(f.fileno())
             if not stat.S_ISREG(st.st_mode) or st.st_size > USAGE_FILE_MAX:
                 return None
-            data = json.loads(f.read(USAGE_FILE_MAX + 1).decode("utf-8"))
+            raw = f.read(USAGE_FILE_MAX + 1).decode("utf-8")
+            data = _codex_usage(raw) if family == "codex" else json.loads(raw)
     except (OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return None
     if isinstance(data, list):  # claude -p --output-format json may print the event array; the result event is last
@@ -243,6 +271,7 @@ def _reviews(adir, uid, gaps):
             "reviewer_family": last.get("family") if last.get("family") in FAMILY.values() else _word(rd.get("reviewer_family")),
             "reviewer_model": _model(last.get("model") or rd.get("model")),
             "same_family_fallback": rd.get("same_family_fallback") is True,
+            "reviewer_fallback": isinstance(rd.get("reviewer_fallback"), str),
             "findings": len(rv["findings"]) if isinstance(rv, dict) and isinstance(rv.get("findings"), list) else None,
             "dispositions": counts})
     return rounds
@@ -627,7 +656,8 @@ def render(rep):
                 for r in a["reviews"]:
                     out.append("  - review r%s by %s %s: %s%s, %s findings, dispositions %s" % (
                         _cell(r["round"]), _cell(r["reviewer_family"]), _cell(r["reviewer_model"]), _cell(r["verdict"]),
-                        " (same-family fallback)" if r["same_family_fallback"] else "", _cell(r["findings"]),
+                        (" (same-family fallback)" if r["same_family_fallback"] else "")
+                        + (" (fallback from the opted-in reviewer)" if r.get("reviewer_fallback") else ""), _cell(r["findings"]),
                         json.dumps(r["dispositions"], sort_keys=True)))
                 if a["orchestrator_decision"]:
                     out.append("  - orchestrator decision recorded at the review cap")

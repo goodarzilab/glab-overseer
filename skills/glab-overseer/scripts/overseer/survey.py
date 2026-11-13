@@ -12,7 +12,7 @@ from . import adapters, env as E, models, paths, store
 
 QUERY_TIMEOUT = 20
 PROBE_TIMEOUT = 180
-TOOLS = ("claude", "agy", "gh", "git", "sbatch", "squeue", "scontrol", "sacct", "sinfo")
+TOOLS = ("claude", "agy", "codex", "gh", "git", "sbatch", "squeue", "scontrol", "sacct", "sinfo")
 SLURM_TOOLS = ("sbatch", "squeue", "scontrol", "sacct", "sinfo")
 UNKNOWN = "unknown"
 KEY_WARNING = ("LLM API-key variables are present; `claude` bills a present key instead of the "
@@ -73,9 +73,12 @@ def _auth_probe(family, found, base, timeout, record):
     with tempfile.TemporaryDirectory(prefix="ovr-probe-") as cwd, \
             tempfile.TemporaryDirectory(prefix="ovr-task-") as task_dir:
         model = roles["review"]
-        inv = adapters.prepare(family, "author", model, "Reply with the single word ok.", cwd,
-                               task_dir=task_dir, transport="file")
-        r = E.run_tool(inv["argv"], E.worker_env(base), timeout, cwd=cwd)
+        if family == "codex":  # reviewer-only, stdin-only
+            inv = adapters.prepare(family, "reviewer", model, "Reply with the single word ok.", cwd)
+        else:
+            inv = adapters.prepare(family, "author", model, "Reply with the single word ok.", cwd,
+                                   task_dir=task_dir, transport="file")
+        r = E.run_tool(inv["argv"], E.worker_env(base), timeout, cwd=cwd, stdin=inv["stdin"])
     if r["timed_out"]:
         return {"status": UNKNOWN}
     res = adapters.parse_result(family, r["rc"], r["stdout"], r["stderr"])
