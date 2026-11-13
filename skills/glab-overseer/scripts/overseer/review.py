@@ -304,7 +304,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
         if cache is None:
             raise ReviewError("models.json is missing or malformed; run `overseer.py models --host claude|google`")
         host = cache["host"]
-        other = [f for f in models.FAMILIES if f != host][0]
+        other = models.reviewer_family(cache)
         roles = models.roles_for(cache, other)
         if roles is None:
             raise ReviewError("the reviewer family %s is unavailable in models.json (%s); once it is fixed, run "
@@ -368,6 +368,7 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
         survey = W._survey(root)
     task = INSTRUCTIONS + text
     plans = [("retry" if reuse else "primary", other, roles["review"])]
+    tried = {other}
     while plans:
         purpose, fam, model = plans.pop(0)
         c = _call(root, rdir, rd, wt, purpose, fam, model, task, survey, timeout, sids_fn)
@@ -376,7 +377,18 @@ def _run_review(root, plan_id, unit, retry, timeout, max_chars):
             store.write_json_atomic(os.path.join(rdir, "review.json"), c["review"])
             rd = _update_round(root, rdir, lambda r: r.update(state="complete", verdict=c["review"]["verdict"]))
             break
-        if c["classification"] in ("QUOTA", "AUTH") and fam != host and not rd["same_family_fallback"]:
+        if c["classification"] not in ("QUOTA", "AUTH"):
+            continue
+        # An opted-in reviewer-only family (codex) falls back first to the non-host family, which is
+        # still cross-family; only after that does the same-family fallback apply.
+        cross = [f for f in models.FAMILIES if f != host][0]
+        croles = models.roles_for(cache, cross)
+        if fam in models.REVIEWERS and cross not in tried and croles:
+            tried.add(cross)
+            why = "%s from %s %s" % (c["classification"], fam, model)
+            rd = _update_round(root, rdir, lambda r: r.update(reviewer_fallback=why))
+            plans.append(("cross_fallback", cross, croles["review"]))
+        elif fam != host and not rd["same_family_fallback"]:
             hroles = models.roles_for(cache, host)
             if hroles:
                 why = "%s from %s %s" % (c["classification"], fam, model)

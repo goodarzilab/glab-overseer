@@ -497,7 +497,7 @@ class PrepareTests(Case):
 
     def test_schema_flag_is_inline_compact_json_for_both_families(self):
         ok = sdoc({"claude": {"schema": True}, "google": {"schema": True}})
-        for family in adapters.FAMILIES:
+        for family in adapters.HOST_FAMILIES:  # codex takes a schema file; see test_codex
             inv = adapters.prepare(family, "reviewer", "m", "T", self.root, task_dir=self.td(), survey=ok, schema=self.SCHEMA)
             i = inv["argv"].index("--json-schema")
             self.assertEqual(json.loads(inv["argv"][i + 1]), self.SCHEMA)

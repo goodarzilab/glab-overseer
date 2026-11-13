@@ -20,7 +20,7 @@ Rules that never bend:
 Run these in the project, in order, and read the output:
 
 1. `overseer.py survey` records tools, Slurm, git origin and `gh` auth. Add `--probe-auth` to see how each CLI authenticates (one cheap model call each).
-2. `overseer.py models --host claude` when you run in Claude Code, `overseer.py models --host google` in Antigravity. This is the host label for model roles (section 5). `--refresh` re-resolves.
+2. `overseer.py models --host claude` when you run in Claude Code, `overseer.py models --host google` in Antigravity. This is the host label for model roles (section 5). `--refresh` re-resolves. Add `--reviewer codex` only when the user asks for Codex review; it replaces the non-host reviewer (see README).
 3. `overseer.py probe-transport` measures stdin and `--json-schema` support of each CLI.
 4. On a cluster only: from inside an interactive allocation run `overseer.py slurm-handshake --plan PLAN_ID`. It proves a batch job sees the project root. Use shared storage for the project, not `/tmp`.
 

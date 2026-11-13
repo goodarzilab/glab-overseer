@@ -141,6 +141,8 @@ The host family writes the code; the other family reviews it.
 
 Google model names are resolved from `agy models` and cached with a date (`overseer.py models --refresh` updates them). If the reviewer hits a confirmed quota or login failure, the supervisor retries once with the host family's small model and labels the round `same_family_fallback` in the report. Authors never switch family.
 
+**Optional Codex reviewer (prototype, issue #38).** `overseer.py models --host claude --reviewer codex` makes Codex (`codex exec`, logged in with a ChatGPT Enterprise or Business seat) the reviewer instead of the non-host family. The review model is the newest `gpt-<v>-sol` that `codex debug models` lists, at reasoning effort high. Codex only reviews; it never hosts or authors. It takes the prompt on stdin with a read-only sandbox and receives its schema through `--output-schema`. On a confirmed quota or login failure, the round first falls back to the non-host family, which is still cross-family and is recorded as `reviewer_fallback`. Only after that does the usual `same_family_fallback` apply.
+
 ## When is a unit done
 
 `overseer.py judge` decides, and a worker exiting decides nothing.

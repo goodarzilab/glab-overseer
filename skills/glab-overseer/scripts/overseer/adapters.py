@@ -1,8 +1,13 @@
 """CLI adapters: argv builders, prompt transport, result parsers, failure classifier.
 
 Supported envelope: the output shapes measured for `claude -p --output-format
-json` (event array) and `agy -p --output-format json` (one object). Anything
-else parses as not ok. Quota and auth signatures are provisional until a real
+json` (event array), `agy -p --output-format json` (one object) and
+`codex exec --json` (JSON Lines events, measured with codex-cli 0.169.0).
+Anything else parses as not ok.
+
+`codex` is a reviewer-only family: it never hosts or authors. It always takes
+the prompt on stdin, because its Linux command sandbox may fail to start on a
+cluster node (measured on Chimera, 2026-11-13) and a reviewer needs no tools. Quota and auth signatures are provisional until a real
 sanitized failure confirms them.
 """
 import json
@@ -12,8 +17,10 @@ import tempfile
 
 from . import env as E
 
-FAMILIES = ("claude", "google")
-BINARY = {"claude": "claude", "google": "agy"}
+FAMILIES = ("claude", "google", "codex")
+HOST_FAMILIES = ("claude", "google")
+BINARY = {"claude": "claude", "google": "agy", "codex": "codex"}
+CODEX_EFFORT = "high"  # reasoning effort for codex review calls (`-c model_reasoning_effort=...`)
 
 QUOTA, AUTH, TRANSIENT, CONFIG, UNKNOWN = "QUOTA", "AUTH", "TRANSIENT", "CONFIG", "UNKNOWN"
 
@@ -24,7 +31,7 @@ SIGNATURES = [
     (CONFIG, "invalid-model", r"(invalid|unknown|unsupported|unrecognized) model|model\b[^\n]{0,60}\b(is invalid|invalid|not found|does not exist|not supported|unsupported|unknown)\b", False),
     (QUOTA, "usage-limit", r"usage limit (reached|exceeded)|(5-hour|weekly|daily|monthly) limit reached|you(?:'ve| have) hit your (usage )?limit", True),
     (QUOTA, "quota-exhausted", r"quota (exceeded|exhausted)|exceeded your (current )?quota|out of (credits|usage)", True),
-    (AUTH, "login-required", r"please (run )?/?login|please log in|not logged in|login required|run [`']?(claude|agy) (auth )?login", True),
+    (AUTH, "login-required", r"please (run )?/?login|please log in|not logged in|login required|run [`']?(claude|agy|codex) (auth )?login", True),
     (AUTH, "invalid-credentials", r"invalid (authentication )?credentials|authentication[_ ]error|oauth token (has )?expired", True),
     (TRANSIENT, "http-429", r"\b429\b", False),
     (TRANSIENT, "http-529", r"\b529\b", False),
@@ -150,8 +157,55 @@ def parse_agy(rc, stdout, stderr):
                    usage=data["usage"] if isinstance(data.get("usage"), dict) else None)
 
 
+def parse_codex(rc, stdout, stderr):
+    """`codex exec --json`: one JSON event per line. The reply is the last `agent_message` item; usage comes
+    from `turn.completed`; `turn.failed` and `error` events carry failure text. Codex has no separate
+    structured-output field: with `--output-schema` the final message itself is the JSON, so a final message
+    that parses as one object counts as native structured output."""
+    events = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            events.append(e)
+    if not events:
+        return _fail("codex", rc, stdout or "", stderr, "stdout has no JSON events")
+    sid = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
+    msgs = [e["item"].get("text") for e in events if e.get("type") == "item.completed"
+            and isinstance(e.get("item"), dict) and e["item"].get("type") == "agent_message"]
+    text = msgs[-1] if msgs and isinstance(msgs[-1], str) else None
+    errors = [e.get("message") for e in events if e.get("type") == "error"]
+    errors += [e["error"].get("message") for e in events if e.get("type") == "turn.failed" and isinstance(e.get("error"), dict)]
+    errors = [m for m in errors if isinstance(m, str)]
+    done = [e for e in events if e.get("type") == "turn.completed"]
+    failed = any(e.get("type") == "turn.failed" for e in events)
+    if rc != 0 or failed or not done or text is None:
+        return _fail("codex", rc, "", stderr, "no completed turn with a final message",
+                     classify_text="\n".join(errors), text=text, session_id=_str_or_none(sid))
+    usage = {}
+    for e in done:
+        u = e.get("usage")
+        if isinstance(u, dict):
+            for k, v in u.items():
+                if _int_or_none(v) is not None:
+                    usage[k] = usage.get(k, 0) + v
+    structured = extract_json(text)
+    return _result(True, "codex", rc, text=text, structured=structured, structured_native=structured is not None,
+                   session_id=_str_or_none(sid), num_turns=len(done), usage=usage or None)
+
+
+_PARSERS = {"claude": parse_claude, "google": parse_agy, "codex": parse_codex}
+
+
 def parse_result(family, rc, stdout, stderr):
-    return (parse_claude if family == "claude" else parse_agy)(rc, stdout, stderr)
+    if family not in _PARSERS:
+        raise ValueError("unknown family %r" % (family,))
+    return _PARSERS[family](rc, stdout, stderr)
 
 
 # ---- argv and prompt transport --------------------------------------------
@@ -160,8 +214,10 @@ def schema_arg(schema):
     return json.dumps(schema, separators=(",", ":"))
 
 
-def build_argv(family, model, prompt=None, schema=None):
-    """Full argv. `prompt` None means the prompt arrives on stdin (claude only).
+def build_argv(family, model, prompt=None, schema=None, schema_path=None):
+    """Full argv. `prompt` None means the prompt arrives on stdin (claude and codex).
+
+    codex reads the prompt from stdin (`-`) and its schema from a file (`schema_path`), never inline.
 
     agy's `-p` consumes the next argument as the prompt, so the prompt must come
     right after it and no flag may follow `-p` directly. `--json-schema` takes
@@ -179,6 +235,15 @@ def build_argv(family, model, prompt=None, schema=None):
         argv = ["agy", "-p", prompt, "--model", model]
         argv += ["--dangerously-skip-permissions", "--sandbox", "--output-format", "json"]
         return argv + (["--json-schema", schema_arg(schema)] if schema is not None else [])
+    if family == "codex":
+        if prompt is not None:
+            raise ValueError("codex takes the prompt on stdin only")
+        if (schema is None) != (schema_path is None):
+            raise ValueError("codex needs both the schema and its file path, or neither")
+        argv = ["codex", "exec", "--json", "--ephemeral", "--skip-git-repo-check", "-s", "read-only",
+                "-m", model, "-c", 'model_reasoning_effort="%s"' % CODEX_EFFORT]
+        argv += ["--output-schema", schema_path] if schema_path else []
+        return argv + ["-"]
     raise ValueError("unknown family %r" % (family,))
 
 
@@ -199,14 +264,14 @@ def pointer(task_path):
     return "Read the file %s and follow it exactly." % task_path
 
 
-def _task_path(cwd, task_dir):
-    """`<task_dir>/task.md`, absolute. The directory must be outside cwd and hold no task yet."""
+def _task_path(cwd, task_dir, name="task.md"):
+    """`<task_dir>/<name>`, absolute. The directory must be outside cwd and hold no such file yet."""
     if not task_dir:
         raise ValueError("file transport needs task_dir (a fresh directory outside the working directory)")
     td, wd = os.path.realpath(task_dir), os.path.realpath(cwd)
     if os.path.commonpath([td, wd]) == wd:
         raise ValueError("task_dir %r is inside the working directory" % (task_dir,))
-    path = os.path.join(td, "task.md")
+    path = os.path.join(td, name)
     if os.path.lexists(path):
         raise ValueError("%s already exists; each invocation owns a fresh task_dir" % path)
     return path
@@ -227,9 +292,17 @@ def prepare(family, role, model, task_text, cwd, task_dir=None, survey=None, sch
         raise ValueError("role must be author or reviewer")
     if not os.path.isdir(cwd):
         raise ValueError("working directory %r does not exist" % (cwd,))
+    if family not in FAMILIES:
+        raise ValueError("unknown family %r" % (family,))
+    if family == "codex" and role != "reviewer":
+        raise ValueError("codex is a reviewer-only family")
     if transport is None:
-        transport = "stdin" if family == "claude" and _probe_flag(survey, family, "stdin") else "file"
-    if transport not in ("file", "stdin") or (transport == "stdin" and family != "claude"):
+        if family == "codex":
+            transport = "stdin"
+        else:
+            transport = "stdin" if family == "claude" and _probe_flag(survey, family, "stdin") else "file"
+    if (transport not in ("file", "stdin") or (transport == "stdin" and family == "google")
+            or (transport == "file" and family == "codex")):
         raise ValueError("transport %r is not supported for %s" % (transport, family))
     use_flag = False
     text = task_text
@@ -238,8 +311,13 @@ def prepare(family, role, model, task_text, cwd, task_dir=None, survey=None, sch
         if not use_flag:
             text += "\n\nReply with one JSON object matching this JSON schema:\n" + schema_arg(schema)
     prompt_file = _task_path(cwd, task_dir) if transport == "file" else None
+    schema_file = _task_path(cwd, task_dir, "schema.json") if (family == "codex" and use_flag) else None
     argv = build_argv(family, model, pointer(prompt_file) if prompt_file else None,
-                      schema if use_flag else None)
+                      schema if use_flag else None, schema_path=schema_file)
+    if schema_file:
+        os.makedirs(os.path.dirname(schema_file), exist_ok=True)
+        with open(schema_file, "x", encoding="utf-8") as f:
+            f.write(schema_arg(schema))
     if prompt_file:
         os.makedirs(os.path.dirname(prompt_file), exist_ok=True)
         with open(prompt_file, "x", encoding="utf-8") as f:
@@ -250,7 +328,9 @@ def prepare(family, role, model, task_text, cwd, task_dir=None, survey=None, sch
 
 # ---- transport probes -------------------------------------------------------
 
-PROBE_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+# additionalProperties false: codex (OpenAI strict structured outputs) rejects a schema without it.
+PROBE_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"],
+                "additionalProperties": False}
 
 
 def _call(family, inv, env, timeout):
@@ -262,9 +342,14 @@ def _call(family, inv, env, timeout):
 
 def probe_transport(family, cwd, env, model=None, timeout=180):
     """One real call for stdin and one for --json-schema. Values: True, False, "unknown",
-    or "unsupported" (agy has no stdin transport, so that call is not made)."""
+    or "unsupported" (agy has no stdin transport, so that call is not made). codex is probed with
+    stdin for both, since it has no file transport."""
     out = {}
-    if family == "claude":
+    if family == "codex":
+        inv = prepare(family, "reviewer", model, "Reply with exactly the text PROBE-OK and nothing else.", cwd)
+        state, res = _call(family, inv, env, timeout)
+        out["stdin"] = state or bool(res["ok"] and "PROBE-OK" in res["text"])
+    elif family == "claude":
         inv = prepare(family, "author", model, "Reply with exactly the text PROBE-OK and nothing else.",
                       cwd, transport="stdin")
         state, res = _call(family, inv, env, timeout)
@@ -273,7 +358,8 @@ def probe_transport(family, cwd, env, model=None, timeout=180):
         out["stdin"] = "unsupported"
     with tempfile.TemporaryDirectory(prefix="ovr-task-") as task_dir:
         inv = prepare(family, "reviewer", model, 'Set the field "answer" to the word ok.', cwd,
-                      task_dir=task_dir, schema=PROBE_SCHEMA, transport="file", schema_flag=True)
+                      task_dir=task_dir, schema=PROBE_SCHEMA, transport="stdin" if family == "codex" else "file",
+                      schema_flag=True)
         state, res = _call(family, inv, env, timeout)
     # The flag works when the CLI itself returns a schema-valid structured_output.
     # The value is not judged: measured models sometimes nest JSON text in it.

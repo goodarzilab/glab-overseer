@@ -35,7 +35,7 @@ import sys
 import time
 
 PASS, FAIL, INCOMPLETE = "PASS", "FAIL", "INCOMPLETE"
-FAMILY = {"claude": "claude", "agy": "google"}
+FAMILY = {"claude": "claude", "agy": "google", "codex": "codex"}
 RUN_FAMILIES = {"run1": ("claude", "google"), "run2": ("claude", "google"), "run3": ("google", "claude")}
 SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
